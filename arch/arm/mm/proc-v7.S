@@ -18,6 +18,7 @@
 #include <asm/pgtable-hwdef.h>
 #include <asm/pgtable.h>
 #include <asm/memory.h>
+#include <asm/cache.h>
 
 #include "proc-macros.S"
 
@@ -279,7 +280,6 @@ ENDPROC(cpu_pj4b_do_resume)
 __v7_ca5mp_setup:
 __v7_ca9mp_setup:
 __v7_cr7mp_setup:
-__v7_cr8mp_setup:
 	mov	r10, #(1 << 0)			@ Cache/TLB ops broadcasting
 	b	1f
 __v7_ca7mp_setup:
@@ -548,10 +548,10 @@ __v7_setup_stack_ptr:
 ENDPROC(__v7_setup)
 
 	.bss
-	.align	2
+	.align	L1_CACHE_SHIFT
 __v7_setup_stack:
 	.space	4 * 7				@ 7 registers
-
+	.align	L1_CACHE_SHIFT
 	__INITDATA
 
 	.weak cpu_v7_bugs_init
@@ -642,7 +642,7 @@ __v7_setup_stack:
 	/*
 	 * Standard v7 proc info content
 	 */
-.macro __v7_proc name, initfunc, mm_mmuflags = 0, io_mmuflags = 0, hwcaps = 0, proc_fns = v7_processor_functions, cache_fns = v7_cache_fns
+.macro __v7_proc name, initfunc, mm_mmuflags = 0, io_mmuflags = 0, hwcaps = 0, proc_fns = v7_processor_functions
 	ALT_SMP(.long	PMD_TYPE_SECT | PMD_SECT_AP_WRITE | PMD_SECT_AP_READ | \
 			PMD_SECT_AF | PMD_FLAGS_SMP | \mm_mmuflags)
 	ALT_UP(.long	PMD_TYPE_SECT | PMD_SECT_AP_WRITE | PMD_SECT_AP_READ | \
@@ -658,7 +658,7 @@ __v7_setup_stack:
 	.long	\proc_fns
 	.long	v7wbi_tlb_fns
 	.long	v6_user_fns
-	.long	\cache_fns
+	.long	v7_cache_fns
 .endm
 
 #ifndef CONFIG_ARM_LPAE
@@ -717,16 +717,6 @@ __v7_cr7mp_proc_info:
 	.size	__v7_cr7mp_proc_info, . - __v7_cr7mp_proc_info
 
 	/*
-	 * ARM Ltd. Cortex R8 processor.
-	 */
-	.type	__v7_cr8mp_proc_info, #object
-__v7_cr8mp_proc_info:
-	.long	0x410fc180
-	.long	0xff0ffff0
-	__v7_proc __v7_cr8mp_proc_info, __v7_cr8mp_setup
-	.size	__v7_cr8mp_proc_info, . - __v7_cr8mp_proc_info
-
-	/*
 	 * ARM Ltd. Cortex A7 processor.
 	 */
 	.type	__v7_ca7mp_proc_info, #object
@@ -763,7 +753,7 @@ __v7_ca15mp_proc_info:
 __v7_b15mp_proc_info:
 	.long	0x420f00f0
 	.long	0xff0ffff0
-	__v7_proc __v7_b15mp_proc_info, __v7_b15mp_setup, proc_fns = ca15_processor_functions, cache_fns = b15_cache_fns
+	__v7_proc __v7_b15mp_proc_info, __v7_b15mp_setup, proc_fns = ca15_processor_functions
 	.size	__v7_b15mp_proc_info, . - __v7_b15mp_proc_info
 
 	/*

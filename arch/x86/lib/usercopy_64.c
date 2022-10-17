@@ -23,14 +23,13 @@ unsigned long __clear_user(void __user *addr, unsigned long size)
 	asm volatile(
 		"	testq  %[size8],%[size8]\n"
 		"	jz     4f\n"
-		"	.align 16\n"
-		"0:	movq $0,(%[dst])\n"
-		"	addq   $8,%[dst]\n"
+		"0:	movq %[zero],(%[dst])\n"
+		"	addq   %[eight],%[dst]\n"
 		"	decl %%ecx ; jnz   0b\n"
 		"4:	movq  %[size1],%%rcx\n"
 		"	testl %%ecx,%%ecx\n"
 		"	jz     2f\n"
-		"1:	movb   $0,(%[dst])\n"
+		"1:	movb   %b[zero],(%[dst])\n"
 		"	incq   %[dst]\n"
 		"	decl %%ecx ; jnz  1b\n"
 		"2:\n"
@@ -41,7 +40,8 @@ unsigned long __clear_user(void __user *addr, unsigned long size)
 		_ASM_EXTABLE(0b,3b)
 		_ASM_EXTABLE(1b,2b)
 		: [size8] "=&c"(size), [dst] "=&D" (__d0)
-		: [size1] "r"(size & 7), "[size8]" (size / 8), "[dst]"(addr));
+		: [size1] "r"(size & 7), "[size8]" (size / 8), "[dst]"(addr),
+		  [zero] "r" (0UL), [eight] "r" (8UL));
 	clac();
 	return size;
 }
@@ -72,27 +72,6 @@ copy_user_handle_tail(char *to, char *from, unsigned len)
 			break;
 	}
 	clac();
-	return len;
-}
-
-/*
- * Similar to copy_user_handle_tail, probe for the write fault point,
- * but reuse __memcpy_mcsafe in case a new read error is encountered.
- * clac() is handled in _copy_to_iter_mcsafe().
- */
-__visible unsigned long
-mcsafe_handle_tail(char *to, char *from, unsigned len)
-{
-	for (; len; --len, to++, from++) {
-		/*
-		 * Call the assembly routine back directly since
-		 * memcpy_mcsafe() may silently fallback to memcpy.
-		 */
-		unsigned long rem = __memcpy_mcsafe(to, from, 1);
-
-		if (rem)
-			break;
-	}
 	return len;
 }
 
@@ -139,7 +118,7 @@ long __copy_user_flushcache(void *dst, const void __user *src, unsigned size)
 	 */
 	if (size < 8) {
 		if (!IS_ALIGNED(dest, 4) || size != 4)
-			clean_cache_range(dst, size);
+			clean_cache_range(dst, 1);
 	} else {
 		if (!IS_ALIGNED(dest, 8)) {
 			dest = ALIGN(dest, boot_cpu_data.x86_clflush_size);
@@ -161,7 +140,7 @@ void memcpy_flushcache(void *_dst, const void *_src, size_t size)
 
 	/* cache copy and flush to align dest */
 	if (!IS_ALIGNED(dest, 8)) {
-		size_t len = min_t(size_t, size, ALIGN(dest, 8) - dest);
+		unsigned len = min_t(unsigned, size, ALIGN(dest, 8) - dest);
 
 		memcpy((void *) dest, (void *) source, len);
 		clean_cache_range((void *) dest, len);

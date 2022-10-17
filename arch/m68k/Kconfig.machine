@@ -185,7 +185,6 @@ config INIT_LCD
 config MEMORY_RESERVE
 	int "Memory reservation (MiB)"
 	depends on (UCSIMM || UCDIMM)
-	default 0
 	help
 	  Reserve certain memory regions on 68x328 based boards.
 
@@ -267,12 +266,6 @@ config AMCORE
 	help
 	  Support for the Sysam AMCORE open-hardware generic board.
 
-config STMARK2
-        bool "Sysam stmark2 board support"
-        depends on M5441x
-        help
-          Support for the Sysam stmark2 open-hardware generic board.
-
 config FIREBEE
 	bool "FireBee board support"
 	depends on M547x
@@ -315,7 +308,6 @@ comment "Machine Options"
 
 config UBOOT
 	bool "Support for U-Boot command line parameters"
-	depends on COLDFIRE
 	help
 	  If you say Y here kernel will try to collect command
 	  line parameters from the initial u-boot stack.

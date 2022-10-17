@@ -40,6 +40,9 @@
 #include <linux/mm.h>
 #include <linux/kexec.h>
 #include <linux/crash_dump.h>
+#include <linux/memory.h>
+#include <linux/libfdt.h>
+#include <linux/memblock.h>
 
 #include <asm/boot.h>
 #include <asm/fixmap.h>
@@ -52,8 +55,6 @@
 #include <asm/sizes.h>
 #include <asm/tlb.h>
 #include <asm/alternative.h>
-
-EXPORT_SYMBOL_GPL(kimage_vaddr);
 
 /*
  * We need to be able to catch inadvertent references to memstart_addr
@@ -219,7 +220,7 @@ static void __init reserve_elfcorehdr(void)
 }
 #endif /* CONFIG_CRASH_DUMP */
 /*
- * Return the maximum physical address for ZONE_DMA32 (DMA_BIT_MASK(32)). It
+ * Return the maximum physical address for ZONE_DMA (DMA_BIT_MASK(32)). It
  * currently assumes that for memory starting above 4G, 32-bit devices will
  * use a DMA offset.
  */
@@ -235,9 +236,8 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 {
 	unsigned long max_zone_pfns[MAX_NR_ZONES]  = {0};
 
-#ifdef CONFIG_ZONE_DMA32
-	max_zone_pfns[ZONE_DMA32] = PFN_DOWN(max_zone_dma_phys());
-#endif
+	if (IS_ENABLED(CONFIG_ZONE_DMA))
+		max_zone_pfns[ZONE_DMA] = PFN_DOWN(max_zone_dma_phys());
 	max_zone_pfns[ZONE_NORMAL] = max;
 
 	free_area_init_nodes(max_zone_pfns);
@@ -254,9 +254,9 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 	memset(zone_size, 0, sizeof(zone_size));
 
 	/* 4GB maximum for 32-bit only capable devices */
-#ifdef CONFIG_ZONE_DMA32
+#ifdef CONFIG_ZONE_DMA
 	max_dma = PFN_DOWN(arm64_dma_phys_limit);
-	zone_size[ZONE_DMA32] = max_dma - min;
+	zone_size[ZONE_DMA] = max_dma - min;
 #endif
 	zone_size[ZONE_NORMAL] = max - max_dma;
 
@@ -269,10 +269,10 @@ static void __init zone_sizes_init(unsigned long min, unsigned long max)
 		if (start >= max)
 			continue;
 
-#ifdef CONFIG_ZONE_DMA32
+#ifdef CONFIG_ZONE_DMA
 		if (start < max_dma) {
 			unsigned long dma_end = min(end, max_dma);
-			zhole_size[ZONE_DMA32] -= dma_end - start;
+			zhole_size[ZONE_DMA] -= dma_end - start;
 		}
 #endif
 		if (end > max_dma) {
@@ -317,7 +317,98 @@ static void __init arm64_memory_present(void)
 }
 #endif
 
-static phys_addr_t memory_limit = PHYS_ADDR_MAX;
+static phys_addr_t memory_limit = (phys_addr_t)ULLONG_MAX;
+phys_addr_t bootloader_memory_limit;
+
+#ifdef CONFIG_OVERRIDE_MEMORY_LIMIT
+static void __init update_memory_limit(void)
+{
+	unsigned long dt_root = of_get_flat_dt_root();
+	unsigned long node;
+	unsigned long long ram_sz, sz;
+	phys_addr_t end_addr, addr_aligned, offset;
+	int len;
+	const __be32 *prop;
+	phys_addr_t min_ddr_sz = 0, offline_sz = 0;
+	int t_len = (2 * dt_root_size_cells) * sizeof(__be32);
+
+	if (memory_limit == (phys_addr_t)ULLONG_MAX)
+		ram_sz = memblock_phys_mem_size();
+	else if (IS_ALIGNED(memory_limit, MIN_MEMORY_BLOCK_SIZE))
+		ram_sz = memory_limit;
+	else {
+		WARN(1, "mem-offline is not supported for DDR size %lld\n",
+				memory_limit);
+		return;
+	}
+
+	node = of_get_flat_dt_subnode_by_name(dt_root, "mem-offline");
+	if (node == -FDT_ERR_NOTFOUND) {
+		pr_err("mem-offine node not found in FDT\n");
+		return;
+	}
+
+	prop = of_get_flat_dt_prop(node, "offline-sizes", &len);
+	if (prop) {
+		if (len % t_len != 0) {
+			pr_err("mem-offline: invalid offline-sizes property\n");
+			return;
+		}
+
+		while (len > 0) {
+			phys_addr_t tmp_min_ddr_sz = dt_mem_next_cell(
+							dt_root_addr_cells,
+							&prop);
+			phys_addr_t tmp_offline_sz = dt_mem_next_cell(
+							dt_root_size_cells,
+							&prop);
+
+			if (tmp_min_ddr_sz < ram_sz &&
+			    tmp_min_ddr_sz > min_ddr_sz) {
+				if (tmp_offline_sz < ram_sz) {
+					min_ddr_sz = tmp_min_ddr_sz;
+					offline_sz = tmp_offline_sz;
+				} else {
+					pr_info("mem-offline: invalid offline size:%pa\n",
+						 &tmp_offline_sz);
+				}
+			}
+			len -= t_len;
+		}
+	} else {
+		pr_err("mem-offine: offline-sizes property not found in DT\n");
+		return;
+	}
+
+	if (offline_sz == 0) {
+		pr_info("mem-offline: no memory to offline for DDR size:%llu\n",
+			ram_sz);
+		return;
+	}
+
+	sz = ram_sz - offline_sz;
+	memory_limit = (phys_addr_t)sz;
+	end_addr = memblock_max_addr(memory_limit);
+	addr_aligned = ALIGN(end_addr, MIN_MEMORY_BLOCK_SIZE);
+	offset = addr_aligned - end_addr;
+
+	if (offset > MIN_MEMORY_BLOCK_SIZE / 2) {
+		addr_aligned = ALIGN_DOWN(end_addr, MIN_MEMORY_BLOCK_SIZE);
+		offset = end_addr - addr_aligned;
+		memory_limit -= offset;
+	} else {
+		memory_limit += offset;
+	}
+
+	pr_notice("Memory limit set/overridden to %lldMB\n",
+							memory_limit >> 20);
+}
+#else
+static void __init update_memory_limit(void)
+{
+
+}
+#endif
 
 /*
  * Limit the memory size that was specified via FDT.
@@ -370,11 +461,10 @@ void __init arm64_memblock_init(void)
 {
 	const s64 linear_region_size = -(s64)PAGE_OFFSET;
 
+	set_memsize_kernel_type(MEMSIZE_KERNEL_STOP);
+
 	/* Handle linux,usable-memory-range property */
 	fdt_enforce_memory_region();
-
-	/* Remove memory above our supported physical address size */
-	memblock_remove(1ULL << PHYS_MASK_SHIFT, ULLONG_MAX);
 
 	/*
 	 * Ensure that the linear region takes up exactly half of the kernel
@@ -404,11 +494,22 @@ void __init arm64_memblock_init(void)
 	}
 
 	/*
+	 * Save bootloader imposed memory limit before we overwirte
+	 * memblock.
+	 */
+	if (memory_limit == (phys_addr_t)ULLONG_MAX)
+		bootloader_memory_limit = memblock_end_of_DRAM();
+	else
+		bootloader_memory_limit = memblock_max_addr(memory_limit);
+
+	update_memory_limit();
+
+	/*
 	 * Apply the memory limit if it was set. Since the kernel may be loaded
 	 * high up in memory, add back the kernel region that must be accessible
 	 * via the linear mapping.
 	 */
-	if (memory_limit != PHYS_ADDR_MAX) {
+	if (memory_limit != (phys_addr_t)ULLONG_MAX) {
 		memblock_mem_limit_remove_map(memory_limit);
 		memblock_add(__pa_symbol(_text), (u64)(_end - _text));
 	}
@@ -445,7 +546,7 @@ void __init arm64_memblock_init(void)
 	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE)) {
 		extern u16 memstart_offset_seed;
 		u64 range = linear_region_size -
-			    (memblock_end_of_DRAM() - memblock_start_of_DRAM());
+			   (bootloader_memory_limit - memblock_start_of_DRAM());
 
 		/*
 		 * If the size of the linear region exceeds, by a sufficient
@@ -463,10 +564,17 @@ void __init arm64_memblock_init(void)
 	 * Register the kernel text, kernel data, initrd, and initial
 	 * pagetables with memblock.
 	 */
+	set_memsize_kernel_type(MEMSIZE_KERNEL_KERNEL);
 	memblock_reserve(__pa_symbol(_text), _end - _text);
+	set_memsize_kernel_type(MEMSIZE_KERNEL_STOP);
+	record_memsize_reserved("initmem", __pa(__init_begin),
+				__init_end - __init_begin, false, false);
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (initrd_start) {
 		memblock_reserve(initrd_start, initrd_end - initrd_start);
+		record_memsize_reserved("initrd", initrd_start,
+					initrd_end - initrd_start, false,
+					false);
 
 		/* the generic initrd code expects virtual addresses */
 		initrd_start = __phys_to_virt(initrd_start);
@@ -477,7 +585,7 @@ void __init arm64_memblock_init(void)
 	early_init_fdt_scan_reserved_mem();
 
 	/* 4GB maximum for 32-bit only capable devices */
-	if (IS_ENABLED(CONFIG_ZONE_DMA32))
+	if (IS_ENABLED(CONFIG_ZONE_DMA))
 		arm64_dma_phys_limit = max_zone_dma_phys();
 	else
 		arm64_dma_phys_limit = PHYS_MASK + 1;
@@ -489,6 +597,7 @@ void __init arm64_memblock_init(void)
 	high_memory = __va(memblock_end_of_DRAM() - 1) + 1;
 
 	dma_contiguous_reserve(arm64_dma_phys_limit);
+	set_memsize_kernel_type(MEMSIZE_KERNEL_OTHERS);
 
 	memblock_allow_resize();
 }
@@ -497,6 +606,7 @@ void __init bootmem_init(void)
 {
 	unsigned long min, max;
 
+	set_memsize_kernel_type(MEMSIZE_KERNEL_PAGING);
 	min = PFN_UP(memblock_start_of_DRAM());
 	max = PFN_DOWN(memblock_end_of_DRAM());
 
@@ -515,6 +625,7 @@ void __init bootmem_init(void)
 	zone_sizes_init(min, max);
 
 	memblock_dump_all();
+	set_memsize_kernel_type(MEMSIZE_KERNEL_OTHERS);
 }
 
 #ifndef CONFIG_SPARSEMEM_VMEMMAP
@@ -610,6 +721,50 @@ void __init mem_init(void)
 
 	mem_init_print_info(NULL);
 
+#ifdef CONFIG_PRINT_VMEMLAYOUT
+#define MLK(b, t) b, t, ((t) - (b)) >> 10
+#define MLM(b, t) b, t, ((t) - (b)) >> 20
+#define MLG(b, t) b, t, ((t) - (b)) >> 30
+#define MLK_ROUNDUP(b, t) b, t, DIV_ROUND_UP(((t) - (b)), SZ_1K)
+
+	pr_notice("Virtual kernel memory layout:\n");
+#ifdef CONFIG_KASAN
+	pr_notice("    kasan   : 0x%16lx - 0x%16lx   (%6ld GB)\n",
+		MLG(KASAN_SHADOW_START, KASAN_SHADOW_END));
+#endif
+	pr_notice("    modules : 0x%16lx - 0x%16lx   (%6ld MB)\n",
+		MLM(MODULES_VADDR, MODULES_END));
+	pr_notice("    vmalloc : 0x%16lx - 0x%16lx   (%6ld GB)\n",
+		MLG(VMALLOC_START, VMALLOC_END));
+	pr_notice("      .text : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+		MLK_ROUNDUP(_text, _etext));
+	pr_notice("    .rodata : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+		MLK_ROUNDUP(__start_rodata, __init_begin));
+	pr_notice("      .init : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+		MLK_ROUNDUP(__init_begin, __init_end));
+	pr_notice("      .data : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+		MLK_ROUNDUP(_sdata, _edata));
+	pr_notice("       .bss : 0x%p" " - 0x%p" "   (%6ld KB)\n",
+		MLK_ROUNDUP(__bss_start, __bss_stop));
+	pr_notice("    fixed   : 0x%16lx - 0x%16lx   (%6ld KB)\n",
+		MLK(FIXADDR_START, FIXADDR_TOP));
+	pr_notice("    PCI I/O : 0x%16lx - 0x%16lx   (%6ld MB)\n",
+		MLM(PCI_IO_START, PCI_IO_END));
+#ifdef CONFIG_SPARSEMEM_VMEMMAP
+	pr_notice("    vmemmap : 0x%16lx - 0x%16lx   (%6ld GB maximum)\n",
+		MLG(VMEMMAP_START, VMEMMAP_START + VMEMMAP_SIZE));
+	pr_notice("              0x%16lx - 0x%16lx   (%6ld MB actual)\n",
+		MLM((unsigned long)phys_to_page(memblock_start_of_DRAM()),
+		    (unsigned long)virt_to_page(high_memory)));
+#endif
+	pr_notice("    memory  : 0x%16lx - 0x%16lx   (%6ld MB)\n",
+		MLM(__phys_to_virt(memblock_start_of_DRAM()),
+		    (unsigned long)high_memory));
+
+#undef MLK
+#undef MLM
+#undef MLK_ROUNDUP
+#endif
 	/*
 	 * Check boundaries twice: Some fundamental inconsistencies can be
 	 * detected at build time already.
@@ -655,10 +810,8 @@ static int keep_initrd __initdata;
 
 void __init free_initrd_mem(unsigned long start, unsigned long end)
 {
-	if (!keep_initrd) {
+	if (!keep_initrd)
 		free_reserved_area((void *)start, (void *)end, 0, "initrd");
-		memblock_free(__virt_to_phys(start), end - start);
-	}
 }
 
 static int __init keepinitrd_setup(char *__unused)
@@ -675,7 +828,7 @@ __setup("keepinitrd", keepinitrd_setup);
  */
 static int dump_mem_limit(struct notifier_block *self, unsigned long v, void *p)
 {
-	if (memory_limit != PHYS_ADDR_MAX) {
+	if (memory_limit != (phys_addr_t)ULLONG_MAX) {
 		pr_emerg("Memory Limit: %llu MB\n", memory_limit >> 20);
 	} else {
 		pr_emerg("Memory Limit: none\n");
@@ -694,3 +847,133 @@ static int __init register_mem_limit_dumper(void)
 	return 0;
 }
 __initcall(register_mem_limit_dumper);
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+int arch_add_memory(int nid, u64 start, u64 size, bool want_memblock)
+{
+	pg_data_t *pgdat;
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+	unsigned long end_pfn = start_pfn + nr_pages;
+	unsigned long max_sparsemem_pfn = 1UL << (MAX_PHYSMEM_BITS-PAGE_SHIFT);
+	int ret;
+
+	if (end_pfn > max_sparsemem_pfn) {
+		pr_err("end_pfn too big");
+		return -1;
+	}
+	hotplug_paging(start, size);
+
+	/*
+	 * Mark the first page in the range as unusable. This is needed
+	 * because __add_section (within __add_pages) wants pfn_valid
+	 * of it to be false, and in arm64 pfn falid is implemented by
+	 * just checking at the nomap flag for existing blocks.
+	 *
+	 * A small trick here is that __add_section() requires only
+	 * phys_start_pfn (that is the first pfn of a section) to be
+	 * invalid. Regardless of whether it was assumed (by the function
+	 * author) that all pfns within a section are either all valid
+	 * or all invalid, it allows to avoid looping twice (once here,
+	 * second when memblock_clear_nomap() is called) through all
+	 * pfns of the section and modify only one pfn. Thanks to that,
+	 * further, in __add_zone() only this very first pfn is skipped
+	 * and corresponding page is not flagged reserved. Therefore it
+	 * is enough to correct this setup only for it.
+	 *
+	 * When arch_add_memory() returns the walk_memory_range() function
+	 * is called and passed with online_memory_block() callback,
+	 * which execution finally reaches the memory_block_action()
+	 * function, where also only the first pfn of a memory block is
+	 * checked to be reserved. Above, it was first pfn of a section,
+	 * here it is a block but
+	 * (drivers/base/memory.c):
+	 *     sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
+	 * (include/linux/memory.h):
+	 *     #define MIN_MEMORY_BLOCK_SIZE     (1UL << SECTION_SIZE_BITS)
+	 * so we can consider block and section equivalently
+	 */
+	memblock_mark_nomap(start, 1<<PAGE_SHIFT);
+
+	pgdat = NODE_DATA(nid);
+
+	ret = __add_pages(nid, start_pfn, nr_pages, want_memblock);
+
+	/*
+	 * Make the pages usable after they have been added.
+	 * This will make pfn_valid return true
+	 */
+	memblock_clear_nomap(start, 1<<PAGE_SHIFT);
+
+	/*
+	 * This is a hack to avoid having to mix arch specific code
+	 * into arch independent code. SetPageReserved is supposed
+	 * to be called by __add_zone (within __add_section, within
+	 * __add_pages). However, when it is called there, it assumes that
+	 * pfn_valid returns true.  For the way pfn_valid is implemented
+	 * in arm64 (a check on the nomap flag), the only way to make
+	 * this evaluate true inside __add_zone is to clear the nomap
+	 * flags of blocks in architecture independent code.
+	 *
+	 * To avoid this, we set the Reserved flag here after we cleared
+	 * the nomap flag in the line above.
+	 */
+	SetPageReserved(pfn_to_page(start_pfn));
+
+	if (ret)
+		pr_warn("%s: Problem encountered in __add_pages() ret=%d\n",
+			__func__, ret);
+
+	return ret;
+}
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static void kernel_physical_mapping_remove(unsigned long start,
+	unsigned long end)
+{
+	start = (unsigned long)__va(start);
+	end = (unsigned long)__va(end);
+
+	remove_pagetable(start, end, true);
+
+}
+
+int arch_remove_memory(u64 start, u64 size)
+{
+	unsigned long start_pfn = start >> PAGE_SHIFT;
+	unsigned long nr_pages = size >> PAGE_SHIFT;
+	struct page *page = pfn_to_page(start_pfn);
+	struct zone *zone;
+	int ret = 0;
+
+	zone = page_zone(page);
+	ret = __remove_pages(zone, start_pfn, nr_pages);
+	WARN_ON_ONCE(ret);
+
+	kernel_physical_mapping_remove(start, start + size);
+
+	return ret;
+}
+
+#endif /* CONFIG_MEMORY_HOTREMOVE */
+static int arm64_online_page(struct page *page)
+{
+	unsigned long phy_addr = page_to_phys(page);
+
+	if (phy_addr + PAGE_SIZE > bootloader_memory_limit)
+		return -EINVAL;
+
+	__online_page_set_limits(page);
+	__online_page_increment_counters(page);
+	__online_page_free(page);
+
+	return 0;
+}
+
+static int __init arm64_memory_hotplug_init(void)
+{
+	set_online_page_callback(&arm64_online_page);
+	return 0;
+}
+core_initcall(arm64_memory_hotplug_init);
+#endif /* CONFIG_MEMORY_HOTPLUG */

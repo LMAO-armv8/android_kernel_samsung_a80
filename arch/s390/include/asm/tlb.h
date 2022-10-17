@@ -116,20 +116,6 @@ static inline void tlb_remove_page_size(struct mmu_gather *tlb,
 	return tlb_remove_page(tlb, page);
 }
 
-static inline void tlb_flush_pmd_range(struct mmu_gather *tlb,
-				unsigned long address, unsigned long size)
-{
-	/*
-	 * the range might exceed the original range that was provided to
-	 * tlb_gather_mmu(), so we need to update it despite the fact it is
-	 * usually not updated.
-	 */
-	if (tlb->start > address)
-		tlb->start = address;
-	if (tlb->end < address + size)
-		tlb->end = address + size;
-}
-
 /*
  * pte_free_tlb frees a pte table and clears the CRSTE for the
  * page table from the tlb.
@@ -150,7 +136,7 @@ static inline void pte_free_tlb(struct mmu_gather *tlb, pgtable_t pte,
 static inline void pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmd,
 				unsigned long address)
 {
-	if (mm_pmd_folded(tlb->mm))
+	if (tlb->mm->context.asce_limit <= _REGION3_SIZE)
 		return;
 	pgtable_pmd_page_dtor(virt_to_page(pmd));
 	tlb_remove_table(tlb, pmd);
@@ -166,7 +152,7 @@ static inline void pmd_free_tlb(struct mmu_gather *tlb, pmd_t *pmd,
 static inline void p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d,
 				unsigned long address)
 {
-	if (mm_p4d_folded(tlb->mm))
+	if (tlb->mm->context.asce_limit <= _REGION1_SIZE)
 		return;
 	tlb_remove_table(tlb, p4d);
 }
@@ -181,7 +167,7 @@ static inline void p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d,
 static inline void pud_free_tlb(struct mmu_gather *tlb, pud_t *pud,
 				unsigned long address)
 {
-	if (mm_pud_folded(tlb->mm))
+	if (tlb->mm->context.asce_limit <= _REGION2_SIZE)
 		return;
 	tlb_remove_table(tlb, pud);
 }
@@ -191,8 +177,6 @@ static inline void pud_free_tlb(struct mmu_gather *tlb, pud_t *pud,
 #define tlb_remove_tlb_entry(tlb, ptep, addr)	do { } while (0)
 #define tlb_remove_pmd_tlb_entry(tlb, pmdp, addr)	do { } while (0)
 #define tlb_migrate_finish(mm)			do { } while (0)
-#define tlb_flush_pmd_range(tlb, addr, sz)	do { } while (0)
-
 #define tlb_remove_huge_tlb_entry(h, tlb, ptep, address)	\
 	tlb_remove_tlb_entry(tlb, ptep, address)
 

@@ -99,6 +99,21 @@ core_initcall(register_cpufreq_notifier);
 DEFINE_SPINLOCK(rtc_lock);
 EXPORT_SYMBOL(rtc_lock);
 
+int __weak rtc_mips_set_time(unsigned long sec)
+{
+	return -ENODEV;
+}
+
+int __weak rtc_mips_set_mmss(unsigned long nowtime)
+{
+	return rtc_mips_set_time(nowtime);
+}
+
+int update_persistent_clock(struct timespec now)
+{
+	return rtc_mips_set_mmss(now.tv_sec);
+}
+
 static int null_perf_irq(void)
 {
 	return 0;
@@ -140,10 +155,15 @@ static __init int cpu_has_mfc0_count_bug(void)
 	case CPU_R4400MC:
 		/*
 		 * The published errata for the R4400 up to 3.0 say the CPU
-		 * has the mfc0 from count bug.  This seems the last version
-		 * produced.
+		 * has the mfc0 from count bug.
 		 */
-		return 1;
+		if ((current_cpu_data.processor_id & 0xff) <= 0x30)
+			return 1;
+
+		/*
+		 * we assume newer revisions are ok
+		 */
+		return 0;
 	}
 
 	return 0;

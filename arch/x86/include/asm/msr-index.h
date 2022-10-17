@@ -65,8 +65,8 @@
 #define NHM_C3_AUTO_DEMOTE		(1UL << 25)
 #define NHM_C1_AUTO_DEMOTE		(1UL << 26)
 #define ATM_LNC_C6_AUTO_DEMOTE		(1UL << 25)
-#define SNB_C3_AUTO_UNDEMOTE		(1UL << 27)
-#define SNB_C1_AUTO_UNDEMOTE		(1UL << 28)
+#define SNB_C1_AUTO_UNDEMOTE		(1UL << 27)
+#define SNB_C3_AUTO_UNDEMOTE		(1UL << 28)
 
 #define MSR_MTRRcap			0x000000fe
 
@@ -96,34 +96,6 @@
 						 * Not susceptible to
 						 * TSX Async Abort (TAA) vulnerabilities.
 						 */
-#define ARCH_CAP_SBDR_SSDP_NO		BIT(13)	/*
-						 * Not susceptible to SBDR and SSDP
-						 * variants of Processor MMIO stale data
-						 * vulnerabilities.
-						 */
-#define ARCH_CAP_FBSDP_NO		BIT(14)	/*
-						 * Not susceptible to FBSDP variant of
-						 * Processor MMIO stale data
-						 * vulnerabilities.
-						 */
-#define ARCH_CAP_PSDP_NO		BIT(15)	/*
-						 * Not susceptible to PSDP variant of
-						 * Processor MMIO stale data
-						 * vulnerabilities.
-						 */
-#define ARCH_CAP_FB_CLEAR		BIT(17)	/*
-						 * VERW clears CPU fill buffer
-						 * even on MDS_NO CPUs.
-						 */
-#define ARCH_CAP_FB_CLEAR_CTRL		BIT(18)	/*
-						 * MSR_IA32_MCU_OPT_CTRL[FB_CLEAR_DIS]
-						 * bit available to control VERW
-						 * behavior.
-						 */
-#define ARCH_CAP_PBRSB_NO		BIT(24)	/*
-						 * Not susceptible to Post-Barrier
-						 * Return Stack Buffer Predictions.
-						 */
 
 #define MSR_IA32_FLUSH_CMD		0x0000010b
 #define L1D_FLUSH			BIT(0)	/*
@@ -141,7 +113,6 @@
 /* SRBDS support */
 #define MSR_IA32_MCU_OPT_CTRL		0x00000123
 #define RNGDS_MITG_DIS			BIT(0)
-#define FB_CLEAR_DIS			BIT(3)	/* CPU Fill buffer clear disable */
 
 #define MSR_IA32_SYSENTER_CS		0x00000174
 #define MSR_IA32_SYSENTER_ESP		0x00000175
@@ -406,12 +377,8 @@
 #define MSR_AMD64_IBSOP_REG_MASK	((1UL<<MSR_AMD64_IBSOP_REG_COUNT)-1)
 #define MSR_AMD64_IBSCTL		0xc001103a
 #define MSR_AMD64_IBSBRTARGET		0xc001103b
-#define MSR_AMD64_ICIBSEXTDCTL		0xc001103c
 #define MSR_AMD64_IBSOPDATA4		0xc001103d
 #define MSR_AMD64_IBS_REG_COUNT_MAX	8 /* includes MSR_AMD64_IBSBRTARGET */
-#define MSR_AMD64_SEV			0xc0010131
-#define MSR_AMD64_SEV_ENABLED_BIT	0
-#define MSR_AMD64_SEV_ENABLED		BIT_ULL(MSR_AMD64_SEV_ENABLED_BIT)
 
 #define MSR_AMD64_VIRT_SPEC_CTRL	0xc001011f
 
@@ -428,21 +395,7 @@
 
 /* Fam 15h MSRs */
 #define MSR_F15H_PERF_CTL		0xc0010200
-#define MSR_F15H_PERF_CTL0		MSR_F15H_PERF_CTL
-#define MSR_F15H_PERF_CTL1		(MSR_F15H_PERF_CTL + 2)
-#define MSR_F15H_PERF_CTL2		(MSR_F15H_PERF_CTL + 4)
-#define MSR_F15H_PERF_CTL3		(MSR_F15H_PERF_CTL + 6)
-#define MSR_F15H_PERF_CTL4		(MSR_F15H_PERF_CTL + 8)
-#define MSR_F15H_PERF_CTL5		(MSR_F15H_PERF_CTL + 10)
-
 #define MSR_F15H_PERF_CTR		0xc0010201
-#define MSR_F15H_PERF_CTR0		MSR_F15H_PERF_CTR
-#define MSR_F15H_PERF_CTR1		(MSR_F15H_PERF_CTR + 2)
-#define MSR_F15H_PERF_CTR2		(MSR_F15H_PERF_CTR + 4)
-#define MSR_F15H_PERF_CTR3		(MSR_F15H_PERF_CTR + 6)
-#define MSR_F15H_PERF_CTR4		(MSR_F15H_PERF_CTR + 8)
-#define MSR_F15H_PERF_CTR5		(MSR_F15H_PERF_CTR + 10)
-
 #define MSR_F15H_NB_PERF_CTL		0xc0010240
 #define MSR_F15H_NB_PERF_CTR		0xc0010241
 #define MSR_F15H_PTSC			0xc0010280
@@ -487,10 +440,6 @@
 #define MSR_K7_PERFCTR3			0xc0010007
 #define MSR_K7_CLK_CTL			0xc001001b
 #define MSR_K7_HWCR			0xc0010015
-#define MSR_K7_HWCR_SMMLOCK_BIT		0
-#define MSR_K7_HWCR_SMMLOCK		BIT_ULL(MSR_K7_HWCR_SMMLOCK_BIT)
-#define MSR_K7_HWCR_IRPERF_EN_BIT	30
-#define MSR_K7_HWCR_IRPERF_EN		BIT_ULL(MSR_K7_HWCR_IRPERF_EN_BIT)
 #define MSR_K7_FID_VID_CTL		0xc0010041
 #define MSR_K7_FID_VID_STATUS		0xc0010042
 

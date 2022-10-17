@@ -10,6 +10,7 @@
 #include <linux/sched/task_stack.h>
 #include <linux/thread_info.h>
 
+#include <asm/compat.h>
 #include <asm/cpufeature.h>
 
 static void ssbd_ssbs_enable(struct task_struct *task)
@@ -30,9 +31,7 @@ static void ssbd_ssbs_disable(struct task_struct *task)
 
 /*
  * prctl interface for SSBD
- * FIXME: Drop the below ifdefery once merged in 4.18.
  */
-#ifdef PR_SPEC_STORE_BYPASS
 static int ssbd_prctl_set(struct task_struct *task, unsigned long ctrl)
 {
 	int state = arm64_get_ssbd_state();
@@ -129,4 +128,3 @@ int arch_prctl_spec_ctrl_get(struct task_struct *task, unsigned long which)
 		return -ENODEV;
 	}
 }
-#endif	/* PR_SPEC_STORE_BYPASS */

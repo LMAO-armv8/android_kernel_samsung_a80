@@ -20,6 +20,8 @@ void __init set_real_mode_mem(phys_addr_t mem, size_t size)
 	void *base = __va(mem);
 
 	real_mode_header = (struct real_mode_header *) base;
+	printk(KERN_DEBUG "Base memory trampoline at [%p] %llx size %zu\n",
+	       base, (unsigned long long)mem, size);
 }
 
 void __init reserve_real_mode(void)
@@ -55,7 +57,6 @@ static void __init setup_real_mode(void)
 #ifdef CONFIG_X86_64
 	u64 *trampoline_pgd;
 	u64 efer;
-	int i;
 #endif
 
 	base = (unsigned char *)real_mode_header;
@@ -63,10 +64,9 @@ static void __init setup_real_mode(void)
 	/*
 	 * If SME is active, the trampoline area will need to be in
 	 * decrypted memory in order to bring up other processors
-	 * successfully. This is not needed for SEV.
+	 * successfully.
 	 */
-	if (sme_active())
-		set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
+	set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
 
 	memcpy(base, real_mode_blob, size);
 
@@ -114,17 +114,8 @@ static void __init setup_real_mode(void)
 		trampoline_header->flags |= TH_FLAGS_SME_ACTIVE;
 
 	trampoline_pgd = (u64 *) __va(real_mode_header->trampoline_pgd);
-
-	/* Map the real mode stub as virtual == physical */
 	trampoline_pgd[0] = trampoline_pgd_entry.pgd;
-
-	/*
-	 * Include the entirety of the kernel mapping into the trampoline
-	 * PGD.  This way, all mappings present in the normal kernel page
-	 * tables are usable while running on trampoline_pgd.
-	 */
-	for (i = pgd_index(__PAGE_OFFSET); i < PTRS_PER_PGD; i++)
-		trampoline_pgd[i] = init_top_pgt[i].pgd;
+	trampoline_pgd[511] = init_top_pgt[511].pgd;
 #endif
 }
 

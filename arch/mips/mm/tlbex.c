@@ -31,7 +31,6 @@
 
 #include <asm/cacheflush.h>
 #include <asm/cpu-type.h>
-#include <asm/mmu_context.h>
 #include <asm/pgtable.h>
 #include <asm/war.h>
 #include <asm/uasm.h>
@@ -254,10 +253,8 @@ static void output_pgtable_bits_defines(void)
 	pr_debug("\n");
 }
 
-static inline void dump_handler(const char *symbol, const void *start, const void *end)
+static inline void dump_handler(const char *symbol, const u32 *handler, int count)
 {
-	unsigned int count = (end - start) / sizeof(u32);
-	const u32 *handler = start;
 	int i;
 
 	pr_debug("LEAF(%s)\n", symbol);
@@ -406,6 +403,12 @@ static void build_restore_work_registers(u32 **p)
  * CONFIG_MIPS_PGD_C0_CONTEXT implies 64 bit and lack of pgd_current,
  * we cannot do r3000 under these circumstances.
  *
+ * Declare pgd_current here instead of including mmu_context.h to avoid type
+ * conflicts for tlbmiss_handler_setup_pgd
+ */
+extern unsigned long pgd_current[];
+
+/*
  * The R3000 TLB handler is simple.
  */
 static void build_r3000_tlb_refill_handler(void)
@@ -442,7 +445,8 @@ static void build_r3000_tlb_refill_handler(void)
 
 	memcpy((void *)ebase, tlb_handler, 0x80);
 	local_flush_icache_range(ebase, ebase + 0x80);
-	dump_handler("r3000_tlb_refill", (u32 *)ebase, (u32 *)(ebase + 0x80));
+
+	dump_handler("r3000_tlb_refill", (u32 *)ebase, 32);
 }
 #endif /* CONFIG_MIPS_PGD_C0_CONTEXT */
 
@@ -630,7 +634,7 @@ static __maybe_unused void build_convert_pte_to_entrylo(u32 **p,
 		return;
 	}
 
-	if (cpu_has_rixi && _PAGE_NO_EXEC != 0) {
+	if (cpu_has_rixi && !!_PAGE_NO_EXEC) {
 		if (fill_includes_sw_bits) {
 			UASM_i_ROTR(p, reg, reg, ilog2(_PAGE_GLOBAL));
 		} else {
@@ -1474,12 +1478,12 @@ static void build_r4000_tlb_refill_handler(void)
 
 	memcpy((void *)ebase, final_handler, 0x100);
 	local_flush_icache_range(ebase, ebase + 0x100);
-	dump_handler("r4000_tlb_refill", (u32 *)ebase, (u32 *)(ebase + 0x100));
+
+	dump_handler("r4000_tlb_refill", (u32 *)ebase, 64);
 }
 
 static void setup_pw(void)
 {
-	unsigned int pwctl;
 	unsigned long pgd_i, pgd_w;
 #ifndef __PAGETABLE_PMD_FOLDED
 	unsigned long pmd_i, pmd_w;
@@ -1506,7 +1510,6 @@ static void setup_pw(void)
 
 	pte_i = ilog2(_PAGE_GLOBAL);
 	pte_w = 0;
-	pwctl = 1 << 30; /* Set PWDirExt */
 
 #ifndef __PAGETABLE_PMD_FOLDED
 	write_c0_pwfield(pgd_i << 24 | pmd_i << 12 | pt_i << 6 | pte_i);
@@ -1517,10 +1520,9 @@ static void setup_pw(void)
 #endif
 
 #ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
-	pwctl |= (1 << 6 | psn);
+	write_c0_pwctl(1 << 6 | psn);
 #endif
-	write_c0_pwctl(pwctl);
-	write_c0_kpgd((long)swapper_pg_dir);
+	write_c0_kpgd(swapper_pg_dir);
 	kscratch_used_mask |= (1 << 7); /* KScratch6 is used for KPGD */
 }
 
@@ -1579,21 +1581,31 @@ static void build_loongson3_tlb_refill_handler(void)
 	uasm_resolve_relocs(relocs, labels);
 	memcpy((void *)(ebase + 0x80), tlb_handler, 0x80);
 	local_flush_icache_range(ebase + 0x80, ebase + 0x100);
-	dump_handler("loongson3_tlb_refill",
-		     (u32 *)(ebase + 0x80), (u32 *)(ebase + 0x100));
+	dump_handler("loongson3_tlb_refill", (u32 *)(ebase + 0x80), 32);
 }
+
+extern u32 handle_tlbl[], handle_tlbl_end[];
+extern u32 handle_tlbs[], handle_tlbs_end[];
+extern u32 handle_tlbm[], handle_tlbm_end[];
+extern u32 tlbmiss_handler_setup_pgd_start[];
+extern u32 tlbmiss_handler_setup_pgd[];
+EXPORT_SYMBOL_GPL(tlbmiss_handler_setup_pgd);
+extern u32 tlbmiss_handler_setup_pgd_end[];
 
 static void build_setup_pgd(void)
 {
 	const int a0 = 4;
 	const int __maybe_unused a1 = 5;
 	const int __maybe_unused a2 = 6;
-	u32 *p = (u32 *)msk_isa16_mode((ulong)tlbmiss_handler_setup_pgd);
+	u32 *p = tlbmiss_handler_setup_pgd_start;
+	const int tlbmiss_handler_setup_pgd_size =
+		tlbmiss_handler_setup_pgd_end - tlbmiss_handler_setup_pgd_start;
 #ifndef CONFIG_MIPS_PGD_C0_CONTEXT
 	long pgdc = (long)pgd_current;
 #endif
 
-	memset(p, 0, tlbmiss_handler_setup_pgd_end - (char *)p);
+	memset(tlbmiss_handler_setup_pgd, 0, tlbmiss_handler_setup_pgd_size *
+					sizeof(tlbmiss_handler_setup_pgd[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 	pgd_reg = allocate_kscratch();
@@ -1651,15 +1663,15 @@ static void build_setup_pgd(void)
 		uasm_i_nop(&p);
 	}
 #endif
-	if (p >= (u32 *)tlbmiss_handler_setup_pgd_end)
+	if (p >= tlbmiss_handler_setup_pgd_end)
 		panic("tlbmiss_handler_setup_pgd space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote tlbmiss_handler_setup_pgd (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)tlbmiss_handler_setup_pgd));
+		 (unsigned int)(p - tlbmiss_handler_setup_pgd));
 
 	dump_handler("tlbmiss_handler", tlbmiss_handler_setup_pgd,
-					tlbmiss_handler_setup_pgd_end);
+					tlbmiss_handler_setup_pgd_size);
 }
 
 static void
@@ -1928,11 +1940,12 @@ build_r3000_tlbchange_handler_head(u32 **p, unsigned int pte,
 
 static void build_r3000_tlb_load_handler(void)
 {
-	u32 *p = (u32 *)handle_tlbl;
+	u32 *p = handle_tlbl;
+	const int handle_tlbl_size = handle_tlbl_end - handle_tlbl;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 
-	memset(p, 0, handle_tlbl_end - (char *)p);
+	memset(handle_tlbl, 0, handle_tlbl_size * sizeof(handle_tlbl[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -1946,23 +1959,24 @@ static void build_r3000_tlb_load_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_0 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbl_end)
+	if (p >= handle_tlbl_end)
 		panic("TLB load handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB load handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbl));
+		 (unsigned int)(p - handle_tlbl));
 
-	dump_handler("r3000_tlb_load", handle_tlbl, handle_tlbl_end);
+	dump_handler("r3000_tlb_load", handle_tlbl, handle_tlbl_size);
 }
 
 static void build_r3000_tlb_store_handler(void)
 {
-	u32 *p = (u32 *)handle_tlbs;
+	u32 *p = handle_tlbs;
+	const int handle_tlbs_size = handle_tlbs_end - handle_tlbs;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 
-	memset(p, 0, handle_tlbs_end - (char *)p);
+	memset(handle_tlbs, 0, handle_tlbs_size * sizeof(handle_tlbs[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -1976,23 +1990,24 @@ static void build_r3000_tlb_store_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_1 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbs_end)
+	if (p >= handle_tlbs_end)
 		panic("TLB store handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB store handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbs));
+		 (unsigned int)(p - handle_tlbs));
 
-	dump_handler("r3000_tlb_store", handle_tlbs, handle_tlbs_end);
+	dump_handler("r3000_tlb_store", handle_tlbs, handle_tlbs_size);
 }
 
 static void build_r3000_tlb_modify_handler(void)
 {
-	u32 *p = (u32 *)handle_tlbm;
+	u32 *p = handle_tlbm;
+	const int handle_tlbm_size = handle_tlbm_end - handle_tlbm;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 
-	memset(p, 0, handle_tlbm_end - (char *)p);
+	memset(handle_tlbm, 0, handle_tlbm_size * sizeof(handle_tlbm[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -2006,14 +2021,14 @@ static void build_r3000_tlb_modify_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_1 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbm_end)
+	if (p >= handle_tlbm_end)
 		panic("TLB modify handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB modify handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbm));
+		 (unsigned int)(p - handle_tlbm));
 
-	dump_handler("r3000_tlb_modify", handle_tlbm, handle_tlbm_end);
+	dump_handler("r3000_tlb_modify", handle_tlbm, handle_tlbm_size);
 }
 #endif /* CONFIG_MIPS_PGD_C0_CONTEXT */
 
@@ -2105,11 +2120,12 @@ build_r4000_tlbchange_handler_tail(u32 **p, struct uasm_label **l,
 static void build_r4000_tlb_load_handler(void)
 {
 	u32 *p = (u32 *)msk_isa16_mode((ulong)handle_tlbl);
+	const int handle_tlbl_size = handle_tlbl_end - handle_tlbl;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 	struct work_registers wr;
 
-	memset(p, 0, handle_tlbl_end - (char *)p);
+	memset(handle_tlbl, 0, handle_tlbl_size * sizeof(handle_tlbl[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -2290,24 +2306,25 @@ static void build_r4000_tlb_load_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_0 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbl_end)
+	if (p >= handle_tlbl_end)
 		panic("TLB load handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB load handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbl));
+		 (unsigned int)(p - handle_tlbl));
 
-	dump_handler("r4000_tlb_load", handle_tlbl, handle_tlbl_end);
+	dump_handler("r4000_tlb_load", handle_tlbl, handle_tlbl_size);
 }
 
 static void build_r4000_tlb_store_handler(void)
 {
 	u32 *p = (u32 *)msk_isa16_mode((ulong)handle_tlbs);
+	const int handle_tlbs_size = handle_tlbs_end - handle_tlbs;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 	struct work_registers wr;
 
-	memset(p, 0, handle_tlbs_end - (char *)p);
+	memset(handle_tlbs, 0, handle_tlbs_size * sizeof(handle_tlbs[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -2344,24 +2361,25 @@ static void build_r4000_tlb_store_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_1 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbs_end)
+	if (p >= handle_tlbs_end)
 		panic("TLB store handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB store handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbs));
+		 (unsigned int)(p - handle_tlbs));
 
-	dump_handler("r4000_tlb_store", handle_tlbs, handle_tlbs_end);
+	dump_handler("r4000_tlb_store", handle_tlbs, handle_tlbs_size);
 }
 
 static void build_r4000_tlb_modify_handler(void)
 {
 	u32 *p = (u32 *)msk_isa16_mode((ulong)handle_tlbm);
+	const int handle_tlbm_size = handle_tlbm_end - handle_tlbm;
 	struct uasm_label *l = labels;
 	struct uasm_reloc *r = relocs;
 	struct work_registers wr;
 
-	memset(p, 0, handle_tlbm_end - (char *)p);
+	memset(handle_tlbm, 0, handle_tlbm_size * sizeof(handle_tlbm[0]));
 	memset(labels, 0, sizeof(labels));
 	memset(relocs, 0, sizeof(relocs));
 
@@ -2399,14 +2417,14 @@ static void build_r4000_tlb_modify_handler(void)
 	uasm_i_j(&p, (unsigned long)tlb_do_page_fault_1 & 0x0fffffff);
 	uasm_i_nop(&p);
 
-	if (p >= (u32 *)handle_tlbm_end)
+	if (p >= handle_tlbm_end)
 		panic("TLB modify handler fastpath space exceeded");
 
 	uasm_resolve_relocs(relocs, labels);
 	pr_debug("Wrote TLB modify handler fastpath (%u instructions).\n",
-		 (unsigned int)(p - (u32 *)handle_tlbm));
+		 (unsigned int)(p - handle_tlbm));
 
-	dump_handler("r4000_tlb_modify", handle_tlbm, handle_tlbm_end);
+	dump_handler("r4000_tlb_modify", handle_tlbm, handle_tlbm_size);
 }
 
 static void flush_tlb_handlers(void)
@@ -2559,7 +2577,7 @@ static void check_pabits(void)
 	unsigned long entry;
 	unsigned pabits, fillbits;
 
-	if (!cpu_has_rixi || _PAGE_NO_EXEC == 0) {
+	if (!cpu_has_rixi || !_PAGE_NO_EXEC) {
 		/*
 		 * We'll only be making use of the fact that we can rotate bits
 		 * into the fill if the CPU supports RIXI, so don't bother

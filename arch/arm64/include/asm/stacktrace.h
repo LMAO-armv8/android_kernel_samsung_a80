@@ -22,7 +22,6 @@
 
 #include <asm/memory.h>
 #include <asm/ptrace.h>
-#include <asm/sdei.h>
 
 struct stackframe {
 	unsigned long fp;
@@ -30,21 +29,6 @@ struct stackframe {
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 	int graph;
 #endif
-};
-
-enum stack_type {
-	STACK_TYPE_UNKNOWN,
-	STACK_TYPE_TASK,
-	STACK_TYPE_IRQ,
-	STACK_TYPE_OVERFLOW,
-	STACK_TYPE_SDEI_NORMAL,
-	STACK_TYPE_SDEI_CRITICAL,
-};
-
-struct stack_info {
-	unsigned long low;
-	unsigned long high;
-	enum stack_type type;
 };
 
 extern int unwind_frame(struct task_struct *tsk, struct stackframe *frame);
@@ -58,8 +42,7 @@ DECLARE_PER_CPU(unsigned long *, irq_stack_ptr);
 DECLARE_PER_CPU(unsigned long *, irq_shadow_call_stack_ptr);
 #endif
 
-static inline bool on_irq_stack(unsigned long sp,
-				struct stack_info *info)
+static inline bool on_irq_stack(unsigned long sp)
 {
 	unsigned long low = (unsigned long)raw_cpu_read(irq_stack_ptr);
 	unsigned long high = low + IRQ_STACK_SIZE;
@@ -67,79 +50,44 @@ static inline bool on_irq_stack(unsigned long sp,
 	if (!low)
 		return false;
 
-	if (sp < low || sp >= high)
-		return false;
-
-	if (info) {
-		info->low = low;
-		info->high = high;
-		info->type = STACK_TYPE_IRQ;
-	}
-
-	return true;
+	return (low <= sp && sp < high);
 }
 
-static inline bool on_task_stack(struct task_struct *tsk, unsigned long sp,
-				struct stack_info *info)
+static inline bool on_task_stack(struct task_struct *tsk, unsigned long sp)
 {
 	unsigned long low = (unsigned long)task_stack_page(tsk);
 	unsigned long high = low + THREAD_SIZE;
 
-	if (sp < low || sp >= high)
-		return false;
-
-	if (info) {
-		info->low = low;
-		info->high = high;
-		info->type = STACK_TYPE_TASK;
-	}
-
-	return true;
+	return (low <= sp && sp < high);
 }
 
 #ifdef CONFIG_VMAP_STACK
 DECLARE_PER_CPU(unsigned long [OVERFLOW_STACK_SIZE/sizeof(long)], overflow_stack);
 
-static inline bool on_overflow_stack(unsigned long sp,
-				struct stack_info *info)
+static inline bool on_overflow_stack(unsigned long sp)
 {
 	unsigned long low = (unsigned long)raw_cpu_ptr(overflow_stack);
 	unsigned long high = low + OVERFLOW_STACK_SIZE;
 
-	if (sp < low || sp >= high)
-		return false;
-
-	if (info) {
-		info->low = low;
-		info->high = high;
-		info->type = STACK_TYPE_OVERFLOW;
-	}
-
-	return true;
+	return (low <= sp && sp < high);
 }
 #else
-static inline bool on_overflow_stack(unsigned long sp,
-			struct stack_info *info) { return false; }
+static inline bool on_overflow_stack(unsigned long sp) { return false; }
 #endif
-
 
 /*
  * We can only safely access per-cpu stacks from current in a non-preemptible
  * context.
  */
-static inline bool on_accessible_stack(struct task_struct *tsk,
-					unsigned long sp,
-					struct stack_info *info)
+static inline bool on_accessible_stack(struct task_struct *tsk, unsigned long sp)
 {
-	if (on_task_stack(tsk, sp, info))
+	if (on_task_stack(tsk, sp))
 		return true;
 	if (tsk != current || preemptible())
 		return false;
-	if (on_irq_stack(sp, info))
+	if (on_irq_stack(sp))
 		return true;
-	if (on_overflow_stack(sp, info))
-		return true;
-	if (on_sdei_stack(sp, info))
+	if (on_overflow_stack(sp))
 		return true;
 
 	return false;

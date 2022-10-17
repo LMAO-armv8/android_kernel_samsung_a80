@@ -36,7 +36,6 @@
 #include <asm/opal.h>
 #include <asm/kexec.h>
 #include <asm/smp.h>
-#include <asm/tm.h>
 #include <asm/setup.h>
 #include <asm/security_features.h>
 
@@ -125,29 +124,12 @@ static void pnv_setup_rfi_flush(void)
 			type = L1D_FLUSH_ORI;
 	}
 
-	/*
-	 * If we are non-Power9 bare metal, we don't need to flush on kernel
-	 * entry or after user access: they fix a P9 specific vulnerability.
-	 */
-	if (!pvr_version_is(PVR_POWER9)) {
-		security_ftr_clear(SEC_FTR_L1D_FLUSH_ENTRY);
-		security_ftr_clear(SEC_FTR_L1D_FLUSH_UACCESS);
-	}
-
 	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) && \
 		 (security_ftr_enabled(SEC_FTR_L1D_FLUSH_PR)   || \
 		  security_ftr_enabled(SEC_FTR_L1D_FLUSH_HV));
 
 	setup_rfi_flush(type, enable);
 	setup_count_cache_flush();
-
-	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
-		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_ENTRY);
-	setup_entry_flush(enable);
-
-	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
-		 security_ftr_enabled(SEC_FTR_L1D_FLUSH_UACCESS);
-	setup_uaccess_flush(enable);
 }
 
 static void __init pnv_setup_arch(void)
@@ -171,8 +153,6 @@ static void __init pnv_setup_arch(void)
 	powersave_nap = 1;
 
 	/* XXX PMCS */
-
-	pnv_rng_init();
 }
 
 static void __init pnv_init(void)
@@ -228,12 +208,17 @@ static void pnv_prepare_going_down(void)
 	 */
 	opal_event_shutdown();
 
-	/* Print flash update message if one is scheduled. */
-	opal_flash_update_print_message();
+	/* Soft disable interrupts */
+	local_irq_disable();
 
-	smp_send_stop();
-
-	hard_irq_disable();
+	/*
+	 * Return secondary CPUs to firwmare if a flash update
+	 * is pending otherwise we will get all sort of error
+	 * messages about CPU being stuck etc.. This will also
+	 * have the side effect of hard disabling interrupts so
+	 * past this point, the kernel is effectively dead.
+	 */
+	opal_flash_term_callback();
 }
 
 static void  __noreturn pnv_restart(char *cmd)
@@ -315,7 +300,7 @@ static void pnv_kexec_wait_secondaries_down(void)
 			if (i != notified) {
 				printk(KERN_INFO "kexec: waiting for cpu %d "
 				       "(physical %d) to enter OPAL\n",
-				       i, paca_ptrs[i]->hw_cpu_id);
+				       i, paca[i].hw_cpu_id);
 				notified = i;
 			}
 
@@ -327,7 +312,7 @@ static void pnv_kexec_wait_secondaries_down(void)
 			if (timeout-- == 0) {
 				printk(KERN_ERR "kexec: timed out waiting for "
 				       "cpu %d (physical %d) to enter OPAL\n",
-				       i, paca_ptrs[i]->hw_cpu_id);
+				       i, paca[i].hw_cpu_id);
 				break;
 			}
 		}
@@ -339,7 +324,7 @@ static void pnv_kexec_cpu_down(int crash_shutdown, int secondary)
 	u64 reinit_flags;
 
 	if (xive_enabled())
-		xive_teardown_cpu();
+		xive_kexec_teardown_cpu(secondary);
 	else
 		xics_kexec_teardown_cpu(secondary);
 
@@ -383,7 +368,15 @@ static void pnv_kexec_cpu_down(int crash_shutdown, int secondary)
 #ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
 static unsigned long pnv_memory_block_size(void)
 {
-	return 256UL * 1024 * 1024;
+	/*
+	 * We map the kernel linear region with 1GB large pages on radix. For
+	 * memory hot unplug to work our memory block size must be at least
+	 * this size.
+	 */
+	if (radix_enabled())
+		return 1UL * 1024 * 1024 * 1024;
+	else
+		return 256UL * 1024 * 1024;
 }
 #endif
 
@@ -393,7 +386,6 @@ static void __init pnv_setup_machdep_opal(void)
 	ppc_md.restart = pnv_restart;
 	pm_power_off = pnv_power_off;
 	ppc_md.halt = pnv_halt;
-	/* ppc_md.system_reset_exception gets filled in by pnv_smp_init() */
 	ppc_md.machine_check_exception = opal_machine_check;
 	ppc_md.mce_check_early_recovery = opal_mce_check_early_recovery;
 	ppc_md.hmi_exception_early = opal_hmi_exception_early;
@@ -414,28 +406,6 @@ static int __init pnv_probe(void)
 
 	return 1;
 }
-
-#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
-void __init pnv_tm_init(void)
-{
-	if (!firmware_has_feature(FW_FEATURE_OPAL) ||
-	    !pvr_version_is(PVR_POWER9) ||
-	    early_cpu_has_feature(CPU_FTR_TM))
-		return;
-
-	if (opal_reinit_cpus(OPAL_REINIT_CPUS_TM_SUSPEND_DISABLED) != OPAL_SUCCESS)
-		return;
-
-	pr_info("Enabling TM (Transactional Memory) with Suspend Disabled\n");
-	cur_cpu_spec->cpu_features |= CPU_FTR_TM;
-	/* Make sure "normal" HTM is off (it should be) */
-	cur_cpu_spec->cpu_user_features2 &= ~PPC_FEATURE2_HTM;
-	/* Turn on no suspend mode, and HTM no SC */
-	cur_cpu_spec->cpu_user_features2 |= PPC_FEATURE2_HTM_NO_SUSPEND | \
-					    PPC_FEATURE2_HTM_NOSC;
-	tm_suspend_disabled = true;
-}
-#endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
 
 /*
  * Returns the cpu frequency for 'cpu' in Hz. This is used by

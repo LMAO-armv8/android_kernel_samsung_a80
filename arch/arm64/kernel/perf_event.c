@@ -25,10 +25,11 @@
 #include <asm/virt.h>
 
 #include <linux/acpi.h>
-#include <linux/clocksource.h>
 #include <linux/of.h>
 #include <linux/perf/arm_pmu.h>
 #include <linux/platform_device.h>
+
+static DEFINE_PER_CPU(bool, is_hotplugging);
 
 /*
  * ARMv8 PMUv3 Performance Events handling code.
@@ -447,16 +448,9 @@ static struct attribute_group armv8_pmuv3_events_attr_group = {
 };
 
 PMU_FORMAT_ATTR(event, "config:0-15");
-PMU_FORMAT_ATTR(long, "config1:0");
-
-static inline bool armv8pmu_event_is_64bit(struct perf_event *event)
-{
-	return event->attr.config1 & 0x1;
-}
 
 static struct attribute *armv8_pmuv3_format_attrs[] = {
 	&format_attr_event.attr,
-	&format_attr_long.attr,
 	NULL,
 };
 
@@ -472,21 +466,6 @@ static struct attribute_group armv8_pmuv3_format_attr_group = {
 #define	ARMV8_IDX_COUNTER0	1
 #define	ARMV8_IDX_COUNTER_LAST(cpu_pmu) \
 	(ARMV8_IDX_CYCLE_COUNTER + cpu_pmu->num_events - 1)
-
-/*
- * We must chain two programmable counters for 64 bit events,
- * except when we have allocated the 64bit cycle counter (for CPU
- * cycles event). This must be called only when the event has
- * a counter allocated.
- */
-static inline bool armv8pmu_event_is_chained(struct perf_event *event)
-{
-	int idx = event->hw.idx;
-
-	return !WARN_ON(idx < 0) &&
-	       armv8pmu_event_is_64bit(event) &&
-	       (idx != ARMV8_IDX_CYCLE_COUNTER);
-}
 
 /*
  * ARMv8 low level PMU access
@@ -526,68 +505,34 @@ static inline int armv8pmu_counter_has_overflowed(u32 pmnc, int idx)
 	return pmnc & BIT(ARMV8_IDX_TO_COUNTER(idx));
 }
 
-static inline void armv8pmu_select_counter(int idx)
+static inline int armv8pmu_select_counter(int idx)
 {
 	u32 counter = ARMV8_IDX_TO_COUNTER(idx);
 	write_sysreg(counter, pmselr_el0);
 	isb();
+
+	return idx;
 }
 
-static inline u32 armv8pmu_read_evcntr(int idx)
-{
-	armv8pmu_select_counter(idx);
-	return read_sysreg(pmxevcntr_el0);
-}
-
-static inline u64 armv8pmu_read_hw_counter(struct perf_event *event)
-{
-	int idx = event->hw.idx;
-	u64 val = 0;
-
-	val = armv8pmu_read_evcntr(idx);
-	if (armv8pmu_event_is_chained(event))
-		val = (val << 32) | armv8pmu_read_evcntr(idx - 1);
-	return val;
-}
-
-static inline u64 armv8pmu_read_counter(struct perf_event *event)
+static inline u32 armv8pmu_read_counter(struct perf_event *event)
 {
 	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
 	struct hw_perf_event *hwc = &event->hw;
 	int idx = hwc->idx;
-	u64 value = 0;
+	u32 value = 0;
 
 	if (!armv8pmu_counter_valid(cpu_pmu, idx))
 		pr_err("CPU%u reading wrong counter %d\n",
 			smp_processor_id(), idx);
 	else if (idx == ARMV8_IDX_CYCLE_COUNTER)
 		value = read_sysreg(pmccntr_el0);
-	else
-		value = armv8pmu_read_hw_counter(event);
+	else if (armv8pmu_select_counter(idx) == idx)
+		value = read_sysreg(pmxevcntr_el0);
 
 	return value;
 }
 
-static inline void armv8pmu_write_evcntr(int idx, u32 value)
-{
-	armv8pmu_select_counter(idx);
-	write_sysreg(value, pmxevcntr_el0);
-}
-
-static inline void armv8pmu_write_hw_counter(struct perf_event *event,
-					     u64 value)
-{
-	int idx = event->hw.idx;
-
-	if (armv8pmu_event_is_chained(event)) {
-		armv8pmu_write_evcntr(idx, upper_32_bits(value));
-		armv8pmu_write_evcntr(idx - 1, lower_32_bits(value));
-	} else {
-		armv8pmu_write_evcntr(idx, value);
-	}
-}
-
-static inline void armv8pmu_write_counter(struct perf_event *event, u64 value)
+static inline void armv8pmu_write_counter(struct perf_event *event, u32 value)
 {
 	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
 	struct hw_perf_event *hwc = &event->hw;
@@ -598,43 +543,22 @@ static inline void armv8pmu_write_counter(struct perf_event *event, u64 value)
 			smp_processor_id(), idx);
 	else if (idx == ARMV8_IDX_CYCLE_COUNTER) {
 		/*
-		 * The cycles counter is really a 64-bit counter.
-		 * When treating it as a 32-bit counter, we only count
-		 * the lower 32 bits, and set the upper 32-bits so that
-		 * we get an interrupt upon 32-bit overflow.
+		 * Set the upper 32bits as this is a 64bit counter but we only
+		 * count using the lower 32bits and we want an interrupt when
+		 * it overflows.
 		 */
-		if (!armv8pmu_event_is_64bit(event))
-			value |= 0xffffffff00000000ULL;
-		write_sysreg(value, pmccntr_el0);
-	} else
-		armv8pmu_write_hw_counter(event, value);
+		u64 value64 = 0xffffffff00000000ULL | value;
+
+		write_sysreg(value64, pmccntr_el0);
+	} else if (armv8pmu_select_counter(idx) == idx)
+		write_sysreg(value, pmxevcntr_el0);
 }
 
 static inline void armv8pmu_write_evtype(int idx, u32 val)
 {
-	armv8pmu_select_counter(idx);
-	val &= ARMV8_PMU_EVTYPE_MASK;
-	write_sysreg(val, pmxevtyper_el0);
-}
-
-static inline void armv8pmu_write_event_type(struct perf_event *event)
-{
-	struct hw_perf_event *hwc = &event->hw;
-	int idx = hwc->idx;
-
-	/*
-	 * For chained events, the low counter is programmed to count
-	 * the event of interest and the high counter is programmed
-	 * with CHAIN event code with filters set to count at all ELs.
-	 */
-	if (armv8pmu_event_is_chained(event)) {
-		u32 chain_evt = ARMV8_PMUV3_PERFCTR_CHAIN |
-				ARMV8_PMU_INCLUDE_EL2;
-
-		armv8pmu_write_evtype(idx - 1, hwc->config_base);
-		armv8pmu_write_evtype(idx, chain_evt);
-	} else {
-		armv8pmu_write_evtype(idx, hwc->config_base);
+	if (armv8pmu_select_counter(idx) == idx) {
+		val &= ARMV8_PMU_EVTYPE_MASK;
+		write_sysreg(val, pmxevtyper_el0);
 	}
 }
 
@@ -645,16 +569,6 @@ static inline int armv8pmu_enable_counter(int idx)
 	return idx;
 }
 
-static inline void armv8pmu_enable_event_counter(struct perf_event *event)
-{
-	int idx = event->hw.idx;
-
-	armv8pmu_enable_counter(idx);
-	if (armv8pmu_event_is_chained(event))
-		armv8pmu_enable_counter(idx - 1);
-	isb();
-}
-
 static inline int armv8pmu_disable_counter(int idx)
 {
 	u32 counter = ARMV8_IDX_TO_COUNTER(idx);
@@ -662,26 +576,11 @@ static inline int armv8pmu_disable_counter(int idx)
 	return idx;
 }
 
-static inline void armv8pmu_disable_event_counter(struct perf_event *event)
-{
-	struct hw_perf_event *hwc = &event->hw;
-	int idx = hwc->idx;
-
-	if (armv8pmu_event_is_chained(event))
-		armv8pmu_disable_counter(idx - 1);
-	armv8pmu_disable_counter(idx);
-}
-
 static inline int armv8pmu_enable_intens(int idx)
 {
 	u32 counter = ARMV8_IDX_TO_COUNTER(idx);
 	write_sysreg(BIT(counter), pmintenset_el1);
 	return idx;
-}
-
-static inline int armv8pmu_enable_event_irq(struct perf_event *event)
-{
-	return armv8pmu_enable_intens(event->hw.idx);
 }
 
 static inline int armv8pmu_disable_intens(int idx)
@@ -694,11 +593,6 @@ static inline int armv8pmu_disable_intens(int idx)
 	isb();
 
 	return idx;
-}
-
-static inline int armv8pmu_disable_event_irq(struct perf_event *event)
-{
-	return armv8pmu_disable_intens(event->hw.idx);
 }
 
 static inline u32 armv8pmu_getreset_flags(void)
@@ -718,8 +612,10 @@ static inline u32 armv8pmu_getreset_flags(void)
 static void armv8pmu_enable_event(struct perf_event *event)
 {
 	unsigned long flags;
+	struct hw_perf_event *hwc = &event->hw;
 	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
 	struct pmu_hw_events *events = this_cpu_ptr(cpu_pmu->hw_events);
+	int idx = hwc->idx;
 
 	/*
 	 * Enable counter and interrupt, and set the counter to count
@@ -730,22 +626,22 @@ static void armv8pmu_enable_event(struct perf_event *event)
 	/*
 	 * Disable counter
 	 */
-	armv8pmu_disable_event_counter(event);
+	armv8pmu_disable_counter(idx);
 
 	/*
 	 * Set event (if destined for PMNx counters).
 	 */
-	armv8pmu_write_event_type(event);
+	armv8pmu_write_evtype(idx, hwc->config_base);
 
 	/*
 	 * Enable interrupt for this counter
 	 */
-	armv8pmu_enable_event_irq(event);
+	armv8pmu_enable_intens(idx);
 
 	/*
 	 * Enable counter
 	 */
-	armv8pmu_enable_event_counter(event);
+	armv8pmu_enable_counter(idx);
 
 	raw_spin_unlock_irqrestore(&events->pmu_lock, flags);
 }
@@ -753,8 +649,10 @@ static void armv8pmu_enable_event(struct perf_event *event)
 static void armv8pmu_disable_event(struct perf_event *event)
 {
 	unsigned long flags;
+	struct hw_perf_event *hwc = &event->hw;
 	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
 	struct pmu_hw_events *events = this_cpu_ptr(cpu_pmu->hw_events);
+	int idx = hwc->idx;
 
 	/*
 	 * Disable counter and interrupt
@@ -764,14 +662,130 @@ static void armv8pmu_disable_event(struct perf_event *event)
 	/*
 	 * Disable counter
 	 */
-	armv8pmu_disable_event_counter(event);
+	armv8pmu_disable_counter(idx);
 
 	/*
 	 * Disable interrupt for this counter
 	 */
-	armv8pmu_disable_event_irq(event);
+	armv8pmu_disable_intens(idx);
 
 	raw_spin_unlock_irqrestore(&events->pmu_lock, flags);
+}
+#ifdef CONFIG_KRYO_PMU_WORKAROUND
+static inline u32 armv8pmu_get_enabled_ints(void)
+{
+	u32 int_enset;
+
+	int_enset = read_sysreg(pmintenset_el1);
+	write_sysreg(0xffffffff, pmintenclr_el1);
+	isb();
+	return int_enset;
+}
+
+static inline u32 armv8pmu_update_enabled_ints(u32 value, int idx, int set)
+{
+	if (set)
+		value |=  BIT(ARMV8_IDX_TO_COUNTER(idx));
+	else
+		value &= ~(BIT(ARMV8_IDX_TO_COUNTER(idx)));
+
+	return value;
+}
+
+static inline void armv8pmu_set_enabled_ints(u32 mask)
+{
+	write_sysreg(mask, pmintenset_el1);
+	isb();
+}
+#else
+static inline u32 armv8pmu_get_enabled_ints(void)
+{ return 0; }
+
+static inline u32 armv8pmu_update_enabled_ints(u32 value, int idx, int set)
+{ return value; }
+
+static inline void armv8pmu_set_enabled_ints(u32 mask) { }
+#endif
+
+static irqreturn_t armv8pmu_handle_irq(int irq_num, void *dev)
+{
+	u32 pmovsr;
+	struct perf_sample_data data;
+	struct arm_pmu *cpu_pmu = (struct arm_pmu *)dev;
+	struct pmu_hw_events *cpuc = this_cpu_ptr(cpu_pmu->hw_events);
+	struct pt_regs *regs;
+	int idx;
+	u32 enabled_ints;
+
+	/*
+	 * Get enabled the PMU interrupts and mask all PMU interrupts.
+	 */
+	enabled_ints = armv8pmu_get_enabled_ints();
+
+	/*
+	 * Get and reset the IRQ flags
+	 */
+	pmovsr = armv8pmu_getreset_flags();
+
+	/*
+	 * Did an overflow occur?
+	 */
+	if (!armv8pmu_has_overflowed(pmovsr))
+		return IRQ_NONE;
+
+	/*
+	 * Handle the counter(s) overflow(s)
+	 */
+	regs = get_irq_regs();
+
+	for (idx = 0; idx < cpu_pmu->num_events; ++idx) {
+		struct perf_event *event = cpuc->events[idx];
+		struct hw_perf_event *hwc;
+
+		/* Ignore if we don't have an event */
+		if (!event || event->state != PERF_EVENT_STATE_ACTIVE)
+			continue;
+
+		/*
+		 * We have a single interrupt for all counters. Check that
+		 * each counter has overflowed before we process it.
+		 */
+		if (!armv8pmu_counter_has_overflowed(pmovsr, idx))
+			continue;
+
+		hwc = &event->hw;
+		armpmu_event_update(event);
+		perf_sample_data_init(&data, 0, hwc->last_period);
+		if (!armpmu_event_set_period(event))
+			continue;
+
+		if (perf_event_overflow(event, &data, regs)) {
+			cpu_pmu->disable(event);
+
+			/*
+			 * Update the list of interrupts
+			 * that should be reenabled.
+			 */
+			enabled_ints = armv8pmu_update_enabled_ints(
+					enabled_ints, idx, 0);
+		}
+	}
+
+	/*
+	 * Handle the pending perf events.
+	 *
+	 * Note: this call *must* be run with interrupts disabled. For
+	 * platforms that can have the PMU interrupts raised as an NMI, this
+	 * will not work.
+	 */
+	irq_work_run();
+
+	/*
+	 * Re-enable the PMU interrupts
+	 */
+	armv8pmu_set_enabled_ints(enabled_ints);
+
+	return IRQ_HANDLED;
 }
 
 static void armv8pmu_start(struct arm_pmu *cpu_pmu)
@@ -796,109 +810,10 @@ static void armv8pmu_stop(struct arm_pmu *cpu_pmu)
 	raw_spin_unlock_irqrestore(&events->pmu_lock, flags);
 }
 
-static irqreturn_t armv8pmu_handle_irq(struct arm_pmu *cpu_pmu)
-{
-	u32 pmovsr;
-	struct perf_sample_data data;
-	struct pmu_hw_events *cpuc = this_cpu_ptr(cpu_pmu->hw_events);
-	struct pt_regs *regs;
-	int idx;
-
-	/*
-	 * Get and reset the IRQ flags
-	 */
-	pmovsr = armv8pmu_getreset_flags();
-
-	/*
-	 * Did an overflow occur?
-	 */
-	if (!armv8pmu_has_overflowed(pmovsr))
-		return IRQ_NONE;
-
-	/*
-	 * Handle the counter(s) overflow(s)
-	 */
-	regs = get_irq_regs();
-
-	/*
-	 * Stop the PMU while processing the counter overflows
-	 * to prevent skews in group events.
-	 */
-	armv8pmu_stop(cpu_pmu);
-	for (idx = 0; idx < cpu_pmu->num_events; ++idx) {
-		struct perf_event *event = cpuc->events[idx];
-		struct hw_perf_event *hwc;
-
-		/* Ignore if we don't have an event. */
-		if (!event)
-			continue;
-
-		/*
-		 * We have a single interrupt for all counters. Check that
-		 * each counter has overflowed before we process it.
-		 */
-		if (!armv8pmu_counter_has_overflowed(pmovsr, idx))
-			continue;
-
-		hwc = &event->hw;
-		armpmu_event_update(event);
-		perf_sample_data_init(&data, 0, hwc->last_period);
-		if (!armpmu_event_set_period(event))
-			continue;
-
-		if (perf_event_overflow(event, &data, regs))
-			cpu_pmu->disable(event);
-	}
-	armv8pmu_start(cpu_pmu);
-
-	/*
-	 * Handle the pending perf events.
-	 *
-	 * Note: this call *must* be run with interrupts disabled. For
-	 * platforms that can have the PMU interrupts raised as an NMI, this
-	 * will not work.
-	 */
-	irq_work_run();
-
-	return IRQ_HANDLED;
-}
-
-static int armv8pmu_get_single_idx(struct pmu_hw_events *cpuc,
-				    struct arm_pmu *cpu_pmu)
-{
-	int idx;
-
-	for (idx = ARMV8_IDX_COUNTER0; idx < cpu_pmu->num_events; idx ++) {
-		if (!test_and_set_bit(idx, cpuc->used_mask))
-			return idx;
-	}
-	return -EAGAIN;
-}
-
-static int armv8pmu_get_chain_idx(struct pmu_hw_events *cpuc,
-				   struct arm_pmu *cpu_pmu)
-{
-	int idx;
-
-	/*
-	 * Chaining requires two consecutive event counters, where
-	 * the lower idx must be even.
-	 */
-	for (idx = ARMV8_IDX_COUNTER0 + 1; idx < cpu_pmu->num_events; idx += 2) {
-		if (!test_and_set_bit(idx, cpuc->used_mask)) {
-			/* Check if the preceding even counter is available */
-			if (!test_and_set_bit(idx - 1, cpuc->used_mask))
-				return idx;
-			/* Release the Odd counter */
-			clear_bit(idx, cpuc->used_mask);
-		}
-	}
-	return -EAGAIN;
-}
-
 static int armv8pmu_get_event_idx(struct pmu_hw_events *cpuc,
 				  struct perf_event *event)
 {
+	int idx;
 	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
 	struct hw_perf_event *hwc = &event->hw;
 	unsigned long evtype = hwc->config_base & ARMV8_PMU_EVTYPE_EVENT;
@@ -912,20 +827,13 @@ static int armv8pmu_get_event_idx(struct pmu_hw_events *cpuc,
 	/*
 	 * Otherwise use events counters
 	 */
-	if (armv8pmu_event_is_64bit(event))
-		return	armv8pmu_get_chain_idx(cpuc, cpu_pmu);
-	else
-		return armv8pmu_get_single_idx(cpuc, cpu_pmu);
-}
+	for (idx = ARMV8_IDX_COUNTER0; idx < cpu_pmu->num_events; ++idx) {
+		if (!test_and_set_bit(idx, cpuc->used_mask))
+			return idx;
+	}
 
-static void armv8pmu_clear_event_idx(struct pmu_hw_events *cpuc,
-				     struct perf_event *event)
-{
-	int idx = event->hw.idx;
-
-	clear_bit(idx, cpuc->used_mask);
-	if (armv8pmu_event_is_chained(event))
-		clear_bit(idx - 1, cpuc->used_mask);
+	/* The counters are all in use. */
+	return -EAGAIN;
 }
 
 /*
@@ -935,9 +843,6 @@ static int armv8pmu_set_event_filter(struct hw_perf_event *event,
 				     struct perf_event_attr *attr)
 {
 	unsigned long config_base = 0;
-
-	if (attr->exclude_idle)
-		return -EPERM;
 
 	/*
 	 * If we're running in hyp mode, then we *are* the hypervisor.
@@ -987,8 +892,8 @@ static void armv8pmu_reset(void *info)
 	 * Initialize & Reset PMNC. Request overflow interrupt for
 	 * 64 bit cycle counter but cheat in armv8pmu_write_counter().
 	 */
-	armv8pmu_pmcr_write(ARMV8_PMU_PMCR_P | ARMV8_PMU_PMCR_C |
-			    ARMV8_PMU_PMCR_LC);
+	armv8pmu_pmcr_write(armv8pmu_pmcr_read() | ARMV8_PMU_PMCR_P |
+			ARMV8_PMU_PMCR_C | ARMV8_PMU_PMCR_LC);
 }
 
 static int __armv8_pmuv3_map_event(struct perf_event *event,
@@ -1005,9 +910,6 @@ static int __armv8_pmuv3_map_event(struct perf_event *event,
 	hw_event_id = armpmu_map_event(event, &armv8_pmuv3_perf_map,
 				       &armv8_pmuv3_perf_cache_map,
 				       ARMV8_PMU_EVTYPE_EVENT);
-
-	if (armv8pmu_event_is_64bit(event))
-		event->hw.flags |= ARMPMU_EVT_64BIT;
 
 	/* Onl expose micro/arch events supported by this PMU */
 	if ((hw_event_id > 0) && (hw_event_id < ARMV8_PMUV3_MAX_COMMON_EVENTS)
@@ -1082,8 +984,58 @@ static void __armv8pmu_probe_pmu(void *info)
 	pmceid[0] = read_sysreg(pmceid0_el0);
 	pmceid[1] = read_sysreg(pmceid1_el0);
 
-	bitmap_from_arr32(cpu_pmu->pmceid_bitmap,
-			     pmceid, ARMV8_PMUV3_MAX_COMMON_EVENTS);
+	bitmap_from_u32array(cpu_pmu->pmceid_bitmap,
+			     ARMV8_PMUV3_MAX_COMMON_EVENTS, pmceid,
+			     ARRAY_SIZE(pmceid));
+}
+
+static void armv8pmu_idle_update(struct arm_pmu *cpu_pmu)
+{
+	struct pmu_hw_events *hw_events;
+	struct perf_event *event;
+	int idx;
+
+	if (!cpu_pmu)
+		return;
+
+	if (__this_cpu_read(is_hotplugging))
+		return;
+
+	hw_events = this_cpu_ptr(cpu_pmu->hw_events);
+
+	if (!hw_events)
+		return;
+
+	for (idx = 0; idx < cpu_pmu->num_events; ++idx) {
+
+		if (!test_bit(idx, hw_events->used_mask))
+			continue;
+
+		event = hw_events->events[idx];
+
+		if (!event || !event->attr.exclude_idle ||
+				event->state != PERF_EVENT_STATE_ACTIVE)
+			continue;
+
+		cpu_pmu->pmu.read(event);
+	}
+}
+
+struct arm_pmu_and_idle_nb {
+	struct arm_pmu *cpu_pmu;
+	struct notifier_block perf_cpu_idle_nb;
+};
+
+static int perf_cpu_idle_notifier(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	struct arm_pmu_and_idle_nb *pmu_nb = container_of(nb,
+				struct arm_pmu_and_idle_nb, perf_cpu_idle_nb);
+
+	if (action == IDLE_START)
+		armv8pmu_idle_update(pmu_nb->cpu_pmu);
+
+	return NOTIFY_OK;
 }
 
 static int armv8pmu_probe_pmu(struct arm_pmu *cpu_pmu)
@@ -1093,6 +1045,15 @@ static int armv8pmu_probe_pmu(struct arm_pmu *cpu_pmu)
 		.present = false,
 	};
 	int ret;
+	struct arm_pmu_and_idle_nb *pmu_idle_nb;
+
+	pmu_idle_nb = devm_kzalloc(&cpu_pmu->plat_device->dev,
+					sizeof(*pmu_idle_nb), GFP_KERNEL);
+	if (!pmu_idle_nb)
+		return -ENOMEM;
+
+	pmu_idle_nb->cpu_pmu = cpu_pmu;
+	pmu_idle_nb->perf_cpu_idle_nb.notifier_call = perf_cpu_idle_notifier;
 
 	ret = smp_call_function_any(&cpu_pmu->supported_cpus,
 				    __armv8pmu_probe_pmu,
@@ -1100,7 +1061,12 @@ static int armv8pmu_probe_pmu(struct arm_pmu *cpu_pmu)
 	if (ret)
 		return ret;
 
-	return probe.present ? 0 : -ENODEV;
+	if (!probe.present)
+		return -ENODEV;
+
+	idle_notifier_register(&pmu_idle_nb->perf_cpu_idle_nb);
+
+	return 0;
 }
 
 static int armv8_pmu_init(struct arm_pmu *cpu_pmu)
@@ -1115,10 +1081,10 @@ static int armv8_pmu_init(struct arm_pmu *cpu_pmu)
 	cpu_pmu->read_counter		= armv8pmu_read_counter,
 	cpu_pmu->write_counter		= armv8pmu_write_counter,
 	cpu_pmu->get_event_idx		= armv8pmu_get_event_idx,
-	cpu_pmu->clear_event_idx	= armv8pmu_clear_event_idx,
 	cpu_pmu->start			= armv8pmu_start,
 	cpu_pmu->stop			= armv8pmu_stop,
 	cpu_pmu->reset			= armv8pmu_reset,
+	cpu_pmu->max_period		= (1LLU << 32) - 1,
 	cpu_pmu->set_event_filter	= armv8pmu_set_event_filter;
 	cpu_pmu->filter_match		= armv8pmu_filter_match;
 
@@ -1265,9 +1231,65 @@ static const struct of_device_id armv8_pmu_of_device_ids[] = {
 	{},
 };
 
+#ifdef CONFIG_HOTPLUG_CPU
+static int perf_event_hotplug_coming_up(unsigned int cpu)
+{
+	per_cpu(is_hotplugging, cpu) = false;
+	return 0;
+}
+
+static int perf_event_hotplug_going_down(unsigned int cpu)
+{
+	per_cpu(is_hotplugging, cpu) = true;
+	return 0;
+}
+
+static int perf_event_cpu_hp_init(void)
+{
+	int ret;
+
+	ret = cpuhp_setup_state_nocalls(CPUHP_AP_NOTIFY_PERF_ONLINE,
+				"PERF_EVENT/CPUHP_AP_NOTIFY_PERF_ONLINE",
+				perf_event_hotplug_coming_up,
+				perf_event_hotplug_going_down);
+	if (ret)
+		pr_err("CPU hotplug notifier for perf_event.c could not be registered: %d\n",
+		       ret);
+
+	return ret;
+}
+#else
+static int perf_event_cpu_hp_init(void) { return 0; }
+#endif
+
+/*
+ * Non DT systems have their micro/arch events probed at run-time.
+ * A fairly complete list of generic events are provided and ones that
+ * aren't supported by the current PMU are disabled.
+ */
+static const struct pmu_probe_info armv8_pmu_probe_table[] = {
+	PMU_PROBE(0, 0, armv8_pmuv3_init), /* enable all defined counters */
+	{ /* sentinel value */ }
+};
+
 static int armv8_pmu_device_probe(struct platform_device *pdev)
 {
-	return arm_pmu_device_probe(pdev, armv8_pmu_of_device_ids, NULL);
+	int ret, cpu;
+
+	for_each_possible_cpu(cpu)
+		per_cpu(is_hotplugging, cpu) = false;
+
+	ret = perf_event_cpu_hp_init();
+	if (ret)
+		return ret;
+
+	/* set to true so armv8pmu_idle_update doesn't try to load
+	 * hw_events before arm_pmu_device_probe has initialized it.
+	 */
+	ret = arm_pmu_device_probe(pdev, armv8_pmu_of_device_ids,
+		(acpi_disabled ?  NULL : armv8_pmu_probe_table));
+
+	return ret;
 }
 
 static struct platform_driver armv8_pmu_driver = {
@@ -1287,32 +1309,3 @@ static int __init armv8_pmu_driver_init(void)
 		return arm_pmu_acpi_probe(armv8_pmuv3_init);
 }
 device_initcall(armv8_pmu_driver_init)
-
-void arch_perf_update_userpage(struct perf_event *event,
-			       struct perf_event_mmap_page *userpg, u64 now)
-{
-	u32 freq;
-	u32 shift;
-
-	/*
-	 * Internal timekeeping for enabled/running/stopped times
-	 * is always computed with the sched_clock.
-	 */
-	freq = arch_timer_get_rate();
-	userpg->cap_user_time = 1;
-
-	clocks_calc_mult_shift(&userpg->time_mult, &shift, freq,
-			NSEC_PER_SEC, 0);
-	/*
-	 * time_shift is not expected to be greater than 31 due to
-	 * the original published conversion algorithm shifting a
-	 * 32-bit value (now specifies a 64-bit value) - refer
-	 * perf_event_mmap_page documentation in perf_event.h.
-	 */
-	if (shift == 32) {
-		shift = 31;
-		userpg->time_mult >>= 1;
-	}
-	userpg->time_shift = (u16)shift;
-	userpg->time_offset = -now;
-}

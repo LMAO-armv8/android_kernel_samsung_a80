@@ -18,7 +18,6 @@
  */
 
 #include <linux/acpi.h>
-#include <linux/arm_sdei.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
@@ -48,7 +47,6 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
-#include <asm/daifflags.h>
 #include <asm/mmu_context.h>
 #include <asm/numa.h>
 #include <asm/pgtable.h>
@@ -60,9 +58,16 @@
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
 #include <asm/virt.h>
+#include <asm/system_misc.h>
+#include <soc/qcom/minidump.h>
+
+#include <soc/qcom/scm.h>
+#include <soc/qcom/lpm_levels.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/ipi.h>
+
+#include <linux/sec_debug.h>
 
 DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
 EXPORT_PER_CPU_SYMBOL(cpu_number);
@@ -188,7 +193,6 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
  */
 asmlinkage notrace void secondary_start_kernel(void)
 {
-	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
 	struct mm_struct *mm = &init_mm;
 	unsigned int cpu;
 
@@ -232,21 +236,20 @@ asmlinkage notrace void secondary_start_kernel(void)
 	notify_cpu_starting(cpu);
 
 	store_cpu_topology(cpu);
-	numa_add_cpu(cpu);
 
 	/*
 	 * OK, now it's safe to let the boot CPU continue.  Wait for
 	 * the CPU migration code to notice that the CPU is online
 	 * before we continue.
 	 */
-	pr_info("CPU%u: Booted secondary processor 0x%010lx [0x%08x]\n",
-					 cpu, (unsigned long)mpidr,
-					 read_cpuid_id());
+	pr_info("CPU%u: Booted secondary processor [%08x]\n",
+					 cpu, read_cpuid_id());
 	update_cpu_boot_status(CPU_BOOT_SUCCESS);
 	set_cpu_online(cpu, true);
 	complete(&cpu_running);
 
-	local_daif_restore(DAIF_PROCCTX);
+	local_irq_enable();
+	local_async_enable();
 
 	/*
 	 * OK, it's off to the idle thread for us
@@ -285,9 +288,6 @@ int __cpu_disable(void)
 	ret = op_cpu_disable(cpu);
 	if (ret)
 		return ret;
-
-	remove_cpu_topology(cpu);
-	numa_remove_cpu(cpu);
 
 	/*
 	 * Take this CPU offline.  Once we clear this, we can't return,
@@ -328,7 +328,7 @@ void __cpu_die(unsigned int cpu)
 		pr_crit("CPU%u: cpu didn't die\n", cpu);
 		return;
 	}
-	pr_notice("CPU%u: shutdown\n", cpu);
+	pr_info("CPU%u: shutdown\n", cpu);
 
 	/*
 	 * Now that the dying CPU is beyond the point of no return w.r.t.
@@ -345,6 +345,10 @@ void __cpu_die(unsigned int cpu)
 /*
  * Called from the idle thread for the CPU which has been shutdown.
  *
+ * Note that we disable IRQs here, but do not re-enable them
+ * before returning to the caller. This is also the behaviour
+ * of the other hotplug-cpu capable cores, so presumably coming
+ * out of idle fixes this.
  */
 void cpu_die(void)
 {
@@ -355,7 +359,7 @@ void cpu_die(void)
 
 	idle_task_exit();
 
-	local_daif_mask();
+	local_irq_disable();
 
 	/* Tell __cpu_die() that this CPU is now safe to dispose of */
 	(void)cpu_report_death();
@@ -412,6 +416,7 @@ void __init smp_cpus_done(unsigned int max_cpus)
 	setup_cpu_features();
 	hyp_mode_check();
 	apply_alternatives_all();
+	scm_enable_mem_protection();
 	mark_linear_text_alias_ro();
 }
 
@@ -458,9 +463,12 @@ static bool __init is_mpidr_duplicate(unsigned int cpu, u64 hwid)
 {
 	unsigned int i;
 
-	for (i = 1; (i < cpu) && (i < NR_CPUS); i++)
+	for (i = 0; (i <= cpu) && (i < NR_CPUS); i++) {
+		if (i == logical_bootcpu_id)
+			continue;
 		if (cpu_logical_map(i) == hwid)
 			return true;
+	}
 	return false;
 }
 
@@ -482,7 +490,7 @@ static int __init smp_cpu_setup(int cpu)
 }
 
 static bool bootcpu_valid __initdata;
-static unsigned int cpu_count = 1;
+static unsigned int cpu_count;
 
 #ifdef CONFIG_ACPI
 static struct acpi_madt_generic_interrupt cpu_madt_gicc[NR_CPUS];
@@ -519,7 +527,7 @@ acpi_map_gic_cpu_interface(struct acpi_madt_generic_interrupt *processor)
 	}
 
 	/* Check if GICC structure of boot CPU is available in the MADT */
-	if (cpu_logical_map(0) == hwid) {
+	if (cpu_logical_map(logical_bootcpu_id) == hwid) {
 		if (bootcpu_valid) {
 			pr_err("duplicate boot CPU MPIDR: 0x%llx in MADT\n",
 			       hwid);
@@ -527,6 +535,8 @@ acpi_map_gic_cpu_interface(struct acpi_madt_generic_interrupt *processor)
 		}
 		bootcpu_valid = true;
 		cpu_madt_gicc[0] = *processor;
+		early_map_cpu_to_node(logical_bootcpu_id,
+					acpi_numa_get_nid(0, hwid));
 		return;
 	}
 
@@ -549,6 +559,8 @@ acpi_map_gic_cpu_interface(struct acpi_madt_generic_interrupt *processor)
 	 */
 	acpi_set_mailbox_entry(cpu_count, processor);
 
+	early_map_cpu_to_node(cpu_count, acpi_numa_get_nid(cpu_count, hwid));
+
 	cpu_count++;
 }
 
@@ -568,44 +580,17 @@ acpi_parse_gic_cpu_interface(struct acpi_subtable_header *header,
 
 	return 0;
 }
-
-static void __init acpi_parse_and_init_cpus(void)
-{
-	int i;
-
-	/*
-	 * do a walk of MADT to determine how many CPUs
-	 * we have including disabled CPUs, and get information
-	 * we need for SMP init.
-	 */
-	acpi_table_parse_madt(ACPI_MADT_TYPE_GENERIC_INTERRUPT,
-				      acpi_parse_gic_cpu_interface, 0);
-
-	/*
-	 * In ACPI, SMP and CPU NUMA information is provided in separate
-	 * static tables, namely the MADT and the SRAT.
-	 *
-	 * Thus, it is simpler to first create the cpu logical map through
-	 * an MADT walk and then map the logical cpus to their node ids
-	 * as separate steps.
-	 */
-	acpi_map_cpus_to_nodes();
-
-	for (i = 0; i < nr_cpu_ids; i++)
-		early_map_cpu_to_node(i, acpi_numa_get_nid(i));
-}
 #else
-#define acpi_parse_and_init_cpus(...)	do { } while (0)
+#define acpi_table_parse_madt(...)	do { } while (0)
 #endif
-/* Dummy vendor field */
+void (*__smp_cross_call)(const struct cpumask *, unsigned int);
 DEFINE_PER_CPU(bool, pending_ipi);
-EXPORT_SYMBOL_GPL(pending_ipi);
 
-static void (*__smp_update_ipi_history_cb)(int cpu);
 /*
  * Enumerate the possible CPU set from the device tree and build the
  * cpu logical map array containing MPIDR values related to logical
- * cpus. Assumes that cpu_logical_map(0) has already been initialized.
+ * cpus. Assumes that cpu_logical_map(logical_bootcpu_id) has already
+ * been initialized.
  */
 static void __init of_parse_and_init_cpus(void)
 {
@@ -623,13 +608,7 @@ static void __init of_parse_and_init_cpus(void)
 			goto next;
 		}
 
-		/*
-		 * The numbering scheme requires that the boot CPU
-		 * must be assigned logical id 0. Record it so that
-		 * the logical map built from DT is validated and can
-		 * be used.
-		 */
-		if (hwid == cpu_logical_map(0)) {
+		if (hwid == cpu_logical_map(logical_bootcpu_id)) {
 			if (bootcpu_valid) {
 				pr_err("%pOF: duplicate boot cpu reg property in DT\n",
 					dn);
@@ -637,15 +616,17 @@ static void __init of_parse_and_init_cpus(void)
 			}
 
 			bootcpu_valid = true;
-			early_map_cpu_to_node(0, of_node_to_nid(dn));
+			early_map_cpu_to_node(logical_bootcpu_id,
+						of_node_to_nid(dn));
 
 			/*
-			 * cpu_logical_map has already been
-			 * initialized and the boot cpu doesn't need
-			 * the enable-method so continue without
-			 * incrementing cpu.
+			 * boot cpu's cpu_logical_map is already
+			 * initialized and the boot cpu doesn't need the
+			 * enable-method like secondary cpu's. Now, as we
+			 * can't assume logical boot cpu to be 0, we need
+			 * to loop through entire logical cpu map.
 			 */
-			continue;
+			goto next;
 		}
 
 		if (cpu_count >= NR_CPUS)
@@ -672,7 +653,13 @@ void __init smp_init_cpus(void)
 	if (acpi_disabled)
 		of_parse_and_init_cpus();
 	else
-		acpi_parse_and_init_cpus();
+		/*
+		 * do a walk of MADT to determine how many CPUs
+		 * we have including disabled CPUs, and get information
+		 * we need for SMP init
+		 */
+		acpi_table_parse_madt(ACPI_MADT_TYPE_GENERIC_INTERRUPT,
+				      acpi_parse_gic_cpu_interface, 0);
 
 	if (cpu_count > nr_cpu_ids)
 		pr_warn("Number of cores (%d) exceeds configured maximum of %u - clipping\n",
@@ -690,8 +677,12 @@ void __init smp_init_cpus(void)
 	 * with entries in cpu_logical_map while initializing the cpus.
 	 * If the cpu set-up fails, invalidate the cpu_logical_map entry.
 	 */
-	for (i = 1; i < nr_cpu_ids; i++) {
+	for (i = 0; i < nr_cpu_ids; i++) {
 		if (cpu_logical_map(i) != INVALID_HWID) {
+			if (cpu_logical_map(i) ==
+					cpu_logical_map(logical_bootcpu_id))
+				continue;
+
 			if (smp_cpu_setup(i))
 				cpu_logical_map(i) = INVALID_HWID;
 		}
@@ -709,7 +700,6 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	this_cpu = smp_processor_id();
 	store_cpu_topology(this_cpu);
 	numa_store_cpu_info(this_cpu);
-	numa_add_cpu(this_cpu);
 
 	/*
 	 * If UP is mandated by "nosmp" (which implies "maxcpus=0"), don't set
@@ -742,18 +732,10 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	}
 }
 
-void (*__smp_cross_call)(const struct cpumask *, unsigned int);
-
 void __init set_smp_cross_call(void (*fn)(const struct cpumask *, unsigned int))
 {
 	__smp_cross_call = fn;
 }
-
-void set_update_ipi_history_callback(void (*fn)(int))
-{
-	__smp_update_ipi_history_cb = fn;
-}
-EXPORT_SYMBOL_GPL(set_update_ipi_history_callback);
 
 static const char *ipi_types[NR_IPI] __tracepoint_string = {
 #define S(x,s)	[x] = s
@@ -770,6 +752,17 @@ static void smp_cross_call(const struct cpumask *target, unsigned int ipinr)
 {
 	trace_ipi_raise(target, ipi_types[ipinr]);
 	__smp_cross_call(target, ipinr);
+}
+
+static void smp_cross_call_common(const struct cpumask *cpumask,
+				  unsigned int func)
+{
+	unsigned int cpu;
+
+	for_each_cpu(cpu, cpumask)
+		per_cpu(pending_ipi, cpu) = true;
+
+	smp_cross_call(cpumask, func);
 }
 
 void show_ipi_list(struct seq_file *p, int prec)
@@ -799,18 +792,18 @@ u64 smp_irq_stat_cpu(unsigned int cpu)
 
 void arch_send_call_function_ipi_mask(const struct cpumask *mask)
 {
-	smp_cross_call(mask, IPI_CALL_FUNC);
+	smp_cross_call_common(mask, IPI_CALL_FUNC);
 }
 
 void arch_send_call_function_single_ipi(int cpu)
 {
-	smp_cross_call(cpumask_of(cpu), IPI_CALL_FUNC);
+	smp_cross_call_common(cpumask_of(cpu), IPI_CALL_FUNC);
 }
 
 #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
 void arch_send_wakeup_ipi_mask(const struct cpumask *mask)
 {
-	smp_cross_call(mask, IPI_WAKEUP);
+	smp_cross_call_common(mask, IPI_WAKEUP);
 }
 #endif
 
@@ -818,19 +811,38 @@ void arch_send_wakeup_ipi_mask(const struct cpumask *mask)
 void arch_irq_work_raise(void)
 {
 	if (__smp_cross_call)
-		smp_cross_call(cpumask_of(smp_processor_id()), IPI_IRQ_WORK);
+		smp_cross_call_common(cpumask_of(smp_processor_id()),
+				      IPI_IRQ_WORK);
 }
 #endif
+
+static DEFINE_RAW_SPINLOCK(stop_lock);
+
+DEFINE_PER_CPU(struct pt_regs, regs_before_stop);
 
 /*
  * ipi_cpu_stop - handle IPI from smp_send_stop()
  */
-static void ipi_cpu_stop(unsigned int cpu)
+static void ipi_cpu_stop(unsigned int cpu, struct pt_regs *regs)
 {
-	set_cpu_online(cpu, false);
+	if (system_state == SYSTEM_BOOTING ||
+	    system_state == SYSTEM_RUNNING) {
+		per_cpu(regs_before_stop, cpu) = *regs;
+		raw_spin_lock(&stop_lock);
+		pr_crit("CPU%u: stopping\n", cpu);
+		__show_regs(regs);
+		dump_stack();
+		dump_stack_minidump(regs->sp);
+#ifdef CONFIG_SEC_DEBUG
+		sec_debug_save_context();
+#endif
+		raw_spin_unlock(&stop_lock);
+	}
 
-	local_daif_mask();
-	sdei_mask_local_cpu();
+	set_cpu_active(cpu, false);
+
+	flush_cache_all();
+	local_irq_disable();
 
 	while (1)
 		cpu_relax();
@@ -848,7 +860,6 @@ static void ipi_cpu_crash_stop(unsigned int cpu, struct pt_regs *regs)
 	atomic_dec(&waiting_for_crash_ipi);
 
 	local_irq_disable();
-	sdei_mask_local_cpu();
 
 #ifdef CONFIG_HOTPLUG_CPU
 	if (cpu_ops[cpu]->cpu_die)
@@ -886,7 +897,7 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 	case IPI_CPU_STOP:
 		irq_enter();
-		ipi_cpu_stop(cpu);
+		ipi_cpu_stop(cpu, regs);
 		irq_exit();
 		break;
 
@@ -930,20 +941,21 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 	if ((unsigned)ipinr < NR_IPI)
 		trace_ipi_exit_rcuidle(ipi_types[ipinr]);
+	per_cpu(pending_ipi, cpu) = false;
 	set_irq_regs(old_regs);
 }
 
 void smp_send_reschedule(int cpu)
 {
-	if (__smp_update_ipi_history_cb)
-		__smp_update_ipi_history_cb(cpu);
-	smp_cross_call(cpumask_of(cpu), IPI_RESCHEDULE);
+	BUG_ON(cpu_is_offline(cpu));
+	update_ipi_history(cpu);
+	smp_cross_call_common(cpumask_of(cpu), IPI_RESCHEDULE);
 }
 
 #ifdef CONFIG_GENERIC_CLOCKEVENTS_BROADCAST
 void tick_broadcast(const struct cpumask *mask)
 {
-	smp_cross_call(mask, IPI_TIMER);
+	smp_cross_call_common(mask, IPI_TIMER);
 }
 #endif
 
@@ -970,19 +982,17 @@ void smp_send_stop(void)
 
 		if (system_state <= SYSTEM_RUNNING)
 			pr_crit("SMP: stopping secondary CPUs\n");
-		smp_cross_call(&mask, IPI_CPU_STOP);
+		smp_cross_call_common(&mask, IPI_CPU_STOP);
 	}
 
 	/* Wait up to one second for other CPUs to stop */
 	timeout = USEC_PER_SEC;
-	while (num_other_online_cpus() && timeout--)
+	while (num_active_cpus() > 1 && timeout--)
 		udelay(1);
 
-	if (num_other_online_cpus())
+	if (num_active_cpus() > 1)
 		pr_warning("SMP: failed to stop secondary CPUs %*pbl\n",
 			   cpumask_pr_args(cpu_online_mask));
-
-	sdei_mask_local_cpu();
 }
 
 #ifdef CONFIG_KEXEC_CORE
@@ -1005,10 +1015,8 @@ void crash_smp_send_stop(void)
 	 * If this cpu is the only one alive at this point in time, online or
 	 * not, there are no stop messages to be sent around, so just back out.
 	 */
-	if (num_other_online_cpus() == 0) {
-		sdei_mask_local_cpu();
+	if (num_other_online_cpus() == 0)
 		return;
-	}
 
 	cpumask_copy(&mask, cpu_online_mask);
 	cpumask_clear_cpu(smp_processor_id(), &mask);
@@ -1026,8 +1034,6 @@ void crash_smp_send_stop(void)
 	if (atomic_read(&waiting_for_crash_ipi) > 0)
 		pr_warning("SMP: failed to stop secondary CPUs %*pbl\n",
 			   cpumask_pr_args(&mask));
-
-	sdei_mask_local_cpu();
 }
 
 bool smp_crash_stop_failed(void)

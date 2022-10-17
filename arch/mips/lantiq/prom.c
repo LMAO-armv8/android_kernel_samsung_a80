@@ -9,6 +9,7 @@
 #include <linux/export.h>
 #include <linux/clk.h>
 #include <linux/bootmem.h>
+#include <linux/of_platform.h>
 #include <linux/of_fdt.h>
 
 #include <asm/bootinfo.h>
@@ -81,7 +82,7 @@ void __init plat_mem_setup(void)
 
 	if (fw_passed_dtb) /* UHI interface */
 		dtb = (void *)fw_passed_dtb;
-	else if (&__dtb_start != &__dtb_end)
+	else if (__dtb_start != __dtb_end)
 		dtb = (void *)__dtb_start;
 	else
 		panic("no dtb found");
@@ -113,3 +114,10 @@ void __init prom_init(void)
 		panic("failed to register_vsmp_smp_ops()");
 #endif
 }
+
+int __init plat_of_setup(void)
+{
+	return of_platform_default_populate(NULL, NULL, NULL);
+}
+
+arch_initcall(plat_of_setup);

@@ -28,6 +28,8 @@
 #include <asm/coprocessor.h>
 #include <asm/unistd.h>
 
+#define DEBUG_SIG  0
+
 extern struct task_struct *coproc_owners[];
 
 struct rt_sigframe
@@ -397,8 +399,10 @@ static int setup_frame(struct ksignal *ksig, sigset_t *set,
 	regs->areg[8] = (unsigned long) &frame->uc;
 	regs->threadptr = tp;
 
-	pr_debug("SIG rt deliver (%s:%d): signal=%d sp=%p pc=%08lx\n",
-		 current->comm, current->pid, sig, frame, regs->pc);
+#if DEBUG_SIG
+	printk("SIG rt deliver (%s:%d): signal=%d sp=%p pc=%08x\n",
+		current->comm, current->pid, sig, frame, regs->pc);
+#endif
 
 	return 0;
 }
@@ -455,7 +459,7 @@ static void do_signal(struct pt_regs *regs)
 		/* Set up the stack frame */
 		ret = setup_frame(&ksig, sigmask_to_save(), regs);
 		signal_setup_done(ret, &ksig, 0);
-		if (test_thread_flag(TIF_SINGLESTEP))
+		if (current->ptrace & PT_SINGLESTEP)
 			task_pt_regs(current)->icountlevel = 1;
 
 		return;
@@ -481,7 +485,7 @@ static void do_signal(struct pt_regs *regs)
 	/* If there's no signal to deliver, we just restore the saved mask.  */
 	restore_saved_sigmask();
 
-	if (test_thread_flag(TIF_SINGLESTEP))
+	if (current->ptrace & PT_SINGLESTEP)
 		task_pt_regs(current)->icountlevel = 1;
 	return;
 }

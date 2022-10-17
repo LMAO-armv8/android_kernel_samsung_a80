@@ -35,12 +35,12 @@
 
 void user_enable_single_step(struct task_struct *child)
 {
-	set_tsk_thread_flag(child, TIF_SINGLESTEP);
+	child->ptrace |= PT_SINGLESTEP;
 }
 
 void user_disable_single_step(struct task_struct *child)
 {
-	clear_tsk_thread_flag(child, TIF_SINGLESTEP);
+	child->ptrace &= ~PT_SINGLESTEP;
 }
 
 /*
@@ -312,6 +312,7 @@ static void ptrace_hbptriggered(struct perf_event *bp,
 				struct pt_regs *regs)
 {
 	int i;
+	siginfo_t info;
 	struct arch_hw_breakpoint *bkpt = counter_arch_bp(bp);
 
 	if (bp->attr.bp_type & HW_BREAKPOINT_X) {
@@ -326,7 +327,12 @@ static void ptrace_hbptriggered(struct perf_event *bp,
 		i = (i << 1) | 1;
 	}
 
-	force_sig_ptrace_errno_trap(i, (void __user *)bkpt->address);
+	info.si_signo = SIGTRAP;
+	info.si_errno = i;
+	info.si_code = TRAP_HWBKPT;
+	info.si_addr = (void __user *)bkpt->address;
+
+	force_sig_info(SIGTRAP, &info, current);
 }
 
 static struct perf_event *ptrace_hbp_create(struct task_struct *tsk, int type)

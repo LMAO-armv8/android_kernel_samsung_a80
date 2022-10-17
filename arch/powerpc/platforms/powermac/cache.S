@@ -17,7 +17,6 @@
 #include <asm/processor.h>
 #include <asm/ppc_asm.h>
 #include <asm/cputable.h>
-#include <asm/feature-fixups.h>
 
 /*
  * Flush and disable all data caches (dL1, L2, L3). This is used
@@ -53,7 +52,7 @@ flush_disable_75x:
 
 	/* Stop DST streams */
 BEGIN_FTR_SECTION
-	PPC_DSSALL
+	DSSALL
 	sync
 END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC)
 
@@ -201,7 +200,7 @@ flush_disable_745x:
 	isync
 
 	/* Stop prefetch streams */
-	PPC_DSSALL
+	DSSALL
 	sync
 
 	/* Disable L2 prefetching */

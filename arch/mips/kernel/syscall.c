@@ -63,8 +63,7 @@ SYSCALL_DEFINE6(mips_mmap, unsigned long, addr, unsigned long, len,
 {
 	if (offset & ~PAGE_MASK)
 		return -EINVAL;
-	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
-			       offset >> PAGE_SHIFT);
+	return sys_mmap_pgoff(addr, len, prot, flags, fd, offset >> PAGE_SHIFT);
 }
 
 SYSCALL_DEFINE6(mips_mmap2, unsigned long, addr, unsigned long, len,
@@ -74,8 +73,7 @@ SYSCALL_DEFINE6(mips_mmap2, unsigned long, addr, unsigned long, len,
 	if (pgoff & (~PAGE_MASK >> 12))
 		return -EINVAL;
 
-	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
-			       pgoff >> (PAGE_SHIFT - 12));
+	return sys_mmap_pgoff(addr, len, prot, flags, fd, pgoff >> (PAGE_SHIFT-12));
 }
 
 save_static_function(sys_fork);
@@ -234,4 +232,13 @@ SYSCALL_DEFINE3(sysmips, long, cmd, long, arg1, long, arg2)
 SYSCALL_DEFINE3(cachectl, char *, addr, int, nbytes, int, op)
 {
 	return -ENOSYS;
+}
+
+/*
+ * If we ever come here the user sp is bad.  Zap the process right away.
+ * Due to the bad stack signaling wouldn't work.
+ */
+asmlinkage void bad_stack(void)
+{
+	do_exit(SIGSEGV);
 }
