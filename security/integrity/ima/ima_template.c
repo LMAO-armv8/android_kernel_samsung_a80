@@ -31,7 +31,6 @@ static struct ima_template_desc builtin_templates[] = {
 
 static LIST_HEAD(defined_templates);
 static DEFINE_SPINLOCK(template_list);
-static int template_setup_done;
 
 static struct ima_template_field supported_fields[] = {
 	{.field_id = "d", .field_init = ima_eventdigest_init,
@@ -58,11 +57,10 @@ static int __init ima_template_setup(char *str)
 	struct ima_template_desc *template_desc;
 	int template_len = strlen(str);
 
-	if (template_setup_done)
+	if (ima_template)
 		return 1;
 
-	if (!ima_template)
-		ima_init_template_list();
+	ima_init_template_list();
 
 	/*
 	 * Verify that a template with the supplied name exists.
@@ -86,7 +84,6 @@ static int __init ima_template_setup(char *str)
 	}
 
 	ima_template = template_desc;
-	template_setup_done = 1;
 	return 1;
 }
 __setup("ima_template=", ima_template_setup);
@@ -95,7 +92,7 @@ static int __init ima_template_fmt_setup(char *str)
 {
 	int num_templates = ARRAY_SIZE(builtin_templates);
 
-	if (template_setup_done)
+	if (ima_template)
 		return 1;
 
 	if (template_desc_init_fields(str, NULL, NULL) < 0) {
@@ -106,7 +103,6 @@ static int __init ima_template_fmt_setup(char *str)
 
 	builtin_templates[num_templates - 1].fmt = str;
 	ima_template = builtin_templates + num_templates - 1;
-	template_setup_done = 1;
 
 	return 1;
 }
@@ -381,7 +377,8 @@ int ima_restore_measurement_list(loff_t size, void *buf)
 			break;
 
 		if (hdr[HDR_TEMPLATE_NAME].len >= MAX_TEMPLATE_NAME_LEN) {
-			pr_err("attempting to restore a template name that is too long\n");
+			pr_err("attempting to restore a template name \
+				that is too long\n");
 			ret = -EINVAL;
 			break;
 		}
@@ -392,8 +389,8 @@ int ima_restore_measurement_list(loff_t size, void *buf)
 		template_name[hdr[HDR_TEMPLATE_NAME].len] = 0;
 
 		if (strcmp(template_name, "ima") == 0) {
-			pr_err("attempting to restore an unsupported template \"%s\" failed\n",
-			       template_name);
+			pr_err("attempting to restore an unsupported \
+				template \"%s\" failed\n", template_name);
 			ret = -EINVAL;
 			break;
 		}
@@ -413,8 +410,8 @@ int ima_restore_measurement_list(loff_t size, void *buf)
 						&(template_desc->fields),
 						&(template_desc->num_fields));
 		if (ret < 0) {
-			pr_err("attempting to restore the template fmt \"%s\" failed\n",
-			       template_desc->fmt);
+			pr_err("attempting to restore the template fmt \"%s\" \
+				failed\n", template_desc->fmt);
 			ret = -EINVAL;
 			break;
 		}

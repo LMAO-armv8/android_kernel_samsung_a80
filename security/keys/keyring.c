@@ -561,7 +561,7 @@ static int keyring_search_iterator(const void *object, void *iterator_data)
 
 	/* skip invalidated, revoked and expired keys */
 	if (ctx->flags & KEYRING_SEARCH_DO_STATE_CHECK) {
-		time64_t expiry = READ_ONCE(key->expiry);
+		time_t expiry = READ_ONCE(key->expiry);
 
 		if (kflags & ((1 << KEY_FLAG_INVALIDATED) |
 			      (1 << KEY_FLAG_REVOKED))) {
@@ -570,7 +570,7 @@ static int keyring_search_iterator(const void *object, void *iterator_data)
 			goto skipped;
 		}
 
-		if (expiry && ctx->now >= expiry) {
+		if (expiry && ctx->now.tv_sec >= expiry) {
 			if (!(ctx->flags & KEYRING_SEARCH_SKIP_EXPIRED))
 				ctx->result = ERR_PTR(-EKEYEXPIRED);
 			kleave(" = %d [expire]", ctx->skipped_ret);
@@ -706,6 +706,7 @@ descend_to_keyring:
 		 * doesn't contain any keyring pointers.
 		 */
 		shortcut = assoc_array_ptr_to_shortcut(ptr);
+		smp_read_barrier_depends();
 		if ((shortcut->index_key[0] & ASSOC_ARRAY_FAN_MASK) != 0)
 			goto not_this_keyring;
 
@@ -715,6 +716,8 @@ descend_to_keyring:
 	}
 
 	node = assoc_array_ptr_to_node(ptr);
+	smp_read_barrier_depends();
+
 	ptr = node->slots[0];
 	if (!assoc_array_ptr_is_meta(ptr))
 		goto begin_node;
@@ -726,6 +729,7 @@ descend_to_node:
 	kdebug("descend");
 	if (assoc_array_ptr_is_shortcut(ptr)) {
 		shortcut = assoc_array_ptr_to_shortcut(ptr);
+		smp_read_barrier_depends();
 		ptr = READ_ONCE(shortcut->next_node);
 		BUG_ON(!assoc_array_ptr_is_node(ptr));
 	}
@@ -733,6 +737,7 @@ descend_to_node:
 
 begin_node:
 	kdebug("begin_node");
+	smp_read_barrier_depends();
 	slot = 0;
 ascend_to_node:
 	/* Go through the slots in a node */
@@ -780,12 +785,14 @@ ascend_to_node:
 
 	if (ptr && assoc_array_ptr_is_shortcut(ptr)) {
 		shortcut = assoc_array_ptr_to_shortcut(ptr);
+		smp_read_barrier_depends();
 		ptr = READ_ONCE(shortcut->back_pointer);
 		slot = shortcut->parent_slot;
 	}
 	if (!ptr)
 		goto not_this_keyring;
 	node = assoc_array_ptr_to_node(ptr);
+	smp_read_barrier_depends();
 	slot++;
 
 	/* If we've ascended to the root (zero backpointer), we must have just
@@ -820,10 +827,10 @@ found:
 	key = key_ref_to_ptr(ctx->result);
 	key_check(key);
 	if (!(ctx->flags & KEYRING_SEARCH_NO_UPDATE_TIME)) {
-		key->last_used_at = ctx->now;
-		keyring->last_used_at = ctx->now;
+		key->last_used_at = ctx->now.tv_sec;
+		keyring->last_used_at = ctx->now.tv_sec;
 		while (sp > 0)
-			stack[--sp].keyring->last_used_at = ctx->now;
+			stack[--sp].keyring->last_used_at = ctx->now.tv_sec;
 	}
 	kleave(" = true");
 	return true;
@@ -884,7 +891,7 @@ key_ref_t keyring_search_aux(key_ref_t keyring_ref,
 	}
 
 	rcu_read_lock();
-	ctx->now = ktime_get_real_seconds();
+	ctx->now = current_kernel_time();
 	if (search_nested_keyrings(keyring, ctx))
 		__key_get(key_ref_to_ptr(ctx->result));
 	rcu_read_unlock();
@@ -1136,7 +1143,7 @@ struct key *find_keyring_by_name(const char *name, bool uid_keyring)
 			 * (ie. it has a zero usage count) */
 			if (!refcount_inc_not_zero(&keyring->usage))
 				continue;
-			keyring->last_used_at = ktime_get_real_seconds();
+			keyring->last_used_at = current_kernel_time().tv_sec;
 			goto out;
 		}
 	}
@@ -1476,7 +1483,7 @@ static void keyring_revoke(struct key *keyring)
 static bool keyring_gc_select_iterator(void *object, void *iterator_data)
 {
 	struct key *key = keyring_ptr_to_key(object);
-	time64_t *limit = iterator_data;
+	time_t *limit = iterator_data;
 
 	if (key_is_dead(key, *limit))
 		return false;
@@ -1487,7 +1494,7 @@ static bool keyring_gc_select_iterator(void *object, void *iterator_data)
 static int keyring_gc_check_iterator(const void *object, void *iterator_data)
 {
 	const struct key *key = keyring_ptr_to_key(object);
-	time64_t *limit = iterator_data;
+	time_t *limit = iterator_data;
 
 	key_check(key);
 	return key_is_dead(key, *limit);
@@ -1499,7 +1506,7 @@ static int keyring_gc_check_iterator(const void *object, void *iterator_data)
  * Not called with any locks held.  The keyring's key struct will not be
  * deallocated under us as only our caller may deallocate it.
  */
-void keyring_gc(struct key *keyring, time64_t limit)
+void keyring_gc(struct key *keyring, time_t limit)
 {
 	int result;
 

@@ -80,9 +80,6 @@ static struct nlmsg_perm nlmsg_route_perms[] =
 	{ RTM_NEWSTATS,		NETLINK_ROUTE_SOCKET__NLMSG_READ },
 	{ RTM_GETSTATS,		NETLINK_ROUTE_SOCKET__NLMSG_READ  },
 	{ RTM_NEWCACHEREPORT,	NETLINK_ROUTE_SOCKET__NLMSG_READ },
-	{ RTM_NEWCHAIN,		NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
-	{ RTM_DELCHAIN,		NETLINK_ROUTE_SOCKET__NLMSG_WRITE },
-	{ RTM_GETCHAIN,		NETLINK_ROUTE_SOCKET__NLMSG_READ  },
 };
 
 static const struct nlmsg_perm nlmsg_tcpdiag_perms[] =
@@ -161,12 +158,8 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 
 	switch (sclass) {
 	case SECCLASS_NETLINK_ROUTE_SOCKET:
-		/* RTM_MAX always points to RTM_SETxxxx, ie RTM_NEWxxx + 3.
-		 * If the BUILD_BUG_ON() below fails you must update the
-		 * structures at the top of this file with the new mappings
-		 * before updating the BUILD_BUG_ON() macro!
-		 */
-		BUILD_BUG_ON(RTM_MAX != (RTM_NEWCHAIN + 3));
+		/* RTM_MAX always point to RTM_SETxxxx, ie RTM_NEWxxx + 3 */
+		BUILD_BUG_ON(RTM_MAX != (RTM_NEWCACHEREPORT + 3));
 		err = nlmsg_perm(nlmsg_type, perm, nlmsg_route_perms,
 				 sizeof(nlmsg_route_perms));
 		break;
@@ -177,10 +170,6 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 		break;
 
 	case SECCLASS_NETLINK_XFRM_SOCKET:
-		/* If the BUILD_BUG_ON() below fails you must update the
-		 * structures at the top of this file with the new mappings
-		 * before updating the BUILD_BUG_ON() macro!
-		 */
 		BUILD_BUG_ON(XFRM_MSG_MAX != XFRM_MSG_MAPPING);
 		err = nlmsg_perm(nlmsg_type, perm, nlmsg_xfrm_perms,
 				 sizeof(nlmsg_xfrm_perms));
@@ -207,12 +196,12 @@ int selinux_nlmsg_lookup(u16 sclass, u16 nlmsg_type, u32 *perm)
 	return err;
 }
 
-static void nlmsg_set_perm_for_type(u32 perm, u16 type)
+static void nlmsg_set_getlink_perm(u32 perm)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(nlmsg_route_perms); i++) {
-		if (nlmsg_route_perms[i].nlmsg_type == type) {
+		if (nlmsg_route_perms[i].nlmsg_type == RTM_GETLINK) {
 			nlmsg_route_perms[i].perm = perm;
 			break;
 		}
@@ -222,27 +211,11 @@ static void nlmsg_set_perm_for_type(u32 perm, u16 type)
 /**
  * Use nlmsg_readpriv as the permission for RTM_GETLINK messages if the
  * netlink_route_getlink policy capability is set. Otherwise use nlmsg_read.
- * Similarly, use nlmsg_getneigh for RTM_GETNEIGH and RTM_GETNEIGHTBL if the
- * netlink_route_getneigh policy capability is set. Otherwise use nlmsg_read.
  */
 void selinux_nlmsg_init(void)
 {
 	if (selinux_android_nlroute_getlink())
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_READPRIV,
-					RTM_GETLINK);
+		nlmsg_set_getlink_perm(NETLINK_ROUTE_SOCKET__NLMSG_READPRIV);
 	else
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_READ,
-					RTM_GETLINK);
-
-	if (selinux_android_nlroute_getneigh()) {
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_GETNEIGH,
-					RTM_GETNEIGH);
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_GETNEIGH,
-					RTM_GETNEIGHTBL);
-	} else {
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_READ,
-					RTM_GETNEIGH);
-		nlmsg_set_perm_for_type(NETLINK_ROUTE_SOCKET__NLMSG_READ,
-					RTM_GETNEIGHTBL);
-	}
+		nlmsg_set_getlink_perm(NETLINK_ROUTE_SOCKET__NLMSG_READ);
 }
