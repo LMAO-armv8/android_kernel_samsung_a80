@@ -20,15 +20,7 @@
 
 DEFINE_MUTEX(kernfs_mutex);
 static DEFINE_SPINLOCK(kernfs_rename_lock);	/* kn->parent and ->name */
-/*
- * Don't use rename_lock to piggy back on pr_cont_buf. We don't want to
- * call pr_cont() while holding rename_lock. Because sometimes pr_cont()
- * will perform wakeups when releasing console_sem. Holding rename_lock
- * will introduce deadlock if the scheduler reads the kernfs_name in the
- * wakeup path.
- */
-static DEFINE_SPINLOCK(kernfs_pr_cont_lock);
-static char kernfs_pr_cont_buf[PATH_MAX];	/* protected by pr_cont_lock */
+static char kernfs_pr_cont_buf[PATH_MAX];	/* protected by rename_lock */
 static DEFINE_SPINLOCK(kernfs_idr_lock);	/* root->ino_idr */
 
 #define rb_to_kn(X) rb_entry((X), struct kernfs_node, rb)
@@ -237,12 +229,12 @@ void pr_cont_kernfs_name(struct kernfs_node *kn)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&kernfs_pr_cont_lock, flags);
+	spin_lock_irqsave(&kernfs_rename_lock, flags);
 
-	kernfs_name(kn, kernfs_pr_cont_buf, sizeof(kernfs_pr_cont_buf));
+	kernfs_name_locked(kn, kernfs_pr_cont_buf, sizeof(kernfs_pr_cont_buf));
 	pr_cont("%s", kernfs_pr_cont_buf);
 
-	spin_unlock_irqrestore(&kernfs_pr_cont_lock, flags);
+	spin_unlock_irqrestore(&kernfs_rename_lock, flags);
 }
 
 /**
@@ -256,10 +248,10 @@ void pr_cont_kernfs_path(struct kernfs_node *kn)
 	unsigned long flags;
 	int sz;
 
-	spin_lock_irqsave(&kernfs_pr_cont_lock, flags);
+	spin_lock_irqsave(&kernfs_rename_lock, flags);
 
-	sz = kernfs_path_from_node(kn, NULL, kernfs_pr_cont_buf,
-				   sizeof(kernfs_pr_cont_buf));
+	sz = kernfs_path_from_node_locked(kn, NULL, kernfs_pr_cont_buf,
+					  sizeof(kernfs_pr_cont_buf));
 	if (sz < 0) {
 		pr_cont("(error)");
 		goto out;
@@ -273,7 +265,7 @@ void pr_cont_kernfs_path(struct kernfs_node *kn)
 	pr_cont("%s", kernfs_pr_cont_buf);
 
 out:
-	spin_unlock_irqrestore(&kernfs_pr_cont_lock, flags);
+	spin_unlock_irqrestore(&kernfs_rename_lock, flags);
 }
 
 /**
@@ -627,7 +619,6 @@ struct kernfs_node *kernfs_node_from_dentry(struct dentry *dentry)
 
 static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
 					     const char *name, umode_t mode,
-					     kuid_t uid, kgid_t gid,
 					     unsigned flags)
 {
 	struct kernfs_node *kn;
@@ -668,22 +659,8 @@ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
 	kn->mode = mode;
 	kn->flags = flags;
 
-	if (!uid_eq(uid, GLOBAL_ROOT_UID) || !gid_eq(gid, GLOBAL_ROOT_GID)) {
-		struct iattr iattr = {
-			.ia_valid = ATTR_UID | ATTR_GID,
-			.ia_uid = uid,
-			.ia_gid = gid,
-		};
-
-		ret = __kernfs_setattr(kn, &iattr);
-		if (ret < 0)
-			goto err_out3;
-	}
-
 	return kn;
 
- err_out3:
-	idr_remove(&root->ino_idr, kn->id.ino);
  err_out2:
 	kmem_cache_free(kernfs_node_cache, kn);
  err_out1:
@@ -693,13 +670,11 @@ static struct kernfs_node *__kernfs_new_node(struct kernfs_root *root,
 
 struct kernfs_node *kernfs_new_node(struct kernfs_node *parent,
 				    const char *name, umode_t mode,
-				    kuid_t uid, kgid_t gid,
 				    unsigned flags)
 {
 	struct kernfs_node *kn;
 
-	kn = __kernfs_new_node(kernfs_root(parent),
-			       name, mode, uid, gid, flags);
+	kn = __kernfs_new_node(kernfs_root(parent), name, mode, flags);
 	if (kn) {
 		kernfs_get(parent);
 		kn->parent = parent;
@@ -802,7 +777,7 @@ int kernfs_add_one(struct kernfs_node *kn)
 	ps_iattr = parent->iattr;
 	if (ps_iattr) {
 		struct iattr *ps_iattrs = &ps_iattr->ia_iattr;
-		ktime_get_real_ts64(&ps_iattrs->ia_ctime);
+		ktime_get_real_ts(&ps_iattrs->ia_ctime);
 		ps_iattrs->ia_mtime = ps_iattrs->ia_ctime;
 	}
 
@@ -875,12 +850,13 @@ static struct kernfs_node *kernfs_walk_ns(struct kernfs_node *parent,
 
 	lockdep_assert_held(&kernfs_mutex);
 
-	spin_lock_irq(&kernfs_pr_cont_lock);
+	/* grab kernfs_rename_lock to piggy back on kernfs_pr_cont_buf */
+	spin_lock_irq(&kernfs_rename_lock);
 
 	len = strlcpy(kernfs_pr_cont_buf, path, sizeof(kernfs_pr_cont_buf));
 
 	if (len >= sizeof(kernfs_pr_cont_buf)) {
-		spin_unlock_irq(&kernfs_pr_cont_lock);
+		spin_unlock_irq(&kernfs_rename_lock);
 		return NULL;
 	}
 
@@ -892,7 +868,7 @@ static struct kernfs_node *kernfs_walk_ns(struct kernfs_node *parent,
 		parent = kernfs_find_ns(parent, name, ns);
 	}
 
-	spin_unlock_irq(&kernfs_pr_cont_lock);
+	spin_unlock_irq(&kernfs_rename_lock);
 
 	return parent;
 }
@@ -968,7 +944,6 @@ struct kernfs_root *kernfs_create_root(struct kernfs_syscall_ops *scops,
 	root->next_generation = 1;
 
 	kn = __kernfs_new_node(root, "", S_IFDIR | S_IRUGO | S_IXUGO,
-			       GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
 			       KERNFS_DIR);
 	if (!kn) {
 		idr_destroy(&root->ino_idr);
@@ -1007,8 +982,6 @@ void kernfs_destroy_root(struct kernfs_root *root)
  * @parent: parent in which to create a new directory
  * @name: name of the new directory
  * @mode: mode of the new directory
- * @uid: uid of the new directory
- * @gid: gid of the new directory
  * @priv: opaque data associated with the new directory
  * @ns: optional namespace tag of the directory
  *
@@ -1016,15 +989,13 @@ void kernfs_destroy_root(struct kernfs_root *root)
  */
 struct kernfs_node *kernfs_create_dir_ns(struct kernfs_node *parent,
 					 const char *name, umode_t mode,
-					 kuid_t uid, kgid_t gid,
 					 void *priv, const void *ns)
 {
 	struct kernfs_node *kn;
 	int rc;
 
 	/* allocate */
-	kn = kernfs_new_node(parent, name, mode | S_IFDIR,
-			     uid, gid, KERNFS_DIR);
+	kn = kernfs_new_node(parent, name, mode | S_IFDIR, KERNFS_DIR);
 	if (!kn)
 		return ERR_PTR(-ENOMEM);
 
@@ -1055,8 +1026,7 @@ struct kernfs_node *kernfs_create_empty_dir(struct kernfs_node *parent,
 	int rc;
 
 	/* allocate */
-	kn = kernfs_new_node(parent, name, S_IRUGO|S_IXUGO|S_IFDIR,
-			     GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, KERNFS_DIR);
+	kn = kernfs_new_node(parent, name, S_IRUGO|S_IXUGO|S_IFDIR, KERNFS_DIR);
 	if (!kn)
 		return ERR_PTR(-ENOMEM);
 
@@ -1334,7 +1304,7 @@ static void __kernfs_remove(struct kernfs_node *kn)
 
 			/* update timestamps on the parent */
 			if (ps_iattr) {
-				ktime_get_real_ts64(&ps_iattr->ia_iattr.ia_ctime);
+				ktime_get_real_ts(&ps_iattr->ia_iattr.ia_ctime);
 				ps_iattr->ia_iattr.ia_mtime =
 					ps_iattr->ia_iattr.ia_ctime;
 			}

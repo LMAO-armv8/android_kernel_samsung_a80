@@ -113,9 +113,6 @@ ssize_t fuse_listxattr(struct dentry *entry, char *list, size_t size)
 	struct fuse_getxattr_out outarg;
 	ssize_t ret;
 
-	if (fuse_is_bad(inode))
-		return -EIO;
-
 	if (!fuse_allow_current_process(fc))
 		return -EACCES;
 
@@ -181,9 +178,6 @@ static int fuse_xattr_get(const struct xattr_handler *handler,
 			 struct dentry *dentry, struct inode *inode,
 			 const char *name, void *value, size_t size)
 {
-	if (fuse_is_bad(inode))
-		return -EIO;
-
 	return fuse_getxattr(inode, name, value, size);
 }
 
@@ -192,33 +186,10 @@ static int fuse_xattr_set(const struct xattr_handler *handler,
 			  const char *name, const void *value, size_t size,
 			  int flags)
 {
-	if (fuse_is_bad(inode))
-		return -EIO;
-
 	if (!value)
 		return fuse_removexattr(inode, name);
 
 	return fuse_setxattr(inode, name, value, size, flags);
-}
-
-static bool no_xattr_list(struct dentry *dentry)
-{
-	return false;
-}
-
-static int no_xattr_get(const struct xattr_handler *handler,
-			struct dentry *dentry, struct inode *inode,
-			const char *name, void *value, size_t size)
-{
-	return -EOPNOTSUPP;
-}
-
-static int no_xattr_set(const struct xattr_handler *handler,
-			struct dentry *dentry, struct inode *nodee,
-			const char *name, const void *value,
-			size_t size, int flags)
-{
-	return -EOPNOTSUPP;
 }
 
 static const struct xattr_handler fuse_xattr_handler = {
@@ -235,29 +206,6 @@ const struct xattr_handler *fuse_xattr_handlers[] = {
 const struct xattr_handler *fuse_acl_xattr_handlers[] = {
 	&posix_acl_access_xattr_handler,
 	&posix_acl_default_xattr_handler,
-	&fuse_xattr_handler,
-	NULL
-};
-
-static const struct xattr_handler fuse_no_acl_access_xattr_handler = {
-	.name  = XATTR_NAME_POSIX_ACL_ACCESS,
-	.flags = ACL_TYPE_ACCESS,
-	.list  = no_xattr_list,
-	.get   = no_xattr_get,
-	.set   = no_xattr_set,
-};
-
-static const struct xattr_handler fuse_no_acl_default_xattr_handler = {
-	.name  = XATTR_NAME_POSIX_ACL_DEFAULT,
-	.flags = ACL_TYPE_ACCESS,
-	.list  = no_xattr_list,
-	.get   = no_xattr_get,
-	.set   = no_xattr_set,
-};
-
-const struct xattr_handler *fuse_no_acl_xattr_handlers[] = {
-	&fuse_no_acl_access_xattr_handler,
-	&fuse_no_acl_default_xattr_handler,
 	&fuse_xattr_handler,
 	NULL
 };

@@ -1,7 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2003-2006, Cluster File Systems, Inc, info@clusterfs.com
  * Written by Alex Tomas <alex@clusterfs.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-
  */
 
 
@@ -471,8 +483,6 @@ static void mb_free_blocks_double(struct inode *inode, struct ext4_buddy *e4b,
 					      "freeing block already freed "
 					      "(bit %u)",
 					      first + i);
-			ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
-					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 		}
 		mb_clear_bit(first + i, e4b->bd_info->bb_bitmap);
 	}
@@ -741,6 +751,13 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 	grp->bb_fragments = fragments;
 
 	if (free != grp->bb_free) {
+		struct ext4_group_desc *desc;
+		ext4_fsblk_t bitmap_blk;
+
+		desc = ext4_get_group_desc(sb, group, NULL);
+		bitmap_blk = ext4_block_bitmap(sb, desc);
+
+		print_block_data(sb, bitmap_blk, bitmap, 0, EXT4_BLOCK_SIZE(sb));
 		ext4_grp_locked_error(sb, group, 0, 0,
 				      "block bitmap and bg descriptor "
 				      "inconsistent: %u vs %u free clusters",
@@ -750,18 +767,20 @@ void ext4_mb_generate_buddy(struct super_block *sb,
 		 * corrupt and update bb_free using bitmap value
 		 */
 		grp->bb_free = free;
-		ext4_mark_group_bitmap_corrupted(sb, group,
-					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+		if (!EXT4_MB_GRP_BBITMAP_CORRUPT(grp))
+			percpu_counter_sub(&sbi->s_freeclusters_counter,
+					   grp->bb_free);
+		set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT, &grp->bb_state);
 	}
 	mb_set_largest_free_order(sb, grp);
 
 	clear_bit(EXT4_GROUP_INFO_NEED_INIT_BIT, &(grp->bb_state));
 
 	period = get_cycles() - period;
-	spin_lock(&sbi->s_bal_lock);
-	sbi->s_mb_buddies_generated++;
-	sbi->s_mb_generation_time += period;
-	spin_unlock(&sbi->s_bal_lock);
+	spin_lock(&EXT4_SB(sb)->s_bal_lock);
+	EXT4_SB(sb)->s_mb_buddies_generated++;
+	EXT4_SB(sb)->s_mb_generation_time += period;
+	spin_unlock(&EXT4_SB(sb)->s_bal_lock);
 }
 
 static void mb_regenerate_buddy(struct ext4_buddy *e4b)
@@ -1445,18 +1464,28 @@ static void mb_free_blocks(struct inode *inode, struct ext4_buddy *e4b,
 
 	if (unlikely(block != -1)) {
 		struct ext4_sb_info *sbi = EXT4_SB(sb);
-		ext4_fsblk_t blocknr;
+		struct ext4_group_desc *desc;
+		ext4_fsblk_t blocknr, bitmap_blk;
+
+		desc = ext4_get_group_desc(sb, e4b->bd_group, NULL);
+		bitmap_blk = ext4_block_bitmap(sb, desc);
 
 		blocknr = ext4_group_first_block_no(sb, e4b->bd_group);
-		blocknr += EXT4_C2B(sbi, block);
+		blocknr += EXT4_C2B(EXT4_SB(sb), block);
+
+		print_block_data(sb, bitmap_blk, e4b->bd_bitmap, 0,
+				 EXT4_BLOCK_SIZE(sb));
+
 		ext4_grp_locked_error(sb, e4b->bd_group,
-				      inode ? inode->i_ino : 0,
-				      blocknr,
-				      "freeing already freed block "
-				      "(bit %u); block bitmap corrupt.",
-				      block);
-		ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
-				EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+				inode ? inode->i_ino : 0, blocknr,
+				"freeing already freed block "
+				"(bit %u); block bitmap corrupt.", block);
+		if (!EXT4_MB_GRP_BBITMAP_CORRUPT(e4b->bd_info))
+			percpu_counter_sub(&sbi->s_freeclusters_counter,
+					   e4b->bd_info->bb_free);
+		/* Mark the block group as corrupt. */
+		set_bit(EXT4_GROUP_INFO_BBITMAP_CORRUPT_BIT,
+			&e4b->bd_info->bb_state);
 		mb_regenerate_buddy(e4b);
 		goto done;
 	}
@@ -1542,11 +1571,10 @@ static int mb_find_extent(struct ext4_buddy *e4b, int block,
 	if (ex->fe_start + ex->fe_len > EXT4_CLUSTERS_PER_GROUP(e4b->bd_sb)) {
 		/* Should never happen! (but apparently sometimes does?!?) */
 		WARN_ON(1);
-		ext4_grp_locked_error(e4b->bd_sb, e4b->bd_group, 0, 0,
-			"corruption or bug in mb_find_extent "
-			"block=%d, order=%d needed=%d ex=%u/%d/%d@%u",
-			block, order, needed, ex->fe_group, ex->fe_start,
-			ex->fe_len, ex->fe_logical);
+		ext4_error(e4b->bd_sb, "corruption or bug in mb_find_extent "
+			   "block=%d, order=%d needed=%d ex=%u/%d/%d@%u",
+			   block, order, needed, ex->fe_group, ex->fe_start,
+			   ex->fe_len, ex->fe_logical);
 		ex->fe_len = 0;
 		ex->fe_start = 0;
 		ex->fe_group = 0;
@@ -1902,15 +1930,8 @@ void ext4_mb_simple_scan_group(struct ext4_allocation_context *ac,
 		BUG_ON(buddy == NULL);
 
 		k = mb_find_next_zero_bit(buddy, max, 0);
-		if (k >= max) {
-			ext4_grp_locked_error(ac->ac_sb, e4b->bd_group, 0, 0,
-				"%d free clusters of order %d. But found 0",
-				grp->bb_counters[i], i);
-			ext4_mark_group_bitmap_corrupted(ac->ac_sb,
-					 e4b->bd_group,
-					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
-			break;
-		}
+		BUG_ON(k >= max);
+
 		ac->ac_found++;
 
 		ac->ac_b_ex.fe_len = 1 << i;
@@ -1962,8 +1983,6 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 					"%d free clusters as per "
 					"group info. But bitmap says 0",
 					free);
-			ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
-					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 			break;
 		}
 
@@ -1975,8 +1994,6 @@ void ext4_mb_complex_scan_group(struct ext4_allocation_context *ac,
 					"%d free clusters as per "
 					"group info. But got %d blocks",
 					free, ex.fe_len);
-			ext4_mark_group_bitmap_corrupted(sb, e4b->bd_group,
-					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
 			/*
 			 * The number of free blocks differs. This mostly
 			 * indicate that the bitmap is corrupt. So exit
@@ -2266,7 +2283,7 @@ out:
 
 static void *ext4_mb_seq_groups_start(struct seq_file *seq, loff_t *pos)
 {
-	struct super_block *sb = PDE_DATA(file_inode(seq->file));
+	struct super_block *sb = seq->private;
 	ext4_group_t group;
 
 	if (*pos < 0 || *pos >= ext4_get_groups_count(sb))
@@ -2277,7 +2294,7 @@ static void *ext4_mb_seq_groups_start(struct seq_file *seq, loff_t *pos)
 
 static void *ext4_mb_seq_groups_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	struct super_block *sb = PDE_DATA(file_inode(seq->file));
+	struct super_block *sb = seq->private;
 	ext4_group_t group;
 
 	++*pos;
@@ -2289,7 +2306,7 @@ static void *ext4_mb_seq_groups_next(struct seq_file *seq, void *v, loff_t *pos)
 
 static int ext4_mb_seq_groups_show(struct seq_file *seq, void *v)
 {
-	struct super_block *sb = PDE_DATA(file_inode(seq->file));
+	struct super_block *sb = seq->private;
 	ext4_group_t group = (ext4_group_t) ((unsigned long) v);
 	int i;
 	int err, buddy_loaded = 0;
@@ -2342,12 +2359,82 @@ static void ext4_mb_seq_groups_stop(struct seq_file *seq, void *v)
 {
 }
 
-const struct seq_operations ext4_mb_seq_groups_ops = {
+static const struct seq_operations ext4_mb_seq_groups_ops = {
 	.start  = ext4_mb_seq_groups_start,
 	.next   = ext4_mb_seq_groups_next,
 	.stop   = ext4_mb_seq_groups_stop,
 	.show   = ext4_mb_seq_groups_show,
 };
+
+static int ext4_mb_seq_groups_open(struct inode *inode, struct file *file)
+{
+	struct super_block *sb = PDE_DATA(inode);
+	int rc;
+
+	rc = seq_open(file, &ext4_mb_seq_groups_ops);
+	if (rc == 0) {
+		struct seq_file *m = file->private_data;
+		m->private = sb;
+	}
+	return rc;
+
+}
+
+const struct file_operations ext4_seq_mb_groups_fops = {
+	.open		= ext4_mb_seq_groups_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+ssize_t ext4_mb_freefrag_show(struct ext4_sb_info *sbi, char *buf)
+{
+#define EXT4_FREEFRAG_COLUMN 14 /* sb->s_blocksize_bits + 2 */
+	ext4_group_t group = 0;
+	int i;
+	ext4_fsblk_t freeblock[EXT4_FREEFRAG_COLUMN] = {0,};
+	char *size[EXT4_FREEFRAG_COLUMN] = {"4K", "8K", "16K", "32K", "64K",
+		"128K", "256K", "512K", "1M", "2M", "4M", "8M", "16M", "32M"};
+
+	for (group = 0; group < sbi->s_groups_count; group++) {
+		struct super_block *sb = sbi->s_sb;
+		int err, buddy_loaded = 0;
+		struct ext4_buddy e4b;
+		struct ext4_group_info *grinfo;
+		struct sg {
+			struct ext4_group_info info;
+			ext4_grpblk_t counters[EXT4_FREEFRAG_COLUMN+2];
+		} sg;
+
+		i = (sb->s_blocksize_bits + 2) * sizeof(sg.info.bb_counters[0])
+			+ sizeof(struct ext4_group_info);
+		grinfo = ext4_get_group_info(sb, group);
+		/* Load the group info in memory only if not already loaded. */
+		if (unlikely(EXT4_MB_GRP_NEED_INIT(grinfo))) {
+			err = ext4_mb_load_buddy(sb, group, &e4b);
+			if (err) {
+				freeblock[0] = ULLONG_MAX;
+				goto out;
+			}
+			buddy_loaded = 1;
+		}
+
+		memcpy(&sg, ext4_get_group_info(sb, group), i);
+
+		if (buddy_loaded)
+			ext4_mb_unload_buddy(&e4b);
+		for (i = 0; i < EXT4_FREEFRAG_COLUMN; i++)
+			freeblock[i] += (i <= sb->s_blocksize_bits + 1) ?
+					sg.info.bb_counters[i] : 0;
+	}
+out:
+	for (i = 0; i < EXT4_FREEFRAG_COLUMN; i++)
+		snprintf(buf, PAGE_SIZE, "%s\"%s\":\"%llu\",", buf, size[i],
+			(unsigned long long)freeblock[i]);
+	buf[strlen(buf)-1] = '\n';
+
+	return strlen(buf);
+}
 
 static struct kmem_cache *get_groupinfo_cache(int blocksize_bits)
 {
@@ -2544,7 +2631,8 @@ static void ext4_groupinfo_destroy_slabs(void)
 	int i;
 
 	for (i = 0; i < NR_GRPINFO_CACHES; i++) {
-		kmem_cache_destroy(ext4_groupinfo_caches[i]);
+		if (ext4_groupinfo_caches[i])
+			kmem_cache_destroy(ext4_groupinfo_caches[i]);
 		ext4_groupinfo_caches[i] = NULL;
 	}
 }
@@ -2991,7 +3079,7 @@ ext4_mb_mark_diskspace_used(struct ext4_allocation_context *ac,
 	block = ext4_grp_offs_to_block(sb, &ac->ac_b_ex);
 
 	len = EXT4_C2B(sbi, ac->ac_b_ex.fe_len);
-	if (!ext4_inode_block_valid(ac->ac_inode, block, len)) {
+	if (!ext4_data_block_valid(sbi, block, len)) {
 		ext4_error(sb, "Allocating blocks %llu-%llu which overlap "
 			   "fs metadata", block, block+len);
 		/* File system mounted not to panic on error
@@ -3169,15 +3257,6 @@ ext4_mb_normalize_request(struct ext4_allocation_context *ac,
 	}
 	size = size >> bsbits;
 	start = start_off >> bsbits;
-
-	/*
-	 * For tiny groups (smaller than 8MB) the chosen allocation
-	 * alignment may be larger than group size. Make sure the
-	 * alignment does not move allocation to a different group which
-	 * makes mballoc fail assertions later.
-	 */
-	start = max(start, rounddown(ac->ac_o_ex.fe_logical,
-			(ext4_lblk_t)EXT4_BLOCKS_PER_GROUP(ac->ac_sb)));
 
 	/* don't cover already allocated blocks in selected range */
 	if (ar->pleft && start <= ar->lleft) {
@@ -3839,6 +3918,7 @@ ext4_mb_release_inode_pa(struct ext4_buddy *e4b, struct buffer_head *bitmap_bh,
 	ext4_group_t group;
 	ext4_grpblk_t bit;
 	unsigned long long grp_blk_start;
+	int err = 0;
 	int free = 0;
 
 	BUG_ON(pa->pa_deleted == 0);
@@ -3879,7 +3959,7 @@ ext4_mb_release_inode_pa(struct ext4_buddy *e4b, struct buffer_head *bitmap_bh,
 	}
 	atomic_add(free, &sbi->s_mb_discarded);
 
-	return 0;
+	return err;
 }
 
 static noinline_for_stack int
@@ -4700,7 +4780,6 @@ ext4_mb_free_metadata(handle_t *handle, struct ext4_buddy *e4b,
 				ext4_group_first_block_no(sb, group) +
 				EXT4_C2B(sbi, cluster),
 				"Block already on to-be-freed list");
-			kmem_cache_free(ext4_free_data_cachep, new_entry);
 			return 0;
 		}
 	}
@@ -4765,7 +4844,7 @@ void ext4_free_blocks(handle_t *handle, struct inode *inode,
 
 	sbi = EXT4_SB(sb);
 	if (!(flags & EXT4_FREE_BLOCKS_VALIDATED) &&
-	    !ext4_inode_block_valid(inode, block, count)) {
+	    !ext4_data_block_valid(sbi, block, count)) {
 		ext4_error(sb, "Freeing blocks not in datazone - "
 			   "block = %llu, count = %lu", block, count);
 		goto error_return;
@@ -4858,9 +4937,9 @@ do_more:
 	if (in_range(ext4_block_bitmap(sb, gdp), block, count) ||
 	    in_range(ext4_inode_bitmap(sb, gdp), block, count) ||
 	    in_range(block, ext4_inode_table(sb, gdp),
-		     sbi->s_itb_per_group) ||
+		     EXT4_SB(sb)->s_itb_per_group) ||
 	    in_range(block + count - 1, ext4_inode_table(sb, gdp),
-		     sbi->s_itb_per_group)) {
+		     EXT4_SB(sb)->s_itb_per_group)) {
 
 		ext4_error(sb, "Freeing blocks in system zone - "
 			   "Block = %llu, count = %lu", block, count);
@@ -5003,11 +5082,8 @@ int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 	struct ext4_group_desc *desc;
 	struct ext4_sb_info *sbi = EXT4_SB(sb);
 	struct ext4_buddy e4b;
-	int err = 0, ret, free_clusters_count;
-	ext4_grpblk_t clusters_freed;
-	ext4_fsblk_t first_cluster = EXT4_B2C(sbi, block);
-	ext4_fsblk_t last_cluster = EXT4_B2C(sbi, block + count - 1);
-	unsigned long cluster_count = last_cluster - first_cluster + 1;
+	int err = 0, ret, blk_free_count;
+	ext4_grpblk_t blocks_freed;
 
 	ext4_debug("Adding block(s) %llu-%llu\n", block, block + count - 1);
 
@@ -5019,8 +5095,8 @@ int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 	 * Check to see if we are freeing blocks across a group
 	 * boundary.
 	 */
-	if (bit + cluster_count > EXT4_CLUSTERS_PER_GROUP(sb)) {
-		ext4_warning(sb, "too many blocks added to group %u",
+	if (bit + count > EXT4_BLOCKS_PER_GROUP(sb)) {
+		ext4_warning(sb, "too much blocks added to group %u",
 			     block_group);
 		err = -EINVAL;
 		goto error_return;
@@ -5066,14 +5142,14 @@ int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 	if (err)
 		goto error_return;
 
-	for (i = 0, clusters_freed = 0; i < cluster_count; i++) {
+	for (i = 0, blocks_freed = 0; i < count; i++) {
 		BUFFER_TRACE(bitmap_bh, "clear bit");
 		if (!mb_test_bit(bit + i, bitmap_bh->b_data)) {
 			ext4_error(sb, "bit already cleared for block %llu",
 				   (ext4_fsblk_t)(block + i));
 			BUFFER_TRACE(bitmap_bh, "bit already cleared");
 		} else {
-			clusters_freed++;
+			blocks_freed++;
 		}
 	}
 
@@ -5087,20 +5163,19 @@ int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
 	 * them with group lock_held
 	 */
 	ext4_lock_group(sb, block_group);
-	mb_clear_bits(bitmap_bh->b_data, bit, cluster_count);
-	mb_free_blocks(NULL, &e4b, bit, cluster_count);
-	free_clusters_count = clusters_freed +
-		ext4_free_group_clusters(sb, desc);
-	ext4_free_group_clusters_set(sb, desc, free_clusters_count);
+	mb_clear_bits(bitmap_bh->b_data, bit, count);
+	mb_free_blocks(NULL, &e4b, bit, count);
+	blk_free_count = blocks_freed + ext4_free_group_clusters(sb, desc);
+	ext4_free_group_clusters_set(sb, desc, blk_free_count);
 	ext4_block_bitmap_csum_set(sb, block_group, desc, bitmap_bh);
 	ext4_group_desc_csum_set(sb, block_group, desc);
 	ext4_unlock_group(sb, block_group);
 	percpu_counter_add(&sbi->s_freeclusters_counter,
-			   clusters_freed);
+			   EXT4_NUM_B2C(sbi, blocks_freed));
 
 	if (sbi->s_log_groups_per_flex) {
 		ext4_group_t flex_group = ext4_flex_group(sbi, block_group);
-		atomic64_add(clusters_freed,
+		atomic64_add(EXT4_NUM_B2C(sbi, blocks_freed),
 			     &sbi_array_rcu_deref(sbi, s_flex_groups,
 						  flex_group)->free_clusters);
 	}
@@ -5269,7 +5344,6 @@ out:
  */
 int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range)
 {
-	struct request_queue *q = bdev_get_queue(sb->s_bdev);
 	struct ext4_group_info *grp;
 	ext4_group_t group, first_group, last_group;
 	ext4_grpblk_t cnt = 0, first_cluster, last_cluster;
@@ -5288,13 +5362,6 @@ int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range)
 	    start >= max_blks ||
 	    range->len < sb->s_blocksize)
 		return -EINVAL;
-	/* No point to try to trim less than discard granularity */
-	if (range->minlen < q->limits.discard_granularity) {
-		minlen = EXT4_NUM_B2C(EXT4_SB(sb),
-			q->limits.discard_granularity >> sb->s_blocksize_bits);
-		if (minlen > EXT4_CLUSTERS_PER_GROUP(sb))
-			goto out;
-	}
 	if (end >= max_blks)
 		end = max_blks - 1;
 	if (end <= first_data_blk)

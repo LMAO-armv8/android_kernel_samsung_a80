@@ -48,9 +48,10 @@ struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
 	struct ext2_sb_info *sbi = EXT2_SB(sb);
 
 	if (block_group >= sbi->s_groups_count) {
-		WARN(1, "block_group >= groups_count - "
-		     "block_group = %d, groups_count = %lu",
-		     block_group, sbi->s_groups_count);
+		ext2_error (sb, "ext2_get_group_desc",
+			    "block_group >= groups_count - "
+			    "block_group = %d, groups_count = %lu",
+			    block_group, sbi->s_groups_count);
 
 		return NULL;
 	}
@@ -58,9 +59,10 @@ struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
 	group_desc = block_group >> EXT2_DESC_PER_BLOCK_BITS(sb);
 	offset = block_group & (EXT2_DESC_PER_BLOCK(sb) - 1);
 	if (!sbi->s_group_desc[group_desc]) {
-		WARN(1, "Group descriptor not loaded - "
-		     "block_group = %d, group_desc = %lu, desc = %lu",
-		      block_group, group_desc, offset);
+		ext2_error (sb, "ext2_get_group_desc",
+			    "Group descriptor not loaded - "
+			    "block_group = %d, group_desc = %lu, desc = %lu",
+			     block_group, group_desc, offset);
 		return NULL;
 	}
 
@@ -546,7 +548,7 @@ do_more:
 	}
 
 	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & SB_SYNCHRONOUS)
+	if (sb->s_flags & MS_SYNCHRONOUS)
 		sync_dirty_buffer(bitmap_bh);
 
 	group_adjust_blocks(sb, block_group, desc, bh2, group_freed);
@@ -1422,7 +1424,7 @@ allocated:
 	percpu_counter_sub(&sbi->s_freeblocks_counter, num);
 
 	mark_buffer_dirty(bitmap_bh);
-	if (sb->s_flags & SB_SYNCHRONOUS)
+	if (sb->s_flags & MS_SYNCHRONOUS)
 		sync_dirty_buffer(bitmap_bh);
 
 	*errp = 0;

@@ -62,15 +62,46 @@
 #include <linux/oom.h>
 #include <linux/compat.h>
 #include <linux/vmalloc.h>
+#include <linux/task_integrity.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
 
 #include <trace/events/task.h>
+
+#ifdef CONFIG_RKP_NS_PROT
+#include "mount.h"
+#endif
+
 #include "internal.h"
 
 #include <trace/events/sched.h>
+
+#ifdef CONFIG_RKP_KDP
+#define rkp_is_nonroot(x) ((x->cred->type)>>1 & 1)
+#ifdef CONFIG_LOD_SEC
+#define rkp_is_lod(x) ((x->cred->type)>>3 & 1)
+#endif
+static unsigned int __is_kdp_recovery __kdp_ro;
+
+static int __init boot_recovery(char *str)
+{
+	int temp = 0;
+
+	if (get_option(&str, &temp)) {
+		__is_kdp_recovery = temp;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+early_param("androidboot.boot_recovery", boot_recovery);
+#endif
+
+#ifdef CONFIG_SECURITY_DEFEX
+#include <linux/defex.h>
+#endif
 
 int suid_dumpable = 0;
 
@@ -257,7 +288,7 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
 		 *    to work from.
 		 */
 		limit = _STK_LIM / 4 * 3;
-		limit = min(limit, bprm->rlim_stack.rlim_cur / 4);
+		limit = min(limit, rlimit(RLIMIT_STACK) / 4);
 		if (size > limit)
 			goto fail;
 	}
@@ -290,15 +321,15 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	struct vm_area_struct *vma = NULL;
 	struct mm_struct *mm = bprm->mm;
 
-	bprm->vma = vma = vm_area_alloc(mm);
+	bprm->vma = vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
 	if (!vma)
 		return -ENOMEM;
-	vma_set_anonymous(vma);
 
 	if (down_write_killable(&mm->mmap_sem)) {
 		err = -EINTR;
 		goto err_free;
 	}
+	vma->vm_mm = mm;
 
 	/*
 	 * Place the stack at the largest stack address the architecture
@@ -311,6 +342,7 @@ static int __bprm_mm_init(struct linux_binprm *bprm)
 	vma->vm_start = vma->vm_end - PAGE_SIZE;
 	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS | VM_STACK_INCOMPLETE_SETUP;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	INIT_VMA(vma);
 
 	err = insert_vm_struct(mm, vma);
 	if (err)
@@ -325,7 +357,7 @@ err:
 	up_write(&mm->mmap_sem);
 err_free:
 	bprm->vma = NULL;
-	vm_area_free(vma);
+	kmem_cache_free(vm_area_cachep, vma);
 	return err;
 }
 
@@ -409,11 +441,6 @@ static int bprm_mm_init(struct linux_binprm *bprm)
 	err = -ENOMEM;
 	if (!mm)
 		goto err;
-
-	/* Save current stack limit for all calculations made during exec. */
-	task_lock(current->group_leader);
-	bprm->rlim_stack = current->signal->rlim[RLIMIT_STACK];
-	task_unlock(current->group_leader);
 
 	err = __bprm_mm_init(bprm);
 	if (err)
@@ -701,7 +728,7 @@ int setup_arg_pages(struct linux_binprm *bprm,
 
 #ifdef CONFIG_STACK_GROWSUP
 	/* Limit stack size */
-	stack_base = bprm->rlim_stack.rlim_max;
+	stack_base = rlimit_max(RLIMIT_STACK);
 	if (stack_base > STACK_SIZE_MAX)
 		stack_base = STACK_SIZE_MAX;
 
@@ -774,7 +801,7 @@ int setup_arg_pages(struct linux_binprm *bprm,
 	 * Align this down to a page boundary as expand_stack
 	 * will align it up.
 	 */
-	rlim_stack = bprm->rlim_stack.rlim_cur & PAGE_MASK;
+	rlim_stack = rlimit(RLIMIT_STACK) & PAGE_MASK;
 #ifdef CONFIG_STACK_GROWSUP
 	if (stack_size + stack_expand > rlim_stack)
 		stack_base = vma->vm_start + rlim_stack;
@@ -899,13 +926,13 @@ int kernel_read_file(struct file *file, void **buf, loff_t *size,
 	if (!S_ISREG(file_inode(file)->i_mode) || max_size < 0)
 		return -EINVAL;
 
-	ret = deny_write_access(file);
+	ret = security_kernel_read_file(file, id);
 	if (ret)
 		return ret;
 
-	ret = security_kernel_read_file(file, id);
+	ret = deny_write_access(file);
 	if (ret)
-		goto out;
+		return ret;
 
 	i_size = i_size_read(file_inode(file));
 	if (max_size > 0 && i_size > max_size) {
@@ -984,7 +1011,7 @@ int kernel_read_file_from_fd(int fd, void **buf, loff_t *size, loff_t max_size,
 	struct fd f = fdget(fd);
 	int ret = -EBADF;
 
-	if (!f.file || !(f.file->f_mode & FMODE_READ))
+	if (!f.file)
 		goto out;
 
 	ret = kernel_read_file(f.file, buf, size, max_size, id);
@@ -1028,25 +1055,17 @@ static int exec_mmap(struct mm_struct *mm)
 		}
 	}
 	task_lock(tsk);
-
-	local_irq_disable();
 	active_mm = tsk->active_mm;
-	tsk->active_mm = mm;
 	tsk->mm = mm;
-	/*
-	 * This prevents preemption while active_mm is being loaded and
-	 * it and mm are being updated, which could cause problems for
-	 * lazy tlb mm refcounting when these are updated by context
-	 * switches. Not all architectures can handle irqs off over
-	 * activate_mm yet.
-	 */
-	if (!IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
-		local_irq_enable();
+	tsk->active_mm = mm;
 	activate_mm(active_mm, mm);
-	if (IS_ENABLED(CONFIG_ARCH_WANT_IRQS_OFF_ACTIVATE_MM))
-		local_irq_enable();
 	tsk->mm->vmacache_seqnum = 0;
 	vmacache_flush(tsk);
+#ifdef CONFIG_RKP_KDP
+	if (rkp_cred_enable) {
+		uh_call(UH_APP_RKP, RKP_KDP_X43, (u64)current_cred(), (u64)mm->pgd, 0, 0);
+	}
+#endif
 	task_unlock(tsk);
 	if (old_mm) {
 		up_read(&old_mm->mmap_sem);
@@ -1158,7 +1177,6 @@ static int de_thread(struct task_struct *tsk)
 		 */
 		tsk->pid = leader->pid;
 		change_pid(tsk, PIDTYPE_PID, task_pid(leader));
-		transfer_pid(leader, tsk, PIDTYPE_TGID);
 		transfer_pid(leader, tsk, PIDTYPE_PGID);
 		transfer_pid(leader, tsk, PIDTYPE_SID);
 
@@ -1257,6 +1275,109 @@ void __set_task_comm(struct task_struct *tsk, const char *buf, bool exec)
 	perf_event_comm(tsk, exec);
 }
 
+#ifdef CONFIG_RKP_NS_PROT
+extern struct super_block *sys_sb;	/* pointer to superblock */
+extern struct super_block *odm_sb;	/* pointer to superblock */
+extern struct super_block *vendor_sb;	/* pointer to superblock */
+extern struct super_block *rootfs_sb;	/* pointer to superblock */
+extern struct super_block *art_sb;	/* pointer to superblock */
+extern struct super_block *crypt_sb;	/* pointer to superblock */
+extern struct super_block *adbd_sb;	/* pointer to superblock */
+extern struct super_block *runtime_sb;	/* pointer to superblock */
+extern struct super_block *sysext_sb;	/* pointer to superblock */
+extern int __check_verifiedboot;
+
+static int kdp_check_sb_mismatch(struct super_block *sb)
+{
+	if (__is_kdp_recovery || __check_verifiedboot) {
+		return 0;
+	}
+
+	if ((sb != rootfs_sb) && (sb != sys_sb) && (sb != odm_sb) && (sb != vendor_sb)
+		&& (sb != art_sb) && (sb != crypt_sb) && (sb!=adbd_sb) && (sb!=runtime_sb) && (sb != sysext_sb)) {
+		return 1;
+	}
+	return 0;
+}
+
+static int kdp_check_path_mismatch(struct vfsmount *vfsmnt)
+{
+	int i = 0;
+	int ret = -1;
+	char *buf = NULL;
+	char *path_name = NULL;
+	const char* skip_path[] = {
+		"/com.android.runtime",
+		"/com.android.conscrypt",
+		"/com.android.art",
+		"/com.android.adbd",
+	};
+
+	if (!vfsmnt->bp_mount) {
+		printk(KERN_ERR "vfsmnt->bp_mount is NULL");
+		return -ENOMEM;
+	}
+
+	buf = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	path_name = dentry_path_raw(vfsmnt->bp_mount->mnt_mountpoint, buf, PATH_MAX);
+	if (IS_ERR(path_name))
+		goto out;
+
+	for (; i < ARRAY_SIZE(skip_path); ++i) {
+		if (!strncmp(path_name, skip_path[i], strlen(skip_path[i]))) {
+			ret = 0;
+			break;
+		}
+	}
+out:
+	kfree(buf);
+
+	return ret;
+}
+
+static int invalid_drive(struct linux_binprm * bprm) 
+{
+	struct super_block *sb =  NULL;
+	struct vfsmount *vfsmnt = NULL;
+
+	vfsmnt = bprm->file->f_path.mnt;
+	if (!vfsmnt ||
+		!rkp_ro_page((unsigned long)vfsmnt)) {
+		printk("\nInvalid Drive #%s# #%p#\n",bprm->filename, vfsmnt);
+		return 1;
+	}
+
+	if (!kdp_check_path_mismatch(vfsmnt)) {
+		return 0;
+	}
+
+	sb = vfsmnt->mnt_sb;
+
+	if (kdp_check_sb_mismatch(sb)) {
+		printk("\n Superblock Mismatch #%s# vfsmnt #%lx#sb #%lx:%lx:%lx:%lx:%lx:%lx:%lx:%lx:%lx:%lx#\n",
+					bprm->filename, vfsmnt, sb, rootfs_sb, sys_sb, odm_sb, vendor_sb, art_sb, crypt_sb, adbd_sb, runtime_sb, sysext_sb);
+		return 1;
+	}
+
+	return 0;
+}
+#define RKP_CRED_SYS_ID 1000
+
+static int is_rkp_priv_task(void)
+{
+	struct cred *cred = (struct cred *)current_cred();
+
+	if (cred->uid.val <= (uid_t)RKP_CRED_SYS_ID || cred->euid.val <= (uid_t)RKP_CRED_SYS_ID ||
+		cred->gid.val <= (gid_t)RKP_CRED_SYS_ID || cred->egid.val <= (gid_t)RKP_CRED_SYS_ID ) {
+		return 1;
+	}
+	return 0;
+}
+#endif
+
 /*
  * Calling this is the point of no return. None of the failures will be
  * seen by userspace since either the process is already taking a fatal
@@ -1288,6 +1409,13 @@ int flush_old_exec(struct linux_binprm * bprm)
 	 * Release all of the old mmap stuff
 	 */
 	acct_arg_size(bprm, 0);
+#ifdef CONFIG_RKP_NS_PROT
+	if (rkp_cred_enable &&
+		is_rkp_priv_task() &&
+		invalid_drive(bprm)) {
+		panic("\n KDP_NS_PROT: Illegal Execution of file #%s#\n", bprm->filename);
+	}
+#endif
 	retval = exec_mmap(bprm->mm);
 	if (retval)
 		goto out;
@@ -1323,7 +1451,7 @@ EXPORT_SYMBOL(flush_old_exec);
 void would_dump(struct linux_binprm *bprm, struct file *file)
 {
 	struct inode *inode = file_inode(file);
-	if (inode_permission(inode, MAY_READ) < 0) {
+	if (inode_permission2(file->f_path.mnt, inode, MAY_READ) < 0) {
 		struct user_namespace *old, *user_ns;
 		bprm->interp_flags |= BINPRM_FLAGS_ENFORCE_NONDUMP;
 
@@ -1361,11 +1489,11 @@ void setup_new_exec(struct linux_binprm * bprm)
 		 * RLIMIT_STACK, but after the point of no return to avoid
 		 * needing to clean up the change on failure.
 		 */
-		if (bprm->rlim_stack.rlim_cur > _STK_LIM)
-			bprm->rlim_stack.rlim_cur = _STK_LIM;
+		if (current->signal->rlim[RLIMIT_STACK].rlim_cur > _STK_LIM)
+			current->signal->rlim[RLIMIT_STACK].rlim_cur = _STK_LIM;
 	}
 
-	arch_pick_mmap_layout(current->mm, &bprm->rlim_stack);
+	arch_pick_mmap_layout(current->mm);
 
 	current->sas_ss_sp = current->sas_ss_size = 0;
 
@@ -1397,16 +1525,6 @@ void setup_new_exec(struct linux_binprm * bprm)
 	flush_signal_handlers(current, 0);
 }
 EXPORT_SYMBOL(setup_new_exec);
-
-/* Runs immediately before start_thread() takes over. */
-void finalize_exec(struct linux_binprm *bprm)
-{
-	/* Store any stack rlimit changes before starting thread. */
-	task_lock(current->group_leader);
-	current->signal->rlim[RLIMIT_STACK] = bprm->rlim_stack;
-	task_unlock(current->group_leader);
-}
-EXPORT_SYMBOL(finalize_exec);
 
 /*
  * Prepare credentials and lock ->cred_guard_mutex.
@@ -1686,7 +1804,8 @@ int search_binary_handler(struct linux_binprm *bprm)
 		if (printable(bprm->buf[0]) && printable(bprm->buf[1]) &&
 		    printable(bprm->buf[2]) && printable(bprm->buf[3]))
 			return retval;
-		if (request_module("binfmt-%04x", *(ushort *)(bprm->buf + 2)) < 0)
+		if (request_module("binfmt-%04x",
+					*(ushort *)(bprm->buf + 2)) < 0)
 			return retval;
 		need_retry = false;
 		goto retry;
@@ -1713,6 +1832,8 @@ static int exec_binprm(struct linux_binprm *bprm)
 		trace_sched_process_exec(current, old_pid, bprm);
 		ptrace_event(PTRACE_EVENT_EXEC, old_vpid);
 		proc_exec_connector(current);
+	} else {
+		task_integrity_delayed_reset(current, CAUSE_EXEC, bprm->file);
 	}
 
 	return ret;
@@ -1721,13 +1842,14 @@ static int exec_binprm(struct linux_binprm *bprm)
 /*
  * sys_execve() executes a new program.
  */
-static int __do_execve_file(int fd, struct filename *filename,
-			    struct user_arg_ptr argv,
-			    struct user_arg_ptr envp,
-			    int flags, struct file *file)
+static int do_execveat_common(int fd, struct filename *filename,
+			      struct user_arg_ptr argv,
+			      struct user_arg_ptr envp,
+			      int flags)
 {
 	char *pathbuf = NULL;
 	struct linux_binprm *bprm;
+	struct file *file;
 	struct files_struct *displaced;
 	int retval;
 
@@ -1766,18 +1888,23 @@ static int __do_execve_file(int fd, struct filename *filename,
 	check_unsafe_exec(bprm);
 	current->in_execve = 1;
 
-	if (!file)
-		file = do_open_execat(fd, filename, flags);
+	file = do_open_execat(fd, filename, flags);
 	retval = PTR_ERR(file);
 	if (IS_ERR(file))
 		goto out_unmark;
 
+#ifdef CONFIG_SECURITY_DEFEX
+	retval = task_defex_enforce(current, file, -__NR_execve);
+	if (retval < 0) {
+		bprm->file = file;
+		retval = -EPERM;
+		goto out_unmark;
+	 }
+#endif
 	sched_exec();
 
 	bprm->file = file;
-	if (!filename) {
-		bprm->filename = "none";
-	} else if (fd == AT_FDCWD || filename->name[0] == '/') {
+	if (fd == AT_FDCWD || filename->name[0] == '/') {
 		bprm->filename = filename->name;
 	} else {
 		if (filename->name[0] == '\0')
@@ -1805,9 +1932,6 @@ static int __do_execve_file(int fd, struct filename *filename,
 		goto out_unmark;
 
 	bprm->argc = count(argv, MAX_ARG_STRINGS);
-	if (bprm->argc == 0)
-		pr_warn_once("process '%s' launched '%s' with NULL argv: empty string added\n",
-			     current->comm, bprm->filename);
 	if ((retval = bprm->argc) < 0)
 		goto out;
 
@@ -1832,20 +1956,6 @@ static int __do_execve_file(int fd, struct filename *filename,
 	if (retval < 0)
 		goto out;
 
-	/*
-	 * When argv is empty, add an empty string ("") as argv[0] to
-	 * ensure confused userspace programs that start processing
-	 * from argv[1] won't end up walking envp. See also
-	 * bprm_stack_limits().
-	 */
-	if (bprm->argc == 0) {
-		const char *argv[] = { "", NULL };
-		retval = copy_strings_kernel(1, argv, bprm);
-		if (retval < 0)
-			goto out;
-		bprm->argc = 1;
-	}
-
 	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
@@ -1854,13 +1964,11 @@ static int __do_execve_file(int fd, struct filename *filename,
 	current->fs->in_exec = 0;
 	current->in_execve = 0;
 	membarrier_execve(current);
-	rseq_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
 	free_bprm(bprm);
 	kfree(pathbuf);
-	if (filename)
-		putname(filename);
+	putname(filename);
 	if (displaced)
 		put_files_struct(displaced);
 	return retval;
@@ -1883,25 +1991,8 @@ out_files:
 	if (displaced)
 		reset_files_struct(displaced);
 out_ret:
-	if (filename)
-		putname(filename);
+	putname(filename);
 	return retval;
-}
-
-static int do_execveat_common(int fd, struct filename *filename,
-			      struct user_arg_ptr argv,
-			      struct user_arg_ptr envp,
-			      int flags)
-{
-	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
-}
-
-int do_execve_file(struct file *file, void *__argv, void *__envp)
-{
-	struct user_arg_ptr argv = { .ptr.native = __argv };
-	struct user_arg_ptr envp = { .ptr.native = __envp };
-
-	return __do_execve_file(AT_FDCWD, NULL, argv, envp, 0, file);
 }
 
 int do_execve(struct filename *filename,
@@ -1981,7 +2072,7 @@ void set_dumpable(struct mm_struct *mm, int value)
 		return;
 
 	do {
-		old = READ_ONCE(mm->flags);
+		old = ACCESS_ONCE(mm->flags);
 		new = (old & ~MMF_DUMPABLE_MASK) | value;
 	} while (cmpxchg(&mm->flags, old, new) != old);
 }
@@ -1991,6 +2082,20 @@ SYSCALL_DEFINE3(execve,
 		const char __user *const __user *, argv,
 		const char __user *const __user *, envp)
 {
+#ifdef CONFIG_RKP_KDP
+	struct filename *path = getname(filename);
+	int error = PTR_ERR(path);
+
+	if (IS_ERR(path))
+		return error;
+
+	if (rkp_cred_enable) {
+		uh_call(UH_APP_RKP, RKP_KDP_X4B, (u64)path->name, 0, 0, 0);
+	}
+
+	putname(path);
+#endif
+
 	return do_execve(getname(filename), argv, envp);
 }
 

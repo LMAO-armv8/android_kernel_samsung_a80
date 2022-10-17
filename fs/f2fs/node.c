@@ -87,9 +87,9 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 				sizeof(struct extent_node)) >> PAGE_SHIFT;
 		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
 	} else if (type == INMEM_PAGES) {
-		/* it allows 20% / total_ram for inmemory pages */
+		/* it allows 50% / total_ram for inmemory pages */
 		mem_size = get_pages(sbi, F2FS_INMEM_PAGES);
-		res = mem_size < (val.totalram / 5);
+		res = mem_size < (val.totalram / 2);
 	} else {
 		if (!sbi->sb->s_bdi->wb.dirty_exceeded)
 			return true;
@@ -1230,11 +1230,7 @@ struct page *f2fs_new_node_page(struct dnode_of_data *dn, unsigned int ofs)
 		dec_valid_node_count(sbi, dn->inode, !ofs);
 		goto fail;
 	}
-	if (unlikely(new_ni.blk_addr != NULL_ADDR)) {
-		err = -EFSCORRUPTED;
-		set_sbi_flag(sbi, SBI_NEED_FSCK);
-		goto fail;
-	}
+	f2fs_bug_on(sbi, new_ni.blk_addr != NULL_ADDR);
 #endif
 	new_ni.nid = dn->nid;
 	new_ni.ino = dn->inode->i_ino;
@@ -1302,6 +1298,10 @@ static int read_node_page(struct page *page, int op_flags)
 	}
 
 	fio.new_blkaddr = fio.old_blkaddr = ni.blk_addr;
+	if (op_flags & F2FS_REQ_DEFKEY_BYPASS)
+		f2fs_warn(sbi, "inconsistent node lower block, nid: %lu, ino: %lu, blk_addr: %lu",
+				(unsigned long) ni.nid, (unsigned long) ni.ino,
+				(unsigned long) ni.blk_addr);
 
 	err = f2fs_submit_page_bio(&fio);
 
@@ -1325,7 +1325,7 @@ void f2fs_ra_node_page(struct f2fs_sb_info *sbi, nid_t nid)
 		return;
 
 	rcu_read_lock();
-	apage = radix_tree_lookup(&NODE_MAPPING(sbi)->i_pages, nid);
+	apage = radix_tree_lookup(&NODE_MAPPING(sbi)->page_tree, nid);
 	rcu_read_unlock();
 	if (apage)
 		return;
@@ -1338,6 +1338,35 @@ void f2fs_ra_node_page(struct f2fs_sb_info *sbi, nid_t nid)
 	f2fs_put_page(apage, err ? 1 : 0);
 }
 
+/*
+ * If Metadata encryption enabled, there is no way to check
+ * which pattern the node page is damaged by.
+ * Such as Deadmark, old block, or column corrution.
+ * Therefore, print the on-disk block that skips dm-default-key decryption.
+ */
+static void f2fs_print_lower_node(struct f2fs_sb_info *sbi, struct page *page)
+{
+	int err;
+
+	if (MAJOR(sbi->sb->s_dev) == SCSI_DISK0_MAJOR ||
+			MAJOR(sbi->sb->s_dev) == MMC_BLOCK_MAJOR)
+		return;
+	ClearPageUptodate(page);
+
+	/*
+	 * Handling to PAGE_LOCKED is unnecessary
+	 * because it explicitly clears page uptodate.
+	 */
+	err = read_node_page(page, F2FS_REQ_DEFKEY_BYPASS);
+	if (err < 0)
+		return;
+
+	lock_page(page);
+	if (PageUptodate(page)) {
+		f2fs_warn(sbi, "Print lower nid block");
+		print_block_data(sbi->sb, page->index, page_address(page), 0, F2FS_BLKSIZE);
+	}
+}
 static struct page *__get_node_page(struct f2fs_sb_info *sbi, pgoff_t nid,
 					struct page *parent, int start)
 {
@@ -1389,6 +1418,11 @@ page_hit:
 			  next_blkaddr_of_node(page));
 		err = -EINVAL;
 out_err:
+		if (PageUptodate(page)) {
+			print_block_data(sbi->sb, nid, page_address(page), 0, F2FS_BLKSIZE);
+			f2fs_print_lower_node(sbi, page);
+			f2fs_bug_on(sbi, 1);
+		}
 		ClearPageUptodate(page);
 		f2fs_put_page(page, 1);
 		return ERR_PTR(err);
@@ -1452,7 +1486,7 @@ static struct page *last_fsync_dnode(struct f2fs_sb_info *sbi, nid_t ino)
 	struct page *last_page = NULL;
 	int nr_pages;
 
-	pagevec_init(&pvec);
+	pagevec_init(&pvec, 0);
 	index = 0;
 
 	while ((nr_pages = pagevec_lookup_tag(&pvec, NODE_MAPPING(sbi), &index,
@@ -1521,6 +1555,8 @@ static int __write_node_page(struct page *page, bool atomic, bool *submitted,
 		.io_wbc = wbc,
 	};
 	unsigned int seq;
+
+	f2fs_cond_set_fua(&fio);
 
 	trace_f2fs_writepage(page, NODE);
 
@@ -1678,7 +1714,7 @@ int f2fs_fsync_node_pages(struct f2fs_sb_info *sbi, struct inode *inode,
 			return PTR_ERR_OR_ZERO(last_page);
 	}
 retry:
-	pagevec_init(&pvec);
+	pagevec_init(&pvec, 0);
 	index = 0;
 
 	while ((nr_pages = pagevec_lookup_tag(&pvec, NODE_MAPPING(sbi), &index,
@@ -1825,7 +1861,7 @@ int f2fs_flush_inline_data(struct f2fs_sb_info *sbi)
 	int nr_pages;
 	int ret = 0;
 
-	pagevec_init(&pvec);
+	pagevec_init(&pvec, 0);
 
 	while ((nr_pages = pagevec_lookup_tag(&pvec,
 			NODE_MAPPING(sbi), &index, PAGECACHE_TAG_DIRTY))) {
@@ -1876,7 +1912,7 @@ int f2fs_sync_node_pages(struct f2fs_sb_info *sbi,
 	int ret = 0;
 	int nr_pages, done = 0;
 
-	pagevec_init(&pvec);
+	pagevec_init(&pvec, 0);
 
 next_step:
 	index = 0;
@@ -1928,8 +1964,12 @@ continue_unlock:
 				goto continue_unlock;
 			}
 
-			/* flush inline_data, if it's async context. */
-			if (do_balance && is_inline_node(page)) {
+			/* flush inline_data/inode, if it's async context. */
+			if (!do_balance)                                     
+				goto write_node;                             
+
+			/* flush inline_data */
+			if (is_inline_node(page)) {
 				clear_inline_node(page);
 				unlock_page(page);
 				flush_inline_data(sbi, ino_of_node(page));
@@ -1942,7 +1982,7 @@ continue_unlock:
 				if (flush_dirty_inode(page))
 					goto lock_node;
 			}
-
+write_node:
 			f2fs_wait_on_page_writeback(page, NODE, true, true);
 
 			if (!clear_page_dirty_for_io(page))
@@ -2038,6 +2078,12 @@ static int f2fs_write_node_pages(struct address_space *mapping,
 
 	if (unlikely(is_sbi_flag_set(sbi, SBI_POR_DOING)))
 		goto skip_write;
+
+	/* W/A - prevent panic while shutdown */
+	if (unlikely(ignore_fs_panic)) {
+		pr_err("%s: Ignore panic\n", __func__);
+		return -EIO;
+	}
 
 	/* balancing f2fs's metadata in background */
 	f2fs_balance_fs_bg(sbi, true);
@@ -2297,8 +2343,11 @@ static int scan_nat_page(struct f2fs_sb_info *sbi,
 
 		blk_addr = le32_to_cpu(nat_blk->entries[i].block_addr);
 
-		if (blk_addr == NEW_ADDR)
+		if (blk_addr == NEW_ADDR) {
+			print_block_data(sbi->sb, current_nat_addr(sbi, start_nid),
+				page_address(nat_page), 0, F2FS_BLKSIZE);
 			return -EINVAL;
+		}
 
 		if (blk_addr == NULL_ADDR) {
 			add_free_nid(sbi, start_nid, true, true);
@@ -2375,9 +2424,6 @@ static int __f2fs_build_free_nids(struct f2fs_sb_info *sbi,
 	if (unlikely(nid >= nm_i->max_nid))
 		nid = 0;
 
-	if (unlikely(nid % NAT_ENTRY_PER_BLOCK))
-		nid = NAT_BLOCK_OFFSET(nid) * NAT_ENTRY_PER_BLOCK;
-
 	/* Enough entries */
 	if (nm_i->nid_cnt[FREE_NID] >= NAT_ENTRY_PER_BLOCK)
 		return 0;
@@ -2452,6 +2498,30 @@ int f2fs_build_free_nids(struct f2fs_sb_info *sbi, bool sync, bool mount)
 }
 
 /*
+ * f2fs_has_free_inodes()
+ * @sbi: in-core super block structure.
+ *
+ * Check if filesystem has inodes available for allocation.
+ * On success return 1, return 0 on failure.
+ */
+static inline bool f2fs_has_free_inodes(struct f2fs_sb_info *sbi)
+{
+	struct f2fs_nm_info *nm_i = NM_I(sbi);
+
+#define F2FS_DEF_RESERVE_INODE 8192
+	if (likely(nm_i->available_nids > F2FS_DEF_RESERVE_INODE))
+		return true;
+
+	/* Hm, nope.  Are (enough) root reserved inodes available? */
+	if (uid_eq(F2FS_OPTION(sbi).s_resuid, current_fsuid()) ||
+			(!gid_eq(F2FS_OPTION(sbi).s_resgid, GLOBAL_ROOT_GID) &&
+			 in_group_p(F2FS_OPTION(sbi).s_resgid)) ||
+			capable(CAP_SYS_RESOURCE))
+		return true;
+	return false;
+}
+
+/*
  * If this function returns success, caller can obtain a new nid
  * from second parameter of this function.
  * The returned nid could be used ino as well as nid when inode is created.
@@ -2468,7 +2538,8 @@ retry:
 
 	spin_lock(&nm_i->nid_list_lock);
 
-	if (unlikely(nm_i->available_nids == 0)) {
+	if (unlikely(nm_i->available_nids == 0)
+			|| f2fs_has_free_inodes(sbi) == 0) {
 		spin_unlock(&nm_i->nid_list_lock);
 		return false;
 	}
@@ -2579,7 +2650,7 @@ int f2fs_try_to_free_nids(struct f2fs_sb_info *sbi, int nr_shrink)
 	return nr - nr_shrink;
 }
 
-int f2fs_recover_inline_xattr(struct inode *inode, struct page *page)
+void f2fs_recover_inline_xattr(struct inode *inode, struct page *page)
 {
 	void *src_addr, *dst_addr;
 	size_t inline_size;
@@ -2587,8 +2658,7 @@ int f2fs_recover_inline_xattr(struct inode *inode, struct page *page)
 	struct f2fs_inode *ri;
 
 	ipage = f2fs_get_node_page(F2FS_I_SB(inode), inode->i_ino);
-	if (IS_ERR(ipage))
-		return PTR_ERR(ipage);
+	f2fs_bug_on(F2FS_I_SB(inode), IS_ERR(ipage));
 
 	ri = F2FS_INODE(page);
 	if (ri->i_inline & F2FS_INLINE_XATTR) {
@@ -2607,7 +2677,6 @@ int f2fs_recover_inline_xattr(struct inode *inode, struct page *page)
 update_inode:
 	f2fs_update_inode(inode, ipage);
 	f2fs_put_page(ipage, 1);
-	return 0;
 }
 
 int f2fs_recover_xattr_data(struct inode *inode, struct page *page)
@@ -2778,9 +2847,6 @@ static void remove_nats_in_journal(struct f2fs_sb_info *sbi)
 		struct nat_entry *ne;
 		struct f2fs_nat_entry raw_ne;
 		nid_t nid = le32_to_cpu(nid_in_journal(journal, i));
-
-		if (f2fs_check_nid_range(sbi, nid))
-			continue;
 
 		raw_ne = nat_in_journal(journal, i);
 

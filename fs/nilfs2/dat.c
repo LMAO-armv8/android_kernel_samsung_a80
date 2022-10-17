@@ -1,8 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0+
 /*
  * dat.c - NILFS disk address translation.
  *
  * Copyright (C) 2006-2008 Nippon Telegraph and Telephone Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  *
  * Written by Koji Sato.
  */
@@ -497,9 +506,7 @@ int nilfs_dat_read(struct super_block *sb, size_t entry_size,
 	di = NILFS_DAT_I(dat);
 	lockdep_set_class(&di->mi.mi_sem, &dat_lock_key);
 	nilfs_palloc_setup_cache(dat, &di->palloc_cache);
-	err = nilfs_mdt_setup_shadow_map(dat, &di->shadow);
-	if (err)
-		goto failed;
+	nilfs_mdt_setup_shadow_map(dat, &di->shadow);
 
 	err = nilfs_read_inode_common(dat, raw_inode);
 	if (err)

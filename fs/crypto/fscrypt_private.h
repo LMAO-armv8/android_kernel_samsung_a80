@@ -16,6 +16,12 @@
 #include <crypto/hash.h>
 #include <linux/bio-crypt-ctx.h>
 
+#ifdef CONFIG_FSCRYPT_SDP
+#include "fscrypt_knox_private.h"
+#include "sdp/fscrypto_sdp_private.h"
+#include <sdp/fs_request.h>
+#endif
+
 #define CONST_STRLEN(str)	(sizeof(str) - 1)
 
 #define FS_KEY_DERIVATION_NONCE_SIZE	16
@@ -33,6 +39,9 @@ struct fscrypt_context_v1 {
 	u8 flags;
 	u8 master_key_descriptor[FSCRYPT_KEY_DESCRIPTOR_SIZE];
 	u8 nonce[FS_KEY_DERIVATION_NONCE_SIZE];
+#if defined(CONFIG_FSCRYPT_SDP)
+	u32 knox_flags;
+#endif
 };
 
 struct fscrypt_context_v2 {
@@ -43,6 +52,9 @@ struct fscrypt_context_v2 {
 	u8 __reserved[4];
 	u8 master_key_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE];
 	u8 nonce[FS_KEY_DERIVATION_NONCE_SIZE];
+#if defined(CONFIG_FSCRYPT_SDP)
+	u32 knox_flags;
+#endif
 };
 
 /*
@@ -69,10 +81,18 @@ static inline int fscrypt_context_size(const union fscrypt_context *ctx)
 {
 	switch (ctx->version) {
 	case FSCRYPT_CONTEXT_V1:
+#if defined(CONFIG_FSCRYPT_SDP)
+		BUILD_BUG_ON(sizeof(ctx->v1) != 32);
+#else
 		BUILD_BUG_ON(sizeof(ctx->v1) != 28);
+#endif
 		return sizeof(ctx->v1);
 	case FSCRYPT_CONTEXT_V2:
+#if defined(CONFIG_FSCRYPT_SDP)
+		BUILD_BUG_ON(sizeof(ctx->v2) != 44);
+#else
 		BUILD_BUG_ON(sizeof(ctx->v2) != 40);
+#endif
 		return sizeof(ctx->v2);
 	}
 	return 0;
@@ -190,7 +210,6 @@ struct fscrypt_prepared_key {
  * inode is evicted.
  */
 struct fscrypt_info {
-
 	/* The key in a form prepared for actual encryption/decryption */
 	struct fscrypt_prepared_key	ci_key;
 
@@ -246,9 +265,14 @@ struct fscrypt_info {
 
 	/* This inode's nonce, copied from the fscrypt_context */
 	u8 ci_nonce[FS_KEY_DERIVATION_NONCE_SIZE];
+	u8 ci_raw_key[FSCRYPT_MAX_KEY_SIZE];
 
 	/* Hashed inode number.  Only set for IV_INO_LBLK_32 */
 	u32 ci_hashed_ino;
+
+#ifdef CONFIG_FSCRYPT_SDP
+	struct sdp_info *ci_sdp_info;
+#endif
 };
 
 typedef enum {
@@ -362,17 +386,16 @@ fscrypt_is_key_prepared(struct fscrypt_prepared_key *prep_key,
 			const struct fscrypt_info *ci)
 {
 	/*
-	 * The two smp_load_acquire()'s here pair with the smp_store_release()'s
-	 * in fscrypt_prepare_inline_crypt_key() and fscrypt_prepare_key().
-	 * I.e., in some cases (namely, if this prep_key is a per-mode
-	 * encryption key) another task can publish blk_key or tfm concurrently,
-	 * executing a RELEASE barrier.  We need to use smp_load_acquire() here
-	 * to safely ACQUIRE the memory the other task published.
+	 * The READ_ONCE() here pairs with the smp_store_release() in
+	 * fscrypt_prepare_key().  (This only matters for the per-mode keys,
+	 * which are shared by multiple inodes.)
 	 */
 	if (fscrypt_using_inline_encryption(ci))
-		return smp_load_acquire(&prep_key->blk_key) != NULL;
-	return smp_load_acquire(&prep_key->tfm) != NULL;
+		return READ_ONCE(prep_key->blk_key) != NULL;
+	return READ_ONCE(prep_key->tfm) != NULL;
 }
+
+extern int fscrypt_find_storage_type(char **device);
 
 #else /* CONFIG_FS_ENCRYPTION_INLINE_CRYPT */
 
@@ -418,7 +441,12 @@ static inline bool
 fscrypt_is_key_prepared(struct fscrypt_prepared_key *prep_key,
 			const struct fscrypt_info *ci)
 {
-	return smp_load_acquire(&prep_key->tfm) != NULL;
+	return READ_ONCE(prep_key->tfm) != NULL;
+}
+
+static inline int fscrypt_find_storage_type(char **device)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* !CONFIG_FS_ENCRYPTION_INLINE_CRYPT */
 
@@ -613,6 +641,47 @@ int fscrypt_setup_v1_file_key(struct fscrypt_info *ci,
 
 int fscrypt_setup_v1_file_key_via_subscribed_keyrings(struct fscrypt_info *ci);
 
+#ifdef CONFIG_FSCRYPT_SDP
+extern void fscrypt_sdp_finalize_v1(struct fscrypt_info *ci);
+// functions added for v1 and v2 simultaneous support
+int find_and_derive_v1_fskey_via_subscribed_keyrings(
+					const struct fscrypt_info *ci,
+					struct fscrypt_key *fskey);
+
+int find_and_derive_v1_file_key(
+					struct fscrypt_key *key,
+					struct fscrypt_info *ci,
+					const u8 *raw_master_key);
+
+int find_and_derive_v1_fskey(
+		struct fscrypt_info *crypt_info,
+		struct fscrypt_key *kek);
+
+// In keysetup.c for V1
+int derive_fek_v1(struct inode *inode,
+		struct fscrypt_info *crypt_info,
+		u8 *fek, u32 fek_len);
+
+static inline bool fscrypt_sdp_protected(const union fscrypt_context *ctx_u) {
+	switch (ctx_u->version) {
+		case FSCRYPT_CONTEXT_V1: {
+			const struct fscrypt_context_v1 *ctx = &ctx_u->v1;
+			if (ctx->knox_flags & FSCRYPT_KNOX_FLG_SDP_MASK) {
+				return true;
+			}
+			break;
+		}
+		case FSCRYPT_CONTEXT_V2: {
+			const struct fscrypt_context_v2 *ctx = &ctx_u->v2;
+			if (ctx->knox_flags & FSCRYPT_KNOX_FLG_SDP_MASK) {
+				return true;
+			}
+			break;
+		}
+	}
+	return false;
+}
+#endif
 /* policy.c */
 
 bool fscrypt_policies_equal(const union fscrypt_policy *policy1,

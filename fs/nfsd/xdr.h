@@ -33,8 +33,8 @@ struct nfsd_readargs {
 struct nfsd_writeargs {
 	svc_fh			fh;
 	__u32			offset;
-	__u32			len;
-	struct kvec		first;
+	int			len;
+	int			vlen;
 };
 
 struct nfsd_createargs {
@@ -72,7 +72,6 @@ struct nfsd_symlinkargs {
 	char *			tname;
 	unsigned int		tlen;
 	struct iattr		attrs;
-	struct kvec		first;
 };
 
 struct nfsd_readdirargs {

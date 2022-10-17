@@ -88,24 +88,22 @@ out_unlock:
  * The default page_lock and i_size verification done by non-DAX fault paths
  * is sufficient because ext2 doesn't support hole punching.
  */
-static vm_fault_t ext2_dax_fault(struct vm_fault *vmf)
+static int ext2_dax_fault(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct ext2_inode_info *ei = EXT2_I(inode);
-	vm_fault_t ret;
-	bool write = (vmf->flags & FAULT_FLAG_WRITE) &&
-		(vmf->vma->vm_flags & VM_SHARED);
+	int ret;
 
-	if (write) {
+	if (vmf->flags & FAULT_FLAG_WRITE) {
 		sb_start_pagefault(inode->i_sb);
 		file_update_time(vmf->vma->vm_file);
 	}
 	down_read(&ei->dax_sem);
 
-	ret = dax_iomap_fault(vmf, PE_SIZE_PTE, NULL, NULL, &ext2_iomap_ops);
+	ret = dax_iomap_fault(vmf, PE_SIZE_PTE, &ext2_iomap_ops);
 
 	up_read(&ei->dax_sem);
-	if (write)
+	if (vmf->flags & FAULT_FLAG_WRITE)
 		sb_end_pagefault(inode->i_sb);
 	return ret;
 }
@@ -128,6 +126,7 @@ static int ext2_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 	vma->vm_ops = &ext2_dax_vm_ops;
+	vma->vm_flags |= VM_MIXEDMAP;
 	return 0;
 }
 #else

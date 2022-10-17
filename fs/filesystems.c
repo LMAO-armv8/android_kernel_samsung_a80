@@ -221,6 +221,25 @@ int __init get_filesystem_list(char *buf)
 	return len;
 }
 
+#ifdef CONFIG_EARLY_SERVICES
+int get_filesystem_list_runtime(char *buf)
+{
+	int len = 0;
+	struct file_system_type *tmp;
+
+	read_lock(&file_systems_lock);
+	tmp = file_systems;
+	while (tmp && len < PAGE_SIZE - 80) {
+		len += scnprintf(buf+len, PAGE_SIZE, "%s\t%s\n",
+			(tmp->fs_flags & FS_REQUIRES_DEV) ? "" : "nodev",
+			tmp->name);
+		tmp = tmp->next;
+	}
+	read_unlock(&file_systems_lock);
+	return len;
+}
+#endif
+
 #ifdef CONFIG_PROC_FS
 static int filesystems_proc_show(struct seq_file *m, void *v)
 {
@@ -238,9 +257,21 @@ static int filesystems_proc_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int filesystems_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, filesystems_proc_show, NULL);
+}
+
+static const struct file_operations filesystems_proc_fops = {
+	.open		= filesystems_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static int __init proc_filesystems_init(void)
 {
-	proc_create_single("filesystems", 0, NULL, filesystems_proc_show);
+	proc_create("filesystems", 0, NULL, &filesystems_proc_fops);
 	return 0;
 }
 module_init(proc_filesystems_init);

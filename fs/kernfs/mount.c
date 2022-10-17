@@ -320,7 +320,6 @@ struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
 
 	info->root = root;
 	info->ns = ns;
-	INIT_LIST_HEAD(&info->node);
 
 	sb = sget_userns(fs_type, kernfs_test_super, kernfs_set_super, flags,
 			 &init_user_ns, info);
@@ -340,7 +339,7 @@ struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
 			deactivate_locked_super(sb);
 			return ERR_PTR(error);
 		}
-		sb->s_flags |= SB_ACTIVE;
+		sb->s_flags |= MS_ACTIVE;
 
 		mutex_lock(&kernfs_mutex);
 		list_add(&info->node, &root->supers);

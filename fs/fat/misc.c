@@ -8,6 +8,46 @@
 
 #include "fat.h"
 
+#ifdef CONFIG_FAT_UEVENT
+static struct kobject fat_uevent_kobj;
+
+int fat_uevent_init(struct kset *fat_kset)
+{
+	int err;
+	struct kobj_type *ktype = get_ktype(&fat_kset->kobj);
+
+	fat_uevent_kobj.kset = fat_kset;
+	err = kobject_init_and_add(&fat_uevent_kobj, ktype, NULL, "uevent");
+	if (err)
+		pr_err("FAT-fs Unable to create fat uevent kobj\n");
+
+	return err;
+}
+
+void fat_uevent_uninit(void)
+{
+	kobject_del(&fat_uevent_kobj);
+	memset(&fat_uevent_kobj, 0, sizeof(struct kobject));
+}
+
+void fat_uevent_ro_remount(struct super_block *sb)
+{
+	struct block_device *bdev = sb->s_bdev;
+	dev_t bd_dev = bdev ? bdev->bd_dev : 0;
+
+	char major[16], minor[16];
+	char *envp[] = { major, minor, NULL };
+
+	snprintf(major, sizeof(major), "MAJOR=%d", MAJOR(bd_dev));
+	snprintf(minor, sizeof(minor), "MINOR=%d", MINOR(bd_dev));
+
+	kobject_uevent_env(&fat_uevent_kobj, KOBJ_CHANGE, envp);
+
+	ST_LOG("FAT-fs (%s[%d:%d]): Uevent triggered\n",
+			sb->s_id, MAJOR(bd_dev), MINOR(bd_dev));
+}
+#endif
+
 /*
  * fat_fs_error reports a file system problem that might indicate fa data
  * corruption/inconsistency. Depending on 'errors' mount option the
@@ -21,20 +61,34 @@ void __fat_fs_error(struct super_block *sb, int report, const char *fmt, ...)
 	struct fat_mount_options *opts = &MSDOS_SB(sb)->options;
 	va_list args;
 	struct va_format vaf;
+	struct block_device *bdev = sb->s_bdev;
+	dev_t bd_dev = bdev ? bdev->bd_dev : 0;
 
 	if (report) {
 		va_start(args, fmt);
 		vaf.fmt = fmt;
 		vaf.va = &args;
-		fat_msg(sb, KERN_ERR, "error, %pV", &vaf);
+		printk(KERN_ERR "FAT-fs (%s[%d:%d]): error, %pV\n",
+				sb->s_id, MAJOR(bd_dev), MINOR(bd_dev), &vaf);
+
+		if (opts->errors == FAT_ERRORS_RO && !sb_rdonly(sb))
+				ST_LOG("FAT-fs (%s[%d:%d]): error, %pV\n",
+				sb->s_id, MAJOR(bd_dev), MINOR(bd_dev), &vaf);
 		va_end(args);
 	}
 
 	if (opts->errors == FAT_ERRORS_PANIC)
-		panic("FAT-fs (%s): fs panic from previous error\n", sb->s_id);
+		panic("FAT-fs (%s[%d:%d]): fs panic from previous error\n",
+				sb->s_id, MAJOR(bd_dev), MINOR(bd_dev));
 	else if (opts->errors == FAT_ERRORS_RO && !sb_rdonly(sb)) {
-		sb->s_flags |= SB_RDONLY;
-		fat_msg(sb, KERN_ERR, "Filesystem has been set read-only");
+		sb->s_flags |= MS_RDONLY;
+		printk(KERN_ERR "FAT-fs (%s[%d:%d]): Filesystem has been "
+				"set read-only\n",
+				sb->s_id, MAJOR(bd_dev), MINOR(bd_dev));
+
+		ST_LOG("FAT-fs (%s[%d:%d]): Filesystem has been set read-only\n",
+				sb->s_id, MAJOR(bd_dev), MINOR(bd_dev));
+		fat_uevent_ro_remount(sb);
 	}
 }
 EXPORT_SYMBOL_GPL(__fat_fs_error);
@@ -47,11 +101,18 @@ void fat_msg(struct super_block *sb, const char *level, const char *fmt, ...)
 {
 	struct va_format vaf;
 	va_list args;
+	struct block_device *bdev = sb->s_bdev;
+	dev_t bd_dev = bdev ? bdev->bd_dev : 0;
 
 	va_start(args, fmt);
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	printk("%sFAT-fs (%s): %pV\n", level, sb->s_id, &vaf);
+	if (!strncmp(level, KERN_ERR, sizeof(KERN_ERR)))
+		printk_ratelimited("%sFAT-fs (%s[%d:%d]): %pV\n", level,
+			sb->s_id, MAJOR(bd_dev), MINOR(bd_dev), &vaf);
+	else
+		printk("%sFAT-fs (%s[%d:%d]): %pV\n", level,
+			sb->s_id, MAJOR(bd_dev), MINOR(bd_dev), &vaf);
 	va_end(args);
 }
 
@@ -68,7 +129,7 @@ int fat_clusters_flush(struct super_block *sb)
 
 	bh = sb_bread(sb, sbi->fsinfo_sector);
 	if (bh == NULL) {
-		fat_msg(sb, KERN_ERR, "bread failed in fat_clusters_flush");
+		fat_msg_ratelimit(sb, KERN_ERR, "bread failed in %s", __func__);
 		return -EIO;
 	}
 
@@ -85,7 +146,7 @@ int fat_clusters_flush(struct super_block *sb)
 			fsinfo->free_clusters = cpu_to_le32(sbi->free_clusters);
 		if (sbi->prev_free != -1)
 			fsinfo->next_cluster = cpu_to_le32(sbi->prev_free);
-		mark_buffer_dirty(bh);
+		mark_buffer_dirty_sync(bh);
 	}
 	brelse(bh);
 
@@ -180,18 +241,17 @@ int fat_chain_add(struct inode *inode, int new_dclus, int nr_cluster)
 #define IS_LEAP_YEAR(y)	(!((y) & 3) && (y) != YEAR_2100)
 
 /* Linear day numbers of the respective 1sts in non-leap years. */
-static long days_in_year[] = {
+static time_t days_in_year[] = {
 	/* Jan  Feb  Mar  Apr  May  Jun  Jul  Aug  Sep  Oct  Nov  Dec */
 	0,   0,  31,  59,  90, 120, 151, 181, 212, 243, 273, 304, 334, 0, 0, 0,
 };
 
 /* Convert a FAT time/date pair to a UNIX date (seconds since 1 1 70). */
-void fat_time_fat2unix(struct msdos_sb_info *sbi, struct timespec64 *ts,
+void fat_time_fat2unix(struct msdos_sb_info *sbi, struct timespec *ts,
 		       __le16 __time, __le16 __date, u8 time_cs)
 {
 	u16 time = le16_to_cpu(__time), date = le16_to_cpu(__date);
-	time64_t second;
-	long day, leap_day, month, year;
+	time_t second, day, leap_day, month, year;
 
 	year  = date >> 9;
 	month = max(1, (date >> 5) & 0xf);
@@ -206,7 +266,7 @@ void fat_time_fat2unix(struct msdos_sb_info *sbi, struct timespec64 *ts,
 	second =  (time & 0x1f) << 1;
 	second += ((time >> 5) & 0x3f) * SECS_PER_MIN;
 	second += (time >> 11) * SECS_PER_HOUR;
-	second += (time64_t)(year * 365 + leap_day
+	second += (year * 365 + leap_day
 		   + days_in_year[month] + day
 		   + DAYS_DELTA) * SECS_PER_DAY;
 
@@ -225,11 +285,11 @@ void fat_time_fat2unix(struct msdos_sb_info *sbi, struct timespec64 *ts,
 }
 
 /* Convert linear UNIX date to a FAT time/date pair. */
-void fat_time_unix2fat(struct msdos_sb_info *sbi, struct timespec64 *ts,
+void fat_time_unix2fat(struct msdos_sb_info *sbi, struct timespec *ts,
 		       __le16 *time, __le16 *date, u8 *time_cs)
 {
 	struct tm tm;
-	time64_to_tm(ts->tv_sec,
+	time_to_tm(ts->tv_sec,
 		   (sbi->options.tz_set ? sbi->options.time_offset :
 		   -sys_tz.tz_minuteswest) * SECS_PER_MIN, &tm);
 
