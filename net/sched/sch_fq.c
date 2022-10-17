@@ -699,8 +699,7 @@ static const struct nla_policy fq_policy[TCA_FQ_MAX + 1] = {
 	[TCA_FQ_LOW_RATE_THRESHOLD]	= { .type = NLA_U32 },
 };
 
-static int fq_change(struct Qdisc *sch, struct nlattr *opt,
-		     struct netlink_ext_ack *extack)
+static int fq_change(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct fq_sched_data *q = qdisc_priv(sch);
 	struct nlattr *tb[TCA_FQ_MAX + 1];
@@ -736,12 +735,10 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt,
 	if (tb[TCA_FQ_QUANTUM]) {
 		u32 quantum = nla_get_u32(tb[TCA_FQ_QUANTUM]);
 
-		if (quantum > 0 && quantum <= (1 << 20)) {
+		if (quantum > 0 && quantum <= (1 << 20))
 			q->quantum = quantum;
-		} else {
-			NL_SET_ERR_MSG_MOD(extack, "invalid quantum");
+		else
 			err = -EINVAL;
-		}
 	}
 
 	if (tb[TCA_FQ_INITIAL_QUANTUM])
@@ -805,8 +802,7 @@ static void fq_destroy(struct Qdisc *sch)
 	qdisc_watchdog_cancel(&q->watchdog);
 }
 
-static int fq_init(struct Qdisc *sch, struct nlattr *opt,
-		   struct netlink_ext_ack *extack)
+static int fq_init(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct fq_sched_data *q = qdisc_priv(sch);
 	int err;
@@ -829,7 +825,7 @@ static int fq_init(struct Qdisc *sch, struct nlattr *opt,
 	qdisc_watchdog_init(&q->watchdog, sch);
 
 	if (opt)
-		err = fq_change(sch, opt, extack);
+		err = fq_change(sch, opt);
 	else
 		err = fq_resize(sch, q->fq_trees_log);
 

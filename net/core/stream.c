@@ -38,8 +38,8 @@ void sk_stream_write_space(struct sock *sk)
 		rcu_read_lock();
 		wq = rcu_dereference(sk->sk_wq);
 		if (skwq_has_sleeper(wq))
-			wake_up_interruptible_poll(&wq->wait, EPOLLOUT |
-						EPOLLWRNORM | EPOLLWRBAND);
+			wake_up_interruptible_poll(&wq->wait, POLLOUT |
+						POLLWRNORM | POLLWRBAND);
 		if (wq && wq->fasync_list && !(sk->sk_shutdown & SEND_SHUTDOWN))
 			sock_wake_async(wq, SOCK_WAKE_SPACE, POLL_OUT);
 		rcu_read_unlock();
@@ -194,6 +194,9 @@ void sk_stream_kill_queues(struct sock *sk)
 {
 	/* First the read buffer. */
 	__skb_queue_purge(&sk->sk_receive_queue);
+
+	/* Next, the error queue. */
+	__skb_queue_purge(&sk->sk_error_queue);
 
 	/* Next, the write queue. */
 	WARN_ON(!skb_queue_empty(&sk->sk_write_queue));

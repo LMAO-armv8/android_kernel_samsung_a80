@@ -194,7 +194,6 @@ static void rose_kill_by_device(struct net_device *dev)
 			rose_disconnect(s, ENETUNREACH, ROSE_OUT_OF_ORDER, 0);
 			if (rose->neighbour)
 				rose->neighbour->use--;
-			dev_put(rose->device);
 			rose->device = NULL;
 		}
 	}
@@ -595,8 +594,6 @@ static struct sock *rose_make_new(struct sock *osk)
 	rose->idle	= orose->idle;
 	rose->defer	= orose->defer;
 	rose->device	= orose->device;
-	if (rose->device)
-		dev_hold(rose->device);
 	rose->qbitincl	= orose->qbitincl;
 
 	return sk;
@@ -650,7 +647,6 @@ static int rose_release(struct socket *sock)
 		break;
 	}
 
-	dev_put(rose->device);
 	sock->sk = NULL;
 	release_sock(sk);
 	sock_put(sk);
@@ -725,6 +721,7 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
 	struct rose_sock *rose = rose_sk(sk);
 	struct sockaddr_rose *addr = (struct sockaddr_rose *)uaddr;
 	unsigned char cause, diagnostic;
+	struct net_device *dev;
 	ax25_uid_assoc *user;
 	int n, err = 0;
 
@@ -781,12 +778,9 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
 	}
 
 	if (sock_flag(sk, SOCK_ZAPPED)) {	/* Must bind first - autobinding in this may or may not work */
-		struct net_device *dev;
-
 		sock_reset_flag(sk, SOCK_ZAPPED);
 
-		dev = rose_dev_first();
-		if (!dev) {
+		if ((dev = rose_dev_first()) == NULL) {
 			err = -ENETUNREACH;
 			goto out_release;
 		}
@@ -794,7 +788,6 @@ static int rose_connect(struct socket *sock, struct sockaddr *uaddr, int addr_le
 		user = ax25_findbyuid(current_euid());
 		if (!user) {
 			err = -EINVAL;
-			dev_put(dev);
 			goto out_release;
 		}
 
@@ -945,7 +938,7 @@ out_release:
 }
 
 static int rose_getname(struct socket *sock, struct sockaddr *uaddr,
-	int peer)
+	int *uaddr_len, int peer)
 {
 	struct full_sockaddr_rose *srose = (struct full_sockaddr_rose *)uaddr;
 	struct sock *sk = sock->sk;
@@ -971,7 +964,8 @@ static int rose_getname(struct socket *sock, struct sockaddr *uaddr,
 			srose->srose_digis[n] = rose->source_digis[n];
 	}
 
-	return sizeof(struct full_sockaddr_rose);
+	*uaddr_len = sizeof(struct full_sockaddr_rose);
+	return 0;
 }
 
 int rose_rx_call_request(struct sk_buff *skb, struct net_device *dev, struct rose_neigh *neigh, unsigned int lci)
@@ -1460,6 +1454,19 @@ static const struct seq_operations rose_info_seqops = {
 	.stop = rose_info_stop,
 	.show = rose_info_show,
 };
+
+static int rose_info_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &rose_info_seqops);
+}
+
+static const struct file_operations rose_info_fops = {
+	.owner = THIS_MODULE,
+	.open = rose_info_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release,
+};
 #endif	/* CONFIG_PROC_FS */
 
 static const struct net_proto_family rose_family_ops = {
@@ -1521,8 +1528,7 @@ static int __init rose_proto_init(void)
 
 	rose_callsign = null_ax25_address;
 
-	dev_rose = kcalloc(rose_ndevs, sizeof(struct net_device *),
-			   GFP_KERNEL);
+	dev_rose = kzalloc(rose_ndevs * sizeof(struct net_device *), GFP_KERNEL);
 	if (dev_rose == NULL) {
 		printk(KERN_ERR "ROSE: rose_proto_init - unable to allocate device structure\n");
 		rc = -ENOMEM;
@@ -1563,13 +1569,13 @@ static int __init rose_proto_init(void)
 
 	rose_add_loopback_neigh();
 
-	proc_create_seq("rose", 0444, init_net.proc_net, &rose_info_seqops);
-	proc_create_seq("rose_neigh", 0444, init_net.proc_net,
-		    &rose_neigh_seqops);
-	proc_create_seq("rose_nodes", 0444, init_net.proc_net,
-		    &rose_node_seqops);
-	proc_create_seq("rose_routes", 0444, init_net.proc_net,
-		    &rose_route_seqops);
+	proc_create("rose", S_IRUGO, init_net.proc_net, &rose_info_fops);
+	proc_create("rose_neigh", S_IRUGO, init_net.proc_net,
+		    &rose_neigh_fops);
+	proc_create("rose_nodes", S_IRUGO, init_net.proc_net,
+		    &rose_nodes_fops);
+	proc_create("rose_routes", S_IRUGO, init_net.proc_net,
+		    &rose_routes_fops);
 out:
 	return rc;
 fail:

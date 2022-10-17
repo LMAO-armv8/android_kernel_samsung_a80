@@ -9,7 +9,6 @@
  */
 
 #include <linux/netfilter_bridge/ebtables.h>
-#include <uapi/linux/netfilter_bridge.h>
 #include <linux/module.h>
 
 #define FILTER_VALID_HOOKS ((1 << NF_BR_LOCAL_IN) | (1 << NF_BR_FORWARD) | \
@@ -42,10 +41,18 @@ static struct ebt_replace_kernel initial_table = {
 	.entries	= (char *)initial_chains,
 };
 
+static int check(const struct ebt_table_info *info, unsigned int valid_hooks)
+{
+	if (valid_hooks & ~FILTER_VALID_HOOKS)
+		return -EINVAL;
+	return 0;
+}
+
 static const struct ebt_table frame_filter = {
 	.name		= "filter",
 	.table		= &initial_table,
 	.valid_hooks	= FILTER_VALID_HOOKS,
+	.check		= check,
 	.me		= THIS_MODULE,
 };
 

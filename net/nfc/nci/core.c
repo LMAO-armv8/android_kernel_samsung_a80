@@ -156,15 +156,12 @@ inline int nci_request(struct nci_dev *ndev,
 {
 	int rc;
 
+	if (!test_bit(NCI_UP, &ndev->flags))
+		return -ENETDOWN;
+
 	/* Serialize all requests */
 	mutex_lock(&ndev->req_lock);
-	/* check the state after obtaing the lock against any races
-	 * from nci_close_device when the device gets removed.
-	 */
-	if (test_bit(NCI_UP, &ndev->flags))
-		rc = __nci_request(ndev, req, opt, timeout);
-	else
-		rc = -ENETDOWN;
+	rc = __nci_request(ndev, req, opt, timeout);
 	mutex_unlock(&ndev->req_lock);
 
 	return rc;
@@ -485,11 +482,6 @@ static int nci_open_device(struct nci_dev *ndev)
 
 	mutex_lock(&ndev->req_lock);
 
-	if (test_bit(NCI_UNREG, &ndev->flags)) {
-		rc = -ENODEV;
-		goto done;
-	}
-
 	if (test_bit(NCI_UP, &ndev->flags)) {
 		rc = -EALREADY;
 		goto done;
@@ -553,17 +545,9 @@ done:
 static int nci_close_device(struct nci_dev *ndev)
 {
 	nci_req_cancel(ndev, ENODEV);
-
-	/* This mutex needs to be held as a barrier for
-	 * caller nci_unregister_device
-	 */
 	mutex_lock(&ndev->req_lock);
 
 	if (!test_and_clear_bit(NCI_UP, &ndev->flags)) {
-		/* Need to flush the cmd wq in case
-		 * there is a queued/running cmd_work
-		 */
-		flush_workqueue(ndev->cmd_wq);
 		del_timer_sync(&ndev->cmd_timer);
 		del_timer_sync(&ndev->data_timer);
 		mutex_unlock(&ndev->req_lock);
@@ -598,8 +582,8 @@ static int nci_close_device(struct nci_dev *ndev)
 	/* Flush cmd wq */
 	flush_workqueue(ndev->cmd_wq);
 
-	/* Clear flags except NCI_UNREG */
-	ndev->flags &= BIT(NCI_UNREG);
+	/* Clear flags */
+	ndev->flags = 0;
 
 	mutex_unlock(&ndev->req_lock);
 
@@ -607,18 +591,18 @@ static int nci_close_device(struct nci_dev *ndev)
 }
 
 /* NCI command timer function */
-static void nci_cmd_timer(struct timer_list *t)
+static void nci_cmd_timer(unsigned long arg)
 {
-	struct nci_dev *ndev = from_timer(ndev, t, cmd_timer);
+	struct nci_dev *ndev = (void *) arg;
 
 	atomic_set(&ndev->cmd_cnt, 1);
 	queue_work(ndev->cmd_wq, &ndev->cmd_work);
 }
 
 /* NCI data exchange timer function */
-static void nci_data_timer(struct timer_list *t)
+static void nci_data_timer(unsigned long arg)
 {
-	struct nci_dev *ndev = from_timer(ndev, t, data_timer);
+	struct nci_dev *ndev = (void *) arg;
 
 	set_bit(NCI_DATA_EXCHANGE_TO, &ndev->flags);
 	queue_work(ndev->rx_wq, &ndev->rx_work);
@@ -1203,7 +1187,6 @@ EXPORT_SYMBOL(nci_allocate_device);
 void nci_free_device(struct nci_dev *ndev)
 {
 	nfc_free_device(ndev->nfc_dev);
-	nci_hci_deallocate(ndev);
 	kfree(ndev);
 }
 EXPORT_SYMBOL(nci_free_device);
@@ -1249,8 +1232,10 @@ int nci_register_device(struct nci_dev *ndev)
 	skb_queue_head_init(&ndev->rx_q);
 	skb_queue_head_init(&ndev->tx_q);
 
-	timer_setup(&ndev->cmd_timer, nci_cmd_timer, 0);
-	timer_setup(&ndev->data_timer, nci_data_timer, 0);
+	setup_timer(&ndev->cmd_timer, nci_cmd_timer,
+		    (unsigned long) ndev);
+	setup_timer(&ndev->data_timer, nci_data_timer,
+		    (unsigned long) ndev);
 
 	mutex_init(&ndev->req_lock);
 	INIT_LIST_HEAD(&ndev->conn_info_list);
@@ -1280,12 +1265,6 @@ EXPORT_SYMBOL(nci_register_device);
 void nci_unregister_device(struct nci_dev *ndev)
 {
 	struct nci_conn_info    *conn_info, *n;
-
-	/* This set_bit is not protected with specialized barrier,
-	 * However, it is fine because the mutex_lock(&ndev->req_lock);
-	 * in nci_close_device() will help to emit one.
-	 */
-	set_bit(NCI_UNREG, &ndev->flags);
 
 	nci_close_device(ndev);
 

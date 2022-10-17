@@ -56,7 +56,6 @@
 #include <net/sctp/sm.h>
 #include <net/sctp/checksum.h>
 #include <net/net_namespace.h>
-#include <linux/rhashtable.h>
 
 /* Forward declarations for internal helpers. */
 static int sctp_rcv_ootb(struct sk_buff *);
@@ -104,11 +103,9 @@ int sctp_rcv(struct sk_buff *skb)
 	struct sctp_chunk *chunk;
 	union sctp_addr src;
 	union sctp_addr dest;
-	int bound_dev_if;
 	int family;
 	struct sctp_af *af;
 	struct net *net = dev_net(skb->dev);
-	bool is_gso = skb_is_gso(skb) && skb_is_gso_sctp(skb);
 
 	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
@@ -126,7 +123,8 @@ int sctp_rcv(struct sk_buff *skb)
 	 * it's better to just linearize it otherwise crc computing
 	 * takes longer.
 	 */
-	if ((!is_gso && skb_linearize(skb)) ||
+	if ((!(skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) &&
+	     skb_linearize(skb)) ||
 	    !pskb_may_pull(skb, sizeof(struct sctphdr)))
 		goto discard_it;
 
@@ -137,7 +135,7 @@ int sctp_rcv(struct sk_buff *skb)
 	if (skb_csum_unnecessary(skb))
 		__skb_decr_checksum_unnecessary(skb);
 	else if (!sctp_checksum_disable &&
-		 !is_gso &&
+		 !(skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) &&
 		 sctp_rcv_checksum(net, skb) < 0)
 		goto discard_it;
 	skb->csum_valid = 1;
@@ -182,8 +180,7 @@ int sctp_rcv(struct sk_buff *skb)
 	 * If a frame arrives on an interface and the receiving socket is
 	 * bound to another interface, via SO_BINDTODEVICE, treat it as OOTB
 	 */
-	bound_dev_if = READ_ONCE(sk->sk_bound_dev_if);
-	if (bound_dev_if && (bound_dev_if != af->skb_iif(skb))) {
+	if (sk->sk_bound_dev_if && (sk->sk_bound_dev_if != af->skb_iif(skb))) {
 		if (transport) {
 			sctp_transport_put(transport);
 			asoc = NULL;
@@ -257,7 +254,7 @@ int sctp_rcv(struct sk_buff *skb)
 		bh_lock_sock(sk);
 	}
 
-	if (sock_owned_by_user(sk) || !sctp_newsk_ready(sk)) {
+	if (sock_owned_by_user(sk)) {
 		if (sctp_add_backlog(sk, skb)) {
 			bh_unlock_sock(sk);
 			sctp_chunk_free(chunk);
@@ -335,7 +332,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 		local_bh_disable();
 		bh_lock_sock(sk);
 
-		if (sock_owned_by_user(sk) || !sctp_newsk_ready(sk)) {
+		if (sock_owned_by_user(sk)) {
 			if (sk_add_backlog(sk, skb, sk->sk_rcvbuf))
 				sctp_chunk_free(chunk);
 			else
@@ -350,13 +347,7 @@ int sctp_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 		if (backloged)
 			return 0;
 	} else {
-		if (!sctp_newsk_ready(sk)) {
-			if (!sk_add_backlog(sk, skb, sk->sk_rcvbuf))
-				return 0;
-			sctp_chunk_free(chunk);
-		} else {
-			sctp_inq_push(inqueue, chunk);
-		}
+		sctp_inq_push(inqueue, chunk);
 	}
 
 done:
@@ -403,7 +394,6 @@ void sctp_icmp_frag_needed(struct sock *sk, struct sctp_association *asoc,
 		return;
 
 	if (sock_owned_by_user(sk)) {
-		atomic_set(&t->mtu_info, pmtu);
 		asoc->pmtu_pending = 1;
 		t->pmtu_pending = 1;
 		return;
@@ -463,7 +453,7 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 		else {
 			if (!mod_timer(&t->proto_unreach_timer,
 						jiffies + (HZ/20)))
-				sctp_transport_hold(t);
+				sctp_association_hold(asoc);
 		}
 	} else {
 		struct net *net = sock_net(sk);
@@ -472,7 +462,7 @@ void sctp_icmp_proto_unreachable(struct sock *sk,
 			 "encountered!\n", __func__);
 
 		if (del_timer(&t->proto_unreach_timer))
-			sctp_transport_put(t);
+			sctp_association_put(asoc);
 
 		sctp_do_sm(net, SCTP_EVENT_T_OTHER,
 			   SCTP_ST_OTHER(SCTP_EVENT_ICMP_PROTO_UNREACH),
@@ -689,7 +679,7 @@ static int sctp_rcv_ootb(struct sk_buff *skb)
 		ch = skb_header_pointer(skb, offset, sizeof(*ch), &_ch);
 
 		/* Break out if chunk length is less then minimal. */
-		if (!ch || ntohs(ch->length) < sizeof(_ch))
+		if (ntohs(ch->length) < sizeof(_ch))
 			break;
 
 		ch_end = offset + SCTP_PAD4(ntohs(ch->length));
@@ -1020,18 +1010,19 @@ struct sctp_association *sctp_lookup_association(struct net *net,
 }
 
 /* Is there an association matching the given local and peer addresses? */
-bool sctp_has_association(struct net *net,
-			  const union sctp_addr *laddr,
-			  const union sctp_addr *paddr)
+int sctp_has_association(struct net *net,
+			 const union sctp_addr *laddr,
+			 const union sctp_addr *paddr)
 {
+	struct sctp_association *asoc;
 	struct sctp_transport *transport;
 
-	if (sctp_lookup_association(net, laddr, paddr, &transport)) {
+	if ((asoc = sctp_lookup_association(net, laddr, paddr, &transport))) {
 		sctp_transport_put(transport);
-		return true;
+		return 1;
 	}
 
-	return false;
+	return 0;
 }
 
 /*
@@ -1232,7 +1223,7 @@ static struct sctp_association *__sctp_rcv_lookup_harder(struct net *net,
 	 * issue as packets hitting this are mostly INIT or INIT-ACK and
 	 * those cannot be on GSO-style anyway.
 	 */
-	if (skb_is_gso(skb) && skb_is_gso_sctp(skb))
+	if ((skb_shinfo(skb)->gso_type & SKB_GSO_SCTP) == SKB_GSO_SCTP)
 		return NULL;
 
 	ch = (struct sctp_chunkhdr *)skb->data;

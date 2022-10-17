@@ -97,7 +97,10 @@ struct rsvp_filter {
 
 	u32				handle;
 	struct rsvp_session		*sess;
-	struct rcu_work			rwork;
+	union {
+		struct work_struct		work;
+		struct rcu_head			rcu;
+	};
 };
 
 static inline unsigned int hash_dst(__be32 *dst, u8 protocol, u8 tunnelid)
@@ -291,12 +294,19 @@ static void __rsvp_delete_filter(struct rsvp_filter *f)
 
 static void rsvp_delete_filter_work(struct work_struct *work)
 {
-	struct rsvp_filter *f = container_of(to_rcu_work(work),
-					     struct rsvp_filter,
-					     rwork);
+	struct rsvp_filter *f = container_of(work, struct rsvp_filter, work);
+
 	rtnl_lock();
 	__rsvp_delete_filter(f);
 	rtnl_unlock();
+}
+
+static void rsvp_delete_filter_rcu(struct rcu_head *head)
+{
+	struct rsvp_filter *f = container_of(head, struct rsvp_filter, rcu);
+
+	INIT_WORK(&f->work, rsvp_delete_filter_work);
+	tcf_queue_work(&f->work);
 }
 
 static void rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
@@ -307,12 +317,12 @@ static void rsvp_delete_filter(struct tcf_proto *tp, struct rsvp_filter *f)
 	 * in cleanup() callback
 	 */
 	if (tcf_exts_get_net(&f->exts))
-		tcf_queue_work(&f->rwork, rsvp_delete_filter_work);
+		call_rcu(&f->rcu, rsvp_delete_filter_rcu);
 	else
 		__rsvp_delete_filter(f);
 }
 
-static void rsvp_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+static void rsvp_destroy(struct tcf_proto *tp)
 {
 	struct rsvp_head *data = rtnl_dereference(tp->root);
 	int h1, h2;
@@ -340,8 +350,7 @@ static void rsvp_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
 	kfree_rcu(data, rcu);
 }
 
-static int rsvp_delete(struct tcf_proto *tp, void *arg, bool *last,
-		       struct netlink_ext_ack *extack)
+static int rsvp_delete(struct tcf_proto *tp, void *arg, bool *last)
 {
 	struct rsvp_head *head = rtnl_dereference(tp->root);
 	struct rsvp_filter *nfp, *f = arg;
@@ -475,7 +484,7 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
 		       struct tcf_proto *tp, unsigned long base,
 		       u32 handle,
 		       struct nlattr **tca,
-		       void **arg, bool ovr, struct netlink_ext_ack *extack)
+		       void **arg, bool ovr)
 {
 	struct rsvp_head *data = rtnl_dereference(tp->root);
 	struct rsvp_filter *f, *nfp;
@@ -500,7 +509,7 @@ static int rsvp_change(struct net *net, struct sk_buff *in_skb,
 	err = tcf_exts_init(&e, TCA_RSVP_ACT, TCA_RSVP_POLICE);
 	if (err < 0)
 		return err;
-	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr, extack);
+	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
 	if (err < 0)
 		goto errout2;
 
@@ -734,17 +743,12 @@ nla_put_failure:
 	return -1;
 }
 
-static void rsvp_bind_class(void *fh, u32 classid, unsigned long cl, void *q,
-			    unsigned long base)
+static void rsvp_bind_class(void *fh, u32 classid, unsigned long cl)
 {
 	struct rsvp_filter *f = fh;
 
-	if (f && f->res.classid == classid) {
-		if (cl)
-			__tcf_bind_filter(q, &f->res, base);
-		else
-			__tcf_unbind_filter(q, &f->res);
-	}
+	if (f && f->res.classid == classid)
+		f->res.class = cl;
 }
 
 static struct tcf_proto_ops RSVP_OPS __read_mostly = {

@@ -120,19 +120,13 @@ static int llcp_sock_bind(struct socket *sock, struct sockaddr *addr, int alen)
 					  llcp_sock->service_name_len,
 					  GFP_KERNEL);
 	if (!llcp_sock->service_name) {
-		nfc_llcp_local_put(llcp_sock->local);
-		llcp_sock->local = NULL;
-		llcp_sock->dev = NULL;
 		ret = -ENOMEM;
 		goto put_dev;
 	}
 	llcp_sock->ssap = nfc_llcp_get_sdp_ssap(local, llcp_sock);
 	if (llcp_sock->ssap == LLCP_SAP_MAX) {
-		nfc_llcp_local_put(llcp_sock->local);
-		llcp_sock->local = NULL;
 		kfree(llcp_sock->service_name);
 		llcp_sock->service_name = NULL;
-		llcp_sock->dev = NULL;
 		ret = -EADDRINUSE;
 		goto put_dev;
 	}
@@ -508,7 +502,7 @@ error:
 }
 
 static int llcp_sock_getname(struct socket *sock, struct sockaddr *uaddr,
-			     int peer)
+			     int *len, int peer)
 {
 	struct sock *sk = sock->sk;
 	struct nfc_llcp_sock *llcp_sock = nfc_llcp_sock(sk);
@@ -521,6 +515,7 @@ static int llcp_sock_getname(struct socket *sock, struct sockaddr *uaddr,
 		 llcp_sock->dsap, llcp_sock->ssap);
 
 	memset(llcp_addr, 0, sizeof(*llcp_addr));
+	*len = sizeof(struct sockaddr_nfc_llcp);
 
 	lock_sock(sk);
 	if (!llcp_sock->dev) {
@@ -538,10 +533,10 @@ static int llcp_sock_getname(struct socket *sock, struct sockaddr *uaddr,
 	       llcp_addr->service_name_len);
 	release_sock(sk);
 
-	return sizeof(struct sockaddr_nfc_llcp);
+	return 0;
 }
 
-static inline __poll_t llcp_accept_poll(struct sock *parent)
+static inline unsigned int llcp_accept_poll(struct sock *parent)
 {
 	struct nfc_llcp_sock *llcp_sock, *parent_sock;
 	struct sock *sk;
@@ -553,43 +548,43 @@ static inline __poll_t llcp_accept_poll(struct sock *parent)
 		sk = &llcp_sock->sk;
 
 		if (sk->sk_state == LLCP_CONNECTED)
-			return EPOLLIN | EPOLLRDNORM;
+			return POLLIN | POLLRDNORM;
 	}
 
 	return 0;
 }
 
-static __poll_t llcp_sock_poll(struct file *file, struct socket *sock,
+static unsigned int llcp_sock_poll(struct file *file, struct socket *sock,
 				   poll_table *wait)
 {
 	struct sock *sk = sock->sk;
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 
 	pr_debug("%p\n", sk);
 
-	sock_poll_wait(file, sock, wait);
+	sock_poll_wait(file, sk_sleep(sk), wait);
 
 	if (sk->sk_state == LLCP_LISTEN)
 		return llcp_accept_poll(sk);
 
 	if (sk->sk_err || !skb_queue_empty_lockless(&sk->sk_error_queue))
-		mask |= EPOLLERR |
-			(sock_flag(sk, SOCK_SELECT_ERR_QUEUE) ? EPOLLPRI : 0);
+		mask |= POLLERR |
+			(sock_flag(sk, SOCK_SELECT_ERR_QUEUE) ? POLLPRI : 0);
 
 	if (!skb_queue_empty_lockless(&sk->sk_receive_queue))
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 
 	if (sk->sk_state == LLCP_CLOSED)
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 
 	if (sk->sk_shutdown & RCV_SHUTDOWN)
-		mask |= EPOLLRDHUP | EPOLLIN | EPOLLRDNORM;
+		mask |= POLLRDHUP | POLLIN | POLLRDNORM;
 
 	if (sk->sk_shutdown == SHUTDOWN_MASK)
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 
 	if (sock_writeable(sk) && sk->sk_state == LLCP_CONNECTED)
-		mask |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+		mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
 	else
 		sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 
@@ -689,10 +684,6 @@ static int llcp_sock_connect(struct socket *sock, struct sockaddr *_addr,
 		ret = -EISCONN;
 		goto error;
 	}
-	if (sk->sk_state == LLCP_CONNECTING) {
-		ret = -EINPROGRESS;
-		goto error;
-	}
 
 	dev = nfc_get_device(addr->dev_idx);
 	if (dev == NULL) {
@@ -724,8 +715,6 @@ static int llcp_sock_connect(struct socket *sock, struct sockaddr *_addr,
 	llcp_sock->local = nfc_llcp_local_get(local);
 	llcp_sock->ssap = nfc_llcp_get_local_ssap(local);
 	if (llcp_sock->ssap == LLCP_SAP_MAX) {
-		nfc_llcp_local_put(llcp_sock->local);
-		llcp_sock->local = NULL;
 		ret = -ENOMEM;
 		goto put_dev;
 	}
@@ -763,12 +752,8 @@ static int llcp_sock_connect(struct socket *sock, struct sockaddr *_addr,
 
 sock_unlink:
 	nfc_llcp_put_ssap(local, llcp_sock->ssap);
-	nfc_llcp_local_put(llcp_sock->local);
-	llcp_sock->local = NULL;
 
 	nfc_llcp_sock_unlink(&local->connecting_sockets, sk);
-	kfree(llcp_sock->service_name);
-	llcp_sock->service_name = NULL;
 
 put_dev:
 	nfc_put_device(dev);
@@ -795,11 +780,6 @@ static int llcp_sock_sendmsg(struct socket *sock, struct msghdr *msg,
 		return -EOPNOTSUPP;
 
 	lock_sock(sk);
-
-	if (!llcp_sock->local) {
-		release_sock(sk);
-		return -ENODEV;
-	}
 
 	if (sk->sk_type == SOCK_DGRAM) {
 		DECLARE_SOCKADDR(struct sockaddr_nfc_llcp *, addr,

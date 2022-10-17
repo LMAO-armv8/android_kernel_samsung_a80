@@ -163,6 +163,7 @@ EXPORT_SYMBOL_GPL(vm_sockets_get_local_cid);
  * vsock_bind_table[VSOCK_HASH_SIZE] is for unbound sockets.  The hash function
  * mods with VSOCK_HASH_SIZE to ensure this.
  */
+#define VSOCK_HASH_SIZE         251
 #define MAX_PORT_RETRIES        24
 
 #define VSOCK_HASH(addr)        ((addr)->svm_port % VSOCK_HASH_SIZE)
@@ -177,12 +178,9 @@ EXPORT_SYMBOL_GPL(vm_sockets_get_local_cid);
 #define vsock_connected_sockets_vsk(vsk)				\
 	vsock_connected_sockets(&(vsk)->remote_addr, &(vsk)->local_addr)
 
-struct list_head vsock_bind_table[VSOCK_HASH_SIZE + 1];
-EXPORT_SYMBOL_GPL(vsock_bind_table);
-struct list_head vsock_connected_table[VSOCK_HASH_SIZE];
-EXPORT_SYMBOL_GPL(vsock_connected_table);
-DEFINE_SPINLOCK(vsock_table_lock);
-EXPORT_SYMBOL_GPL(vsock_table_lock);
+static struct list_head vsock_bind_table[VSOCK_HASH_SIZE + 1];
+static struct list_head vsock_connected_table[VSOCK_HASH_SIZE];
+static DEFINE_SPINLOCK(vsock_table_lock);
 
 /* Autobind this socket to the local address if necessary. */
 static int vsock_auto_bind(struct vsock_sock *vsk)
@@ -196,7 +194,7 @@ static int vsock_auto_bind(struct vsock_sock *vsk)
 	return __vsock_bind(sk, &local_addr);
 }
 
-static int __init vsock_init_tables(void)
+static void vsock_init_tables(void)
 {
 	int i;
 
@@ -205,7 +203,6 @@ static int __init vsock_init_tables(void)
 
 	for (i = 0; i < ARRAY_SIZE(vsock_connected_table); i++)
 		INIT_LIST_HEAD(&vsock_connected_table[i]);
-	return 0;
 }
 
 static void __vsock_insert_bound(struct list_head *list,
@@ -259,6 +256,16 @@ static struct sock *__vsock_find_connected_socket(struct sockaddr_vm *src,
 	}
 
 	return NULL;
+}
+
+static bool __vsock_in_bound_table(struct vsock_sock *vsk)
+{
+	return !list_empty(&vsk->bound_table);
+}
+
+static bool __vsock_in_connected_table(struct vsock_sock *vsk)
+{
+	return !list_empty(&vsk->connected_table);
 }
 
 static void vsock_insert_unbound(struct vsock_sock *vsk)
@@ -628,9 +635,8 @@ struct sock *__vsock_create(struct net *net,
 		vsk->trusted = psk->trusted;
 		vsk->owner = get_cred(psk->owner);
 		vsk->connect_timeout = psk->connect_timeout;
-		security_sk_clone(parent, sk);
 	} else {
-		vsk->trusted = ns_capable_noaudit(&init_user_ns, CAP_NET_ADMIN);
+		vsk->trusted = capable(CAP_NET_ADMIN);
 		vsk->owner = get_current_cred();
 		vsk->connect_timeout = VSOCK_DEFAULT_CONNECT_TIMEOUT;
 	}
@@ -752,7 +758,7 @@ vsock_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 }
 
 static int vsock_getname(struct socket *sock,
-			 struct sockaddr *addr, int peer)
+			 struct sockaddr *addr, int *addr_len, int peer)
 {
 	int err;
 	struct sock *sk;
@@ -787,7 +793,7 @@ static int vsock_getname(struct socket *sock,
 	 */
 	BUILD_BUG_ON(sizeof(*vm_addr) > 128);
 	memcpy(addr, vm_addr, sizeof(*vm_addr));
-	err = sizeof(*vm_addr);
+	*addr_len = sizeof(*vm_addr);
 
 out:
 	release_sock(sk);
@@ -817,12 +823,10 @@ static int vsock_shutdown(struct socket *sock, int mode)
 	 */
 
 	sk = sock->sk;
-
-	lock_sock(sk);
 	if (sock->state == SS_UNCONNECTED) {
 		err = -ENOTCONN;
 		if (sk->sk_type == SOCK_STREAM)
-			goto out;
+			return err;
 	} else {
 		sock->state = SS_DISCONNECTING;
 		err = 0;
@@ -831,8 +835,10 @@ static int vsock_shutdown(struct socket *sock, int mode)
 	/* Receive and send shutdowns are treated alike. */
 	mode = mode & (RCV_SHUTDOWN | SEND_SHUTDOWN);
 	if (mode) {
+		lock_sock(sk);
 		sk->sk_shutdown |= mode;
 		sk->sk_state_change(sk);
+		release_sock(sk);
 
 		if (sk->sk_type == SOCK_STREAM) {
 			sock_reset_flag(sk, SOCK_DONE);
@@ -840,16 +846,14 @@ static int vsock_shutdown(struct socket *sock, int mode)
 		}
 	}
 
-out:
-	release_sock(sk);
 	return err;
 }
 
-static __poll_t vsock_poll(struct file *file, struct socket *sock,
+static unsigned int vsock_poll(struct file *file, struct socket *sock,
 			       poll_table *wait)
 {
 	struct sock *sk;
-	__poll_t mask;
+	unsigned int mask;
 	struct vsock_sock *vsk;
 
 	sk = sock->sk;
@@ -860,20 +864,20 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 
 	if (sk->sk_err)
 		/* Signify that there has been an error on this socket. */
-		mask |= EPOLLERR;
+		mask |= POLLERR;
 
 	/* INET sockets treat local write shutdown and peer write shutdown as a
-	 * case of EPOLLHUP set.
+	 * case of POLLHUP set.
 	 */
 	if ((sk->sk_shutdown == SHUTDOWN_MASK) ||
 	    ((sk->sk_shutdown & SEND_SHUTDOWN) &&
 	     (vsk->peer_shutdown & SEND_SHUTDOWN))) {
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 	}
 
 	if (sk->sk_shutdown & RCV_SHUTDOWN ||
 	    vsk->peer_shutdown & SEND_SHUTDOWN) {
-		mask |= EPOLLRDHUP;
+		mask |= POLLRDHUP;
 	}
 
 	if (sock->type == SOCK_DGRAM) {
@@ -883,11 +887,11 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		 */
 		if (!skb_queue_empty_lockless(&sk->sk_receive_queue) ||
 		    (sk->sk_shutdown & RCV_SHUTDOWN)) {
-			mask |= EPOLLIN | EPOLLRDNORM;
+			mask |= POLLIN | POLLRDNORM;
 		}
 
 		if (!(sk->sk_shutdown & SEND_SHUTDOWN))
-			mask |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+			mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
 
 	} else if (sock->type == SOCK_STREAM) {
 		lock_sock(sk);
@@ -897,7 +901,7 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		 */
 		if (sk->sk_state == TCP_LISTEN
 		    && !vsock_is_accept_queue_empty(sk))
-			mask |= EPOLLIN | EPOLLRDNORM;
+			mask |= POLLIN | POLLRDNORM;
 
 		/* If there is something in the queue then we can read. */
 		if (transport->stream_is_active(vsk) &&
@@ -906,10 +910,10 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 			int ret = transport->notify_poll_in(
 					vsk, 1, &data_ready_now);
 			if (ret < 0) {
-				mask |= EPOLLERR;
+				mask |= POLLERR;
 			} else {
 				if (data_ready_now)
-					mask |= EPOLLIN | EPOLLRDNORM;
+					mask |= POLLIN | POLLRDNORM;
 
 			}
 		}
@@ -920,7 +924,7 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 		 */
 		if (sk->sk_shutdown & RCV_SHUTDOWN ||
 		    vsk->peer_shutdown & SEND_SHUTDOWN) {
-			mask |= EPOLLIN | EPOLLRDNORM;
+			mask |= POLLIN | POLLRDNORM;
 		}
 
 		/* Connected sockets that can produce data can be written. */
@@ -930,25 +934,25 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
 				int ret = transport->notify_poll_out(
 						vsk, 1, &space_avail_now);
 				if (ret < 0) {
-					mask |= EPOLLERR;
+					mask |= POLLERR;
 				} else {
 					if (space_avail_now)
-						/* Remove EPOLLWRBAND since INET
+						/* Remove POLLWRBAND since INET
 						 * sockets are not setting it.
 						 */
-						mask |= EPOLLOUT | EPOLLWRNORM;
+						mask |= POLLOUT | POLLWRNORM;
 
 				}
 			}
 		}
 
 		/* Simulate INET socket poll behaviors, which sets
-		 * EPOLLOUT|EPOLLWRNORM when peer is closed and nothing to read,
+		 * POLLOUT|POLLWRNORM when peer is closed and nothing to read,
 		 * but local send is not shutdown.
 		 */
-		if (sk->sk_state == TCP_CLOSE || sk->sk_state == TCP_CLOSING) {
+		if (sk->sk_state == TCP_CLOSE) {
 			if (!(sk->sk_shutdown & SEND_SHUTDOWN))
-				mask |= EPOLLOUT | EPOLLWRNORM;
+				mask |= POLLOUT | POLLWRNORM;
 
 		}
 
@@ -1110,6 +1114,7 @@ static void vsock_connect_timeout(struct work_struct *work)
 {
 	struct sock *sk;
 	struct vsock_sock *vsk;
+	int cancel = 0;
 
 	vsk = container_of(work, struct vsock_sock, connect_work.work);
 	sk = sk_vsock(vsk);
@@ -1118,12 +1123,13 @@ static void vsock_connect_timeout(struct work_struct *work)
 	if (sk->sk_state == TCP_SYN_SENT &&
 	    (sk->sk_shutdown != SHUTDOWN_MASK)) {
 		sk->sk_state = TCP_CLOSE;
-		sk->sk_socket->state = SS_UNCONNECTED;
 		sk->sk_err = ETIMEDOUT;
 		sk->sk_error_report(sk);
-		vsock_transport_cancel_pkt(vsk);
+		cancel = 1;
 	}
 	release_sock(sk);
+	if (cancel)
+		vsock_transport_cancel_pkt(vsk);
 
 	sock_put(sk);
 }
@@ -1160,8 +1166,6 @@ static int vsock_stream_connect(struct socket *sock, struct sockaddr *addr,
 		 * non-blocking call.
 		 */
 		err = -EALREADY;
-		if (flags & O_NONBLOCK)
-			goto out;
 		break;
 	default:
 		if ((sk->sk_state == TCP_LISTEN) ||
@@ -1216,14 +1220,7 @@ static int vsock_stream_connect(struct socket *sock, struct sockaddr *addr,
 			 * timeout fires.
 			 */
 			sock_hold(sk);
-
-			/* If the timeout function is already scheduled,
-			 * reschedule it, then ungrab the socket refcount to
-			 * keep it balanced.
-			 */
-			if (mod_delayed_work(system_wq, &vsk->connect_work,
-					     timeout))
-				sock_put(sk);
+			schedule_delayed_work(&vsk->connect_work, timeout);
 
 			/* Skip ahead to preserve error code set above. */
 			goto out_wait;
@@ -1235,10 +1232,9 @@ static int vsock_stream_connect(struct socket *sock, struct sockaddr *addr,
 
 		if (signal_pending(current)) {
 			err = sock_intr_errno(timeout);
-			sk->sk_state = sk->sk_state == TCP_ESTABLISHED ? TCP_CLOSING : TCP_CLOSE;
+			sk->sk_state = TCP_CLOSE;
 			sock->state = SS_UNCONNECTED;
 			vsock_transport_cancel_pkt(vsk);
-			vsock_remove_connected(vsk);
 			goto out_wait;
 		} else if (timeout == 0) {
 			err = -ETIMEDOUT;
@@ -1959,6 +1955,8 @@ int __vsock_core_init(const struct vsock_transport *t, struct module *owner)
 	vsock_proto.owner = owner;
 	transport = t;
 
+	vsock_init_tables();
+
 	vsock_device.minor = MISC_DYNAMIC_MINOR;
 	err = misc_register(&vsock_device);
 	if (err) {
@@ -2018,14 +2016,6 @@ const struct vsock_transport *vsock_core_get_transport(void)
 	return transport;
 }
 EXPORT_SYMBOL_GPL(vsock_core_get_transport);
-
-static void __exit vsock_exit(void)
-{
-	/* Do nothing.  This function makes this module removable. */
-}
-
-module_init(vsock_init_tables);
-module_exit(vsock_exit);
 
 MODULE_AUTHOR("VMware, Inc.");
 MODULE_DESCRIPTION("VMware Virtual Socket Family");

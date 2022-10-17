@@ -138,9 +138,6 @@ teql_destroy(struct Qdisc *sch)
 	struct teql_sched_data *dat = qdisc_priv(sch);
 	struct teql_master *master = dat->m;
 
-	if (!master)
-		return;
-
 	prev = master->slaves;
 	if (prev) {
 		do {
@@ -170,8 +167,7 @@ teql_destroy(struct Qdisc *sch)
 	}
 }
 
-static int teql_qdisc_init(struct Qdisc *sch, struct nlattr *opt,
-			   struct netlink_ext_ack *extack)
+static int teql_qdisc_init(struct Qdisc *sch, struct nlattr *opt)
 {
 	struct net_device *dev = qdisc_dev(sch);
 	struct teql_master *m = (struct teql_master *)sch->ops;
@@ -246,7 +242,7 @@ __teql_resolve(struct sk_buff *skb, struct sk_buff *skb_res,
 		char haddr[MAX_ADDR_LEN];
 
 		neigh_ha_snapshot(haddr, n, dev);
-		err = dev_hard_header(skb, dev, ntohs(skb_protocol(skb, false)),
+		err = dev_hard_header(skb, dev, ntohs(tc_skb_protocol(skb)),
 				      haddr, NULL, skb->len);
 
 		if (err < 0)

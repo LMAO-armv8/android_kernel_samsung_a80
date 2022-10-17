@@ -10,10 +10,11 @@
 
 #include <asm/unaligned.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/module.h>
 #include <linux/netlink.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nf_tables.h>
-#include <net/netfilter/nf_tables_core.h>
 #include <net/netfilter/nf_tables.h>
 #include <net/tcp.h>
 
@@ -44,9 +45,6 @@ static void nft_exthdr_ipv6_eval(const struct nft_expr *expr,
 	u32 *dest = &regs->data[priv->dreg];
 	unsigned int offset = 0;
 	int err;
-
-	if (pkt->skb->protocol != htons(ETH_P_IPV6))
-		goto err;
 
 	err = ipv6_find_hdr(pkt->skb, &offset, priv->type, NULL, NULL);
 	if (priv->flags & NFT_EXTHDR_F_PRESENT) {
@@ -137,6 +135,7 @@ static void nft_exthdr_tcp_set_eval(const struct nft_expr *expr,
 	unsigned int i, optl, tcphdr_len, offset;
 	struct tcphdr *tcph;
 	u8 *opt;
+	u32 src;
 
 	tcph = nft_tcp_header_pointer(pkt, sizeof(buff), buff, &tcphdr_len);
 	if (!tcph)
@@ -145,6 +144,7 @@ static void nft_exthdr_tcp_set_eval(const struct nft_expr *expr,
 	opt = (u8 *)tcph;
 	for (i = sizeof(*tcph); i < tcphdr_len - 1; i += optl) {
 		union {
+			u8 octet;
 			__be16 v16;
 			__be32 v32;
 		} old, new;
@@ -165,13 +165,13 @@ static void nft_exthdr_tcp_set_eval(const struct nft_expr *expr,
 		if (!tcph)
 			return;
 
+		src = regs->data[priv->sreg];
 		offset = i + priv->offset;
 
 		switch (priv->len) {
 		case 2:
 			old.v16 = get_unaligned((u16 *)(opt + offset));
-			new.v16 = (__force __be16)nft_reg_load16(
-				&regs->data[priv->sreg]);
+			new.v16 = src;
 
 			switch (priv->type) {
 			case TCPOPT_MSS:
@@ -189,7 +189,7 @@ static void nft_exthdr_tcp_set_eval(const struct nft_expr *expr,
 						 old.v16, new.v16, false);
 			break;
 		case 4:
-			new.v32 = regs->data[priv->sreg];
+			new.v32 = src;
 			old.v32 = get_unaligned((u32 *)(opt + offset));
 
 			if (old.v32 == new.v32)
@@ -214,8 +214,6 @@ static const struct nla_policy nft_exthdr_policy[NFTA_EXTHDR_MAX + 1] = {
 	[NFTA_EXTHDR_OFFSET]		= { .type = NLA_U32 },
 	[NFTA_EXTHDR_LEN]		= { .type = NLA_U32 },
 	[NFTA_EXTHDR_FLAGS]		= { .type = NLA_U32 },
-	[NFTA_EXTHDR_OP]		= { .type = NLA_U32 },
-	[NFTA_EXTHDR_SREG]		= { .type = NLA_U32 },
 };
 
 static int nft_exthdr_init(const struct nft_ctx *ctx,
@@ -353,6 +351,7 @@ static int nft_exthdr_dump_set(struct sk_buff *skb, const struct nft_expr *expr)
 	return nft_exthdr_dump_common(skb, priv);
 }
 
+static struct nft_expr_type nft_exthdr_type;
 static const struct nft_expr_ops nft_exthdr_ipv6_ops = {
 	.type		= &nft_exthdr_type,
 	.size		= NFT_EXPR_SIZE(sizeof(struct nft_exthdr)),
@@ -406,10 +405,27 @@ nft_exthdr_select_ops(const struct nft_ctx *ctx,
 	return ERR_PTR(-EOPNOTSUPP);
 }
 
-struct nft_expr_type nft_exthdr_type __read_mostly = {
+static struct nft_expr_type nft_exthdr_type __read_mostly = {
 	.name		= "exthdr",
 	.select_ops	= nft_exthdr_select_ops,
 	.policy		= nft_exthdr_policy,
 	.maxattr	= NFTA_EXTHDR_MAX,
 	.owner		= THIS_MODULE,
 };
+
+static int __init nft_exthdr_module_init(void)
+{
+	return nft_register_expr(&nft_exthdr_type);
+}
+
+static void __exit nft_exthdr_module_exit(void)
+{
+	nft_unregister_expr(&nft_exthdr_type);
+}
+
+module_init(nft_exthdr_module_init);
+module_exit(nft_exthdr_module_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Patrick McHardy <kaber@trash.net>");
+MODULE_ALIAS_NFT_EXPR("exthdr");

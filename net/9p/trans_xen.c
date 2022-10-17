@@ -38,6 +38,7 @@
 
 #include <linux/module.h>
 #include <linux/spinlock.h>
+#include <linux/rwlock.h>
 #include <net/9p/9p.h>
 #include <net/9p/client.h>
 #include <net/9p/transport.h>
@@ -138,10 +139,10 @@ static bool p9_xen_write_todo(struct xen_9pfs_dataring *ring, RING_IDX size)
 
 static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 {
-	struct xen_9pfs_front_priv *priv;
+	struct xen_9pfs_front_priv *priv = NULL;
 	RING_IDX cons, prod, masked_cons, masked_prod;
 	unsigned long flags;
-	u32 size = p9_req->tc.size;
+	u32 size = p9_req->tc->size;
 	struct xen_9pfs_dataring *ring;
 	int num;
 
@@ -151,10 +152,10 @@ static int p9_xen_request(struct p9_client *client, struct p9_req_t *p9_req)
 			break;
 	}
 	read_unlock(&xen_9pfs_lock);
-	if (list_entry_is_head(priv, &xen_9pfs_devs, list))
+	if (!priv || priv->client != client)
 		return -EINVAL;
 
-	num = p9_req->tc.tag % priv->num_rings;
+	num = p9_req->tc->tag % priv->num_rings;
 	ring = &priv->rings[num];
 
 again:
@@ -176,7 +177,7 @@ again:
 	masked_prod = xen_9pfs_mask(prod, XEN_9PFS_RING_SIZE);
 	masked_cons = xen_9pfs_mask(cons, XEN_9PFS_RING_SIZE);
 
-	xen_9pfs_write_packet(ring->data.out, p9_req->tc.sdata, size,
+	xen_9pfs_write_packet(ring->data.out, p9_req->tc->sdata, size,
 			      &masked_prod, masked_cons, XEN_9PFS_RING_SIZE);
 
 	p9_req->status = REQ_STATUS_SENT;
@@ -185,7 +186,6 @@ again:
 	ring->intf->out_prod = prod;
 	spin_unlock_irqrestore(&ring->lock, flags);
 	notify_remote_via_irq(ring->irq);
-	p9_req_put(p9_req);
 
 	return 0;
 }
@@ -230,12 +230,12 @@ static void p9_xen_response(struct work_struct *work)
 			continue;
 		}
 
-		memcpy(&req->rc, &h, sizeof(h));
-		req->rc.offset = 0;
+		memcpy(req->rc, &h, sizeof(h));
+		req->rc->offset = 0;
 
 		masked_cons = xen_9pfs_mask(cons, XEN_9PFS_RING_SIZE);
 		/* Then, read the whole packet (including the header) */
-		xen_9pfs_read_packet(req->rc.sdata, ring->data.in, h.size,
+		xen_9pfs_read_packet(req->rc->sdata, ring->data.in, h.size,
 				     masked_prod, &masked_cons,
 				     XEN_9PFS_RING_SIZE);
 
@@ -301,9 +301,9 @@ static void xen_9pfs_front_free(struct xen_9pfs_front_priv *priv)
 				ref = priv->rings[i].intf->ref[j];
 				gnttab_end_foreign_access(ref, 0, 0);
 			}
-			free_pages_exact(priv->rings[i].data.in,
-				   1UL << (XEN_9PFS_RING_ORDER +
-					   XEN_PAGE_SHIFT));
+			free_pages((unsigned long)priv->rings[i].data.in,
+				   XEN_9PFS_RING_ORDER -
+				   (PAGE_SHIFT - XEN_PAGE_SHIFT));
 		}
 		gnttab_end_foreign_access(priv->rings[i].ref, 0, 0);
 		free_page((unsigned long)priv->rings[i].intf);
@@ -341,8 +341,8 @@ static int xen_9pfs_front_alloc_dataring(struct xenbus_device *dev,
 	if (ret < 0)
 		goto out;
 	ring->ref = ret;
-	bytes = alloc_pages_exact(1UL << (XEN_9PFS_RING_ORDER + XEN_PAGE_SHIFT),
-				  GFP_KERNEL | __GFP_ZERO);
+	bytes = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+			XEN_9PFS_RING_ORDER - (PAGE_SHIFT - XEN_PAGE_SHIFT));
 	if (!bytes) {
 		ret = -ENOMEM;
 		goto out;
@@ -373,7 +373,9 @@ out:
 	if (bytes) {
 		for (i--; i >= 0; i--)
 			gnttab_end_foreign_access(ring->intf->ref[i], 0, 0);
-		free_pages_exact(bytes, 1UL << (XEN_9PFS_RING_ORDER + XEN_PAGE_SHIFT));
+		free_pages((unsigned long)bytes,
+			   XEN_9PFS_RING_ORDER -
+			   (PAGE_SHIFT - XEN_PAGE_SHIFT));
 	}
 	gnttab_end_foreign_access(ring->ref, 0, 0);
 	free_page((unsigned long)ring->intf);
@@ -486,7 +488,7 @@ static int xen_9pfs_front_probe(struct xenbus_device *dev,
 
 static int xen_9pfs_front_resume(struct xenbus_device *dev)
 {
-	dev_warn(&dev->dev, "suspend/resume unsupported\n");
+	dev_warn(&dev->dev, "suspsend/resume unsupported\n");
 	return 0;
 }
 
@@ -550,7 +552,3 @@ static void p9_trans_xen_exit(void)
 	return xenbus_unregister_driver(&xen_9pfs_front_driver);
 }
 module_exit(p9_trans_xen_exit);
-
-MODULE_AUTHOR("Stefano Stabellini <stefano@aporeto.com>");
-MODULE_DESCRIPTION("Xen Transport for 9P");
-MODULE_LICENSE("GPL");
