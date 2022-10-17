@@ -45,7 +45,10 @@ static int snd_pcm_ioctl_rewind_compat(struct snd_pcm_substream *substream,
 
 	if (get_user(frames, src))
 		return -EFAULT;
-	err = snd_pcm_rewind(substream, frames);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		err = snd_pcm_playback_rewind(substream, frames);
+	else
+		err = snd_pcm_capture_rewind(substream, frames);
 	if (put_user(err, src))
 		return -EFAULT;
 	return err < 0 ? err : 0;
@@ -59,7 +62,10 @@ static int snd_pcm_ioctl_forward_compat(struct snd_pcm_substream *substream,
 
 	if (get_user(frames, src))
 		return -EFAULT;
-	err = snd_pcm_forward(substream, frames);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		err = snd_pcm_playback_forward(substream, frames);
+	else
+		err = snd_pcm_capture_forward(substream, frames);
 	if (put_user(err, src))
 		return -EFAULT;
 	return err < 0 ? err : 0;
@@ -426,7 +432,7 @@ static int snd_pcm_ioctl_xfern_compat(struct snd_pcm_substream *substream,
 	    get_user(frames, &data32->frames))
 		return -EFAULT;
 	bufptr = compat_ptr(buf);
-	bufs = kmalloc_array(ch, sizeof(void __user *), GFP_KERNEL);
+	bufs = kmalloc(sizeof(void __user *) * ch, GFP_KERNEL);
 	if (bufs == NULL)
 		return -ENOMEM;
 	for (i = 0; i < ch; i++) {
@@ -649,6 +655,39 @@ enum {
 #endif /* CONFIG_X86_X32 */
 };
 
+static int snd_compressed_ioctl32(struct snd_pcm_substream *substream,
+				 unsigned int cmd, void __user *arg)
+{
+	struct snd_pcm_runtime *runtime;
+	int err = 0;
+
+	if (PCM_RUNTIME_CHECK(substream))
+		return -ENXIO;
+	runtime = substream->runtime;
+	if (substream->ops->compat_ioctl) {
+		err = substream->ops->compat_ioctl(substream, cmd, arg);
+	} else {
+		err = -ENOIOCTLCMD;
+		pr_err("%s failed cmd = %d\n", __func__, cmd);
+	}
+	pr_debug("%s called with cmd = %d\n", __func__, cmd);
+	return err;
+}
+static int snd_user_ioctl32(struct snd_pcm_substream *substream,
+			  unsigned int cmd, void __user *arg)
+{
+	struct snd_pcm_runtime *runtime;
+	int err = -ENOIOCTLCMD;
+
+	if (PCM_RUNTIME_CHECK(substream))
+		return -ENXIO;
+	runtime = substream->runtime;
+	if (substream->ops->compat_ioctl)
+		err = substream->ops->compat_ioctl(substream, cmd, arg);
+	return err;
+}
+
+
 static long snd_pcm_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct snd_pcm_file *pcm_file;
@@ -726,6 +765,11 @@ static long snd_pcm_ioctl_compat(struct file *file, unsigned int cmd, unsigned l
 	case SNDRV_PCM_IOCTL_CHANNEL_INFO_X32:
 		return snd_pcm_ioctl_channel_info_x32(substream, argp);
 #endif /* CONFIG_X86_X32 */
+	default:
+		if (_IOC_TYPE(cmd) == 'C')
+			return snd_compressed_ioctl32(substream, cmd, argp);
+		else if (_IOC_TYPE(cmd) == 'U')
+			return snd_user_ioctl32(substream, cmd, argp);
 	}
 
 	return -ENOIOCTLCMD;

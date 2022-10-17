@@ -35,7 +35,6 @@ hwdep_read_resp_buf(struct snd_efw *efw, char __user *buf, long remained,
 	type = SNDRV_FIREWIRE_EVENT_EFW_RESPONSE;
 	if (copy_to_user(buf, &type, sizeof(type)))
 		return -EFAULT;
-	count += sizeof(type);
 	remained -= sizeof(type);
 	buf += sizeof(type);
 
@@ -185,22 +184,22 @@ end:
 	return count;
 }
 
-static __poll_t
+static unsigned int
 hwdep_poll(struct snd_hwdep *hwdep, struct file *file, poll_table *wait)
 {
 	struct snd_efw *efw = hwdep->private_data;
-	__poll_t events;
+	unsigned int events;
 
 	poll_wait(file, &efw->hwdep_wait, wait);
 
 	spin_lock_irq(&efw->lock);
 	if (efw->dev_lock_changed || efw->pull_ptr != efw->push_ptr)
-		events = EPOLLIN | EPOLLRDNORM;
+		events = POLLIN | POLLRDNORM;
 	else
 		events = 0;
 	spin_unlock_irq(&efw->lock);
 
-	return events | EPOLLOUT;
+	return events | POLLOUT;
 }
 
 static int

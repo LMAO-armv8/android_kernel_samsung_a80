@@ -222,7 +222,6 @@ struct sigmatel_spec {
 
 	/* beep widgets */
 	hda_nid_t anabeep_nid;
-	bool beep_power_on;
 
 	/* SPDIF-out mux */
 	const char * const *spdif_labels;
@@ -334,15 +333,33 @@ static void stac_gpio_set(struct hda_codec *codec, unsigned int mask,
 }
 
 /* hook for controlling mic-mute LED GPIO */
-static void stac_capture_led_update(struct hda_codec *codec)
+static void stac_capture_led_hook(struct hda_codec *codec,
+				  struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
 {
 	struct sigmatel_spec *spec = codec->spec;
+	unsigned int mask;
+	bool cur_mute, prev_mute;
 
-	if (spec->gen.micmute_led.led_value)
-		spec->gpio_data |= spec->mic_mute_led_gpio;
+	if (!kcontrol || !ucontrol)
+		return;
+
+	mask = 1U << snd_ctl_get_ioffidx(kcontrol, &ucontrol->id);
+	prev_mute = !spec->mic_enabled;
+	if (ucontrol->value.integer.value[0] ||
+	    ucontrol->value.integer.value[1])
+		spec->mic_enabled |= mask;
 	else
-		spec->gpio_data &= ~spec->mic_mute_led_gpio;
-	stac_gpio_set(codec, spec->gpio_mask, spec->gpio_dir, spec->gpio_data);
+		spec->mic_enabled &= ~mask;
+	cur_mute = !spec->mic_enabled;
+	if (cur_mute != prev_mute) {
+		if (cur_mute)
+			spec->gpio_data |= spec->mic_mute_led_gpio;
+		else
+			spec->gpio_data &= ~spec->mic_mute_led_gpio;
+		stac_gpio_set(codec, spec->gpio_mask,
+			      spec->gpio_dir, spec->gpio_data);
+	}
 }
 
 static int stac_vrefout_set(struct hda_codec *codec,
@@ -846,7 +863,7 @@ static int stac_auto_create_beep_ctls(struct hda_codec *codec,
 	static struct snd_kcontrol_new beep_vol_ctl =
 		HDA_CODEC_VOLUME(NULL, 0, 0, 0);
 
-	/* check for mute support for the amp */
+	/* check for mute support for the the amp */
 	if ((caps & AC_AMPCAP_MUTE) >> AC_AMPCAP_MUTE_SHIFT) {
 		const struct snd_kcontrol_new *temp;
 		if (spec->anabeep_nid == nid)
@@ -4464,28 +4481,6 @@ static int stac_suspend(struct hda_codec *codec)
 	stac_shutup(codec);
 	return 0;
 }
-
-static int stac_check_power_status(struct hda_codec *codec, hda_nid_t nid)
-{
-#ifdef CONFIG_SND_HDA_INPUT_BEEP
-	struct sigmatel_spec *spec = codec->spec;
-#endif
-	int ret = snd_hda_gen_check_power_status(codec, nid);
-
-#ifdef CONFIG_SND_HDA_INPUT_BEEP
-	if (nid == spec->gen.beep_nid && codec->beep) {
-		if (codec->beep->enabled != spec->beep_power_on) {
-			spec->beep_power_on = codec->beep->enabled;
-			if (spec->beep_power_on)
-				snd_hda_power_up_pm(codec);
-			else
-				snd_hda_power_down_pm(codec);
-		}
-		ret |= spec->beep_power_on;
-	}
-#endif
-	return ret;
-}
 #else
 #define stac_suspend		NULL
 #endif /* CONFIG_PM */
@@ -4498,7 +4493,6 @@ static const struct hda_codec_ops stac_patch_ops = {
 	.unsol_event = snd_hda_jack_unsol_event,
 #ifdef CONFIG_PM
 	.suspend = stac_suspend,
-	.check_power_status = stac_check_power_status,
 #endif
 	.reboot_notify = stac_shutup,
 };
@@ -4682,7 +4676,8 @@ static void stac_setup_gpio(struct hda_codec *codec)
 		spec->gpio_dir |= spec->mic_mute_led_gpio;
 		spec->mic_enabled = 0;
 		spec->gpio_data |= spec->mic_mute_led_gpio;
-		snd_hda_gen_add_micmute_led(codec, stac_capture_led_update);
+
+		spec->gen.cap_sync_hook = stac_capture_led_hook;
 	}
 }
 

@@ -159,8 +159,18 @@ static void queue_delete(struct snd_seq_queue *q)
 
 /*----------------------------------------------------------------*/
 
+/* setup queues */
+int __init snd_seq_queues_init(void)
+{
+	/*
+	memset(queue_list, 0, sizeof(queue_list));
+	num_queues = 0;
+	*/
+	return 0;
+}
+
 /* delete all existing queues */
-void snd_seq_queues_delete(void)
+void __exit snd_seq_queues_delete(void)
 {
 	int i;
 
@@ -247,15 +257,12 @@ struct snd_seq_queue *snd_seq_queue_find_name(char *name)
 
 /* -------------------------------------------------------- */
 
-#define MAX_CELL_PROCESSES_IN_QUEUE	1000
-
 void snd_seq_check_queue(struct snd_seq_queue *q, int atomic, int hop)
 {
 	unsigned long flags;
 	struct snd_seq_event_cell *cell;
 	snd_seq_tick_time_t cur_tick;
 	snd_seq_real_time_t cur_time;
-	int processed = 0;
 
 	if (q == NULL)
 		return;
@@ -278,8 +285,6 @@ void snd_seq_check_queue(struct snd_seq_queue *q, int atomic, int hop)
 		if (!cell)
 			break;
 		snd_seq_dispatch_event(cell, atomic, hop);
-		if (++processed >= MAX_CELL_PROCESSES_IN_QUEUE)
-			goto out; /* the rest processed at the next batch */
 	}
 
 	/* Process time queue... */
@@ -289,19 +294,14 @@ void snd_seq_check_queue(struct snd_seq_queue *q, int atomic, int hop)
 		if (!cell)
 			break;
 		snd_seq_dispatch_event(cell, atomic, hop);
-		if (++processed >= MAX_CELL_PROCESSES_IN_QUEUE)
-			goto out; /* the rest processed at the next batch */
 	}
 
- out:
 	/* free lock */
 	spin_lock_irqsave(&q->check_lock, flags);
 	if (q->check_again) {
 		q->check_again = 0;
-		if (processed < MAX_CELL_PROCESSES_IN_QUEUE) {
-			spin_unlock_irqrestore(&q->check_lock, flags);
-			goto __again;
-		}
+		spin_unlock_irqrestore(&q->check_lock, flags);
+		goto __again;
 	}
 	q->check_blocked = 0;
 	spin_unlock_irqrestore(&q->check_lock, flags);
@@ -493,7 +493,9 @@ int snd_seq_queue_timer_set_tempo(int queueid, int client,
 		return -EPERM;
 	}
 
-	result = snd_seq_timer_set_tempo_ppq(q->timer, info->tempo, info->ppq);
+	result = snd_seq_timer_set_tempo(q->timer, info->tempo);
+	if (result >= 0)
+		result = snd_seq_timer_set_ppq(q->timer, info->ppq);
 	if (result >= 0 && info->skew_base > 0)
 		result = snd_seq_timer_set_skew(q->timer, info->skew_value,
 						info->skew_base);

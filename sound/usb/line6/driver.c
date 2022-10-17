@@ -117,12 +117,12 @@ static int line6_send_raw_message(struct usb_line6 *line6, const char *buffer,
 			retval = usb_interrupt_msg(line6->usbdev,
 						usb_sndintpipe(line6->usbdev, properties->ep_ctrl_w),
 						(char *)frag_buf, frag_size,
-						&partial, LINE6_TIMEOUT);
+						&partial, LINE6_TIMEOUT * HZ);
 		} else {
 			retval = usb_bulk_msg(line6->usbdev,
 						usb_sndbulkpipe(line6->usbdev, properties->ep_ctrl_w),
 						(char *)frag_buf, frag_size,
-						&partial, LINE6_TIMEOUT);
+						&partial, LINE6_TIMEOUT * HZ);
 		}
 
 		if (retval) {
@@ -175,33 +175,26 @@ static int line6_send_raw_message_async_part(struct message *msg,
 	}
 
 	msg->done += bytes;
-
-	/* sanity checks of EP before actually submitting */
-	retval = usb_urb_ep_type_check(urb);
-	if (retval < 0)
-		goto error;
-
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
-	if (retval < 0)
-		goto error;
+
+	if (retval < 0) {
+		dev_err(line6->ifcdev, "%s: usb_submit_urb failed (%d)\n",
+			__func__, retval);
+		usb_free_urb(urb);
+		kfree(msg);
+		return retval;
+	}
 
 	return 0;
-
- error:
-	dev_err(line6->ifcdev, "%s: usb_submit_urb failed (%d)\n",
-		__func__, retval);
-	usb_free_urb(urb);
-	kfree(msg);
-	return retval;
 }
 
 /*
 	Setup and start timer.
 */
 void line6_start_timer(struct timer_list *timer, unsigned long msecs,
-		       void (*function)(struct timer_list *t))
+		       void (*function)(unsigned long), unsigned long data)
 {
-	timer->function = function;
+	setup_timer(timer, function, data);
 	mod_timer(timer, jiffies + msecs_to_jiffies(msecs));
 }
 EXPORT_SYMBOL_GPL(line6_start_timer);
@@ -365,7 +358,7 @@ int line6_read_data(struct usb_line6 *line6, unsigned address, void *data,
 	ret = usb_control_msg(usbdev, usb_sndctrlpipe(usbdev, 0), 0x67,
 			      USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 			      (datalen << 8) | 0x21, address,
-			      NULL, 0, LINE6_TIMEOUT);
+			      NULL, 0, LINE6_TIMEOUT * HZ);
 
 	if (ret < 0) {
 		dev_err(line6->ifcdev, "read request failed (error %d)\n", ret);
@@ -380,7 +373,7 @@ int line6_read_data(struct usb_line6 *line6, unsigned address, void *data,
 				      USB_TYPE_VENDOR | USB_RECIP_DEVICE |
 				      USB_DIR_IN,
 				      0x0012, 0x0000, len, 1,
-				      LINE6_TIMEOUT);
+				      LINE6_TIMEOUT * HZ);
 		if (ret < 0) {
 			dev_err(line6->ifcdev,
 				"receive length failed (error %d)\n", ret);
@@ -408,7 +401,7 @@ int line6_read_data(struct usb_line6 *line6, unsigned address, void *data,
 	ret = usb_control_msg(usbdev, usb_rcvctrlpipe(usbdev, 0), 0x67,
 			      USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
 			      0x0013, 0x0000, data, datalen,
-			      LINE6_TIMEOUT);
+			      LINE6_TIMEOUT * HZ);
 
 	if (ret < 0)
 		dev_err(line6->ifcdev, "read failed (error %d)\n", ret);
@@ -440,7 +433,7 @@ int line6_write_data(struct usb_line6 *line6, unsigned address, void *data,
 	ret = usb_control_msg(usbdev, usb_sndctrlpipe(usbdev, 0), 0x67,
 			      USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
 			      0x0022, address, data, datalen,
-			      LINE6_TIMEOUT);
+			      LINE6_TIMEOUT * HZ);
 
 	if (ret < 0) {
 		dev_err(line6->ifcdev,
@@ -456,7 +449,7 @@ int line6_write_data(struct usb_line6 *line6, unsigned address, void *data,
 				      USB_TYPE_VENDOR | USB_RECIP_DEVICE |
 				      USB_DIR_IN,
 				      0x0012, 0x0000,
-				      status, 1, LINE6_TIMEOUT);
+				      status, 1, LINE6_TIMEOUT * HZ);
 
 		if (ret < 0) {
 			dev_err(line6->ifcdev,
@@ -705,10 +698,6 @@ static int line6_init_cap_control(struct usb_line6 *line6)
 		line6->buffer_message = kmalloc(LINE6_MIDI_MESSAGE_MAXLEN, GFP_KERNEL);
 		if (!line6->buffer_message)
 			return -ENOMEM;
-
-		ret = line6_init_midi(line6);
-		if (ret < 0)
-			return ret;
 	} else {
 		ret = line6_hwdep_init(line6);
 		if (ret < 0)
@@ -722,15 +711,6 @@ static int line6_init_cap_control(struct usb_line6 *line6)
 	}
 
 	return 0;
-}
-
-static void line6_startup_work(struct work_struct *work)
-{
-	struct usb_line6 *line6 =
-		container_of(work, struct usb_line6, startup_work.work);
-
-	if (line6->startup)
-		line6->startup(line6);
 }
 
 /*
@@ -768,7 +748,6 @@ int line6_probe(struct usb_interface *interface,
 	line6->properties = properties;
 	line6->usbdev = usbdev;
 	line6->ifcdev = &interface->dev;
-	INIT_DELAYED_WORK(&line6->startup_work, line6_startup_work);
 
 	strcpy(card->id, properties->id);
 	strcpy(card->driver, driver_name);
@@ -838,8 +817,6 @@ void line6_disconnect(struct usb_interface *interface)
 
 	if (WARN_ON(usbdev != line6->usbdev))
 		return;
-
-	cancel_delayed_work_sync(&line6->startup_work);
 
 	if (line6->urb_listen != NULL)
 		line6_stop_listen(line6);

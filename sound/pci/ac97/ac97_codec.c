@@ -958,8 +958,8 @@ static int snd_ac97_ad18xx_pcm_get_volume(struct snd_kcontrol *kcontrol, struct 
 	int codec = kcontrol->private_value & 3;
 	
 	mutex_lock(&ac97->page_mutex);
-	ucontrol->value.integer.value[0] = 31 - ((ac97->spec.ad18xx.pcmreg[codec] >> 8) & 31);
-	ucontrol->value.integer.value[1] = 31 - ((ac97->spec.ad18xx.pcmreg[codec] >> 0) & 31);
+	ucontrol->value.integer.value[0] = 31 - ((ac97->spec.ad18xx.pcmreg[codec] >> 0) & 31);
+	ucontrol->value.integer.value[1] = 31 - ((ac97->spec.ad18xx.pcmreg[codec] >> 8) & 31);
 	mutex_unlock(&ac97->page_mutex);
 	return 0;
 }
@@ -2941,3 +2941,19 @@ int snd_ac97_tune_hardware(struct snd_ac97 *ac97,
 }
 
 EXPORT_SYMBOL(snd_ac97_tune_hardware);
+
+/*
+ *  INIT part
+ */
+
+static int __init alsa_ac97_init(void)
+{
+	return 0;
+}
+
+static void __exit alsa_ac97_exit(void)
+{
+}
+
+module_init(alsa_ac97_init)
+module_exit(alsa_ac97_exit)

@@ -1,21 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0+
-//
-// soc-dapm.c  --  ALSA SoC Dynamic Audio Power Management
-//
-// Copyright 2005 Wolfson Microelectronics PLC.
-// Author: Liam Girdwood <lrg@slimlogic.co.uk>
-//
-//  Features:
-//    o Changes power status of internal codec blocks depending on the
-//      dynamic configuration of codec internal audio paths and active
-//      DACs/ADCs.
-//    o Platform power domain - can support external components i.e. amps and
-//      mic/headphone insertion events.
-//    o Automatic Mic Bias support
-//    o Jack insertion power event initiation - e.g. hp insertion will enable
-//      sinks, dacs, etc
-//    o Delayed power down of audio subsystem to reduce pops between a quick
-//      device reopen.
+/*
+ * soc-dapm.c  --  ALSA SoC Dynamic Audio Power Management
+ *
+ * Copyright 2005 Wolfson Microelectronics PLC.
+ * Author: Liam Girdwood <lrg@slimlogic.co.uk>
+ *
+ *  This program is free software; you can redistribute  it and/or modify it
+ *  under  the terms of  the GNU General  Public License as published by the
+ *  Free Software Foundation;  either version 2 of the  License, or (at your
+ *  option) any later version.
+ *
+ *  Features:
+ *    o Changes power status of internal codec blocks depending on the
+ *      dynamic configuration of codec internal audio paths and active
+ *      DACs/ADCs.
+ *    o Platform power domain - can support external components i.e. amps and
+ *      mic/headphone insertion events.
+ *    o Automatic Mic Bias support
+ *    o Jack insertion power event initiation - e.g. hp insertion will enable
+ *      sinks, dacs, etc
+ *    o Delayed power down of audio subsystem to reduce pops between a quick
+ *      device reopen.
+ *
+ */
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -29,7 +35,6 @@
 #include <linux/debugfs.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
-#include <linux/pinctrl/consumer.h>
 #include <linux/clk.h>
 #include <linux/slab.h>
 #include <sound/core.h>
@@ -67,7 +72,6 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 static int dapm_up_seq[] = {
 	[snd_soc_dapm_pre] = 0,
 	[snd_soc_dapm_regulator_supply] = 1,
-	[snd_soc_dapm_pinctrl] = 1,
 	[snd_soc_dapm_clock_supply] = 1,
 	[snd_soc_dapm_supply] = 2,
 	[snd_soc_dapm_micbias] = 3,
@@ -75,8 +79,7 @@ static int dapm_up_seq[] = {
 	[snd_soc_dapm_dai_link] = 2,
 	[snd_soc_dapm_dai_in] = 4,
 	[snd_soc_dapm_dai_out] = 4,
-	[snd_soc_dapm_aif_in] = 4,
-	[snd_soc_dapm_aif_out] = 4,
+	[snd_soc_dapm_adc] = 4,
 	[snd_soc_dapm_mic] = 5,
 	[snd_soc_dapm_siggen] = 5,
 	[snd_soc_dapm_input] = 5,
@@ -88,6 +91,8 @@ static int dapm_up_seq[] = {
 	[snd_soc_dapm_mixer] = 8,
 	[snd_soc_dapm_mixer_named_ctl] = 8,
 	[snd_soc_dapm_pga] = 9,
+	[snd_soc_dapm_aif_in] = 9,
+	[snd_soc_dapm_aif_out] = 9,
 	[snd_soc_dapm_buffer] = 9,
 	[snd_soc_dapm_scheduler] = 9,
 	[snd_soc_dapm_effect] = 9,
@@ -95,7 +100,6 @@ static int dapm_up_seq[] = {
 	[snd_soc_dapm_asrc] = 9,
 	[snd_soc_dapm_encoder] = 9,
 	[snd_soc_dapm_decoder] = 9,
-	[snd_soc_dapm_adc] = 10,
 	[snd_soc_dapm_out_drv] = 11,
 	[snd_soc_dapm_hp] = 11,
 	[snd_soc_dapm_spk] = 11,
@@ -108,7 +112,9 @@ static int dapm_up_seq[] = {
 static int dapm_down_seq[] = {
 	[snd_soc_dapm_pre] = 0,
 	[snd_soc_dapm_kcontrol] = 1,
-	[snd_soc_dapm_adc] = 2,
+	[snd_soc_dapm_aif_in] = 2,
+	[snd_soc_dapm_aif_out] = 2,
+	[snd_soc_dapm_adc] = 5,
 	[snd_soc_dapm_hp] = 3,
 	[snd_soc_dapm_spk] = 3,
 	[snd_soc_dapm_line] = 3,
@@ -134,14 +140,11 @@ static int dapm_down_seq[] = {
 	[snd_soc_dapm_vmid] = 8,
 	[snd_soc_dapm_mux] = 9,
 	[snd_soc_dapm_demux] = 9,
-	[snd_soc_dapm_aif_in] = 10,
-	[snd_soc_dapm_aif_out] = 10,
 	[snd_soc_dapm_dai_in] = 10,
 	[snd_soc_dapm_dai_out] = 10,
 	[snd_soc_dapm_dai_link] = 11,
 	[snd_soc_dapm_supply] = 12,
 	[snd_soc_dapm_clock_supply] = 13,
-	[snd_soc_dapm_pinctrl] = 13,
 	[snd_soc_dapm_regulator_supply] = 13,
 	[snd_soc_dapm_post] = 14,
 };
@@ -303,6 +306,8 @@ void dapm_mark_endpoints_dirty(struct snd_soc_card *card)
 	mutex_lock(&card->dapm_mutex);
 
 	list_for_each_entry(w, &card->widgets, list) {
+		if (w->ignore_suspend)
+			continue;
 		if (w->is_ep) {
 			dapm_mark_dirty(w, "Rechecking endpoints");
 			if (w->is_ep & SND_SOC_DAPM_EP_SINK)
@@ -758,14 +763,18 @@ static int dapm_connect_mux(struct snd_soc_dapm_context *dapm,
 		item = 0;
 	}
 
-	i = match_string(e->texts, e->items, control_name);
-	if (i < 0)
-		return -ENODEV;
+	for (i = 0; i < e->items; i++) {
+		if (!(strcmp(control_name, e->texts[i]))) {
+			path->name = e->texts[i];
+			if (i == item)
+				path->connect = 1;
+			else
+				path->connect = 0;
+			return 0;
+		}
+	}
 
-	path->name = e->texts[i];
-	path->connect = (i == item);
-	return 0;
-
+	return -ENODEV;
 }
 
 /* set up initial codec paths */
@@ -779,7 +788,7 @@ static void dapm_set_mixer_path_status(struct snd_soc_dapm_path *p, int i,
 	unsigned int max = mc->max;
 	unsigned int mask = (1 << fls(max)) - 1;
 	unsigned int invert = mc->invert;
-	unsigned int val;
+	unsigned int val = 0;
 
 	if (reg != SND_SOC_NOPM) {
 		soc_dapm_read(p->sink->dapm, reg, &val);
@@ -1124,7 +1133,7 @@ static int dapm_widget_list_create(struct snd_soc_dapm_widget_list **list,
 	list_for_each(it, widgets)
 		size++;
 
-	*list = kzalloc(struct_size(*list, widgets, size), GFP_KERNEL);
+	*list = kzalloc(sizeof(**list) + size * sizeof(*w), GFP_KERNEL);
 	if (*list == NULL)
 		return -ENOMEM;
 
@@ -1327,31 +1336,6 @@ int dapm_regulator_event(struct snd_soc_dapm_widget *w,
 	}
 }
 EXPORT_SYMBOL_GPL(dapm_regulator_event);
-
-/*
- * Handler for pinctrl widget.
- */
-int dapm_pinctrl_event(struct snd_soc_dapm_widget *w,
-		       struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_dapm_pinctrl_priv *priv = w->priv;
-	struct pinctrl *p = w->pinctrl;
-	struct pinctrl_state *s;
-
-	if (!p || !priv)
-		return -EIO;
-
-	if (SND_SOC_DAPM_EVENT_ON(event))
-		s = pinctrl_lookup_state(p, priv->active_state);
-	else
-		s = pinctrl_lookup_state(p, priv->sleep_state);
-
-	if (IS_ERR(s))
-		return PTR_ERR(s);
-
-	return pinctrl_select_state(p, s);
-}
-EXPORT_SYMBOL_GPL(dapm_pinctrl_event);
 
 /*
  * Handler for clock supply widget.
@@ -1635,7 +1619,8 @@ static void dapm_seq_run(struct snd_soc_card *card,
 		switch (w->id) {
 		case snd_soc_dapm_pre:
 			if (!w->event)
-				continue;
+				list_for_each_entry_safe_continue(w, n, list,
+								  power_list);
 
 			if (event == SND_SOC_DAPM_STREAM_START)
 				ret = w->event(w,
@@ -1647,7 +1632,8 @@ static void dapm_seq_run(struct snd_soc_card *card,
 
 		case snd_soc_dapm_post:
 			if (!w->event)
-				continue;
+				list_for_each_entry_safe_continue(w, n, list,
+								  power_list);
 
 			if (event == SND_SOC_DAPM_STREAM_START)
 				ret = w->event(w,
@@ -1666,6 +1652,13 @@ static void dapm_seq_run(struct snd_soc_card *card,
 			list_move(&w->power_list, &pending);
 			break;
 		}
+
+		/*
+		 * Add this debug log to keep track of widgets being
+		 * powered-up and powered-down.
+		 */
+		dev_dbg(w->dapm->dev, "dapm: powering %s widget %s\n",
+			power_up ? "up" : "down", w->name);
 
 		if (ret < 0)
 			dev_err(w->dapm->dev,
@@ -1913,6 +1906,8 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
 	LIST_HEAD(down_list);
 	ASYNC_DOMAIN_EXCLUSIVE(async_domain);
 	enum snd_soc_bias_level bias;
+	struct snd_soc_platform *p;
+	struct snd_soc_codec *c;
 
 	lockdep_assert_held(&card->dapm_mutex);
 
@@ -1965,7 +1960,6 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
 				break;
 			case snd_soc_dapm_supply:
 			case snd_soc_dapm_regulator_supply:
-			case snd_soc_dapm_pinctrl:
 			case snd_soc_dapm_clock_supply:
 			case snd_soc_dapm_micbias:
 				if (d->target_bias_level < SND_SOC_BIAS_STANDBY)
@@ -1996,7 +1990,9 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
 	dapm_pre_sequence_async(&card->dapm, 0);
 	/* Run other bias changes in parallel */
 	list_for_each_entry(d, &card->dapm_list, list) {
-		if (d != &card->dapm)
+		p = snd_soc_dapm_to_platform(d);
+		c = snd_soc_dapm_to_codec(d);
+		if ((d != &card->dapm) && (c || p))
 			async_schedule_domain(dapm_pre_sequence_async, d,
 						&async_domain);
 	}
@@ -2020,7 +2016,9 @@ static int dapm_power_widgets(struct snd_soc_card *card, int event)
 
 	/* Run all the bias changes in parallel */
 	list_for_each_entry(d, &card->dapm_list, list) {
-		if (d != &card->dapm)
+		p = snd_soc_dapm_to_platform(d);
+		c = snd_soc_dapm_to_codec(d);
+		if ((d != &card->dapm) && (c || p))
 			async_schedule_domain(dapm_post_sequence_async, d,
 						&async_domain);
 	}
@@ -2091,7 +2089,7 @@ static ssize_t dapm_widget_power_read_file(struct file *file,
 	snd_soc_dapm_for_each_direction(dir) {
 		rdir = SND_SOC_DAPM_DIR_REVERSE(dir);
 		snd_soc_dapm_widget_for_each_path(w, dir, p) {
-			if (p->connected && !p->connected(p->source, p->sink))
+			if (p->connected && !p->connected(w, p->node[rdir]))
 				continue;
 
 			if (!p->connect)
@@ -2382,7 +2380,6 @@ static ssize_t dapm_widget_show_component(struct snd_soc_component *cmpnt,
 		case snd_soc_dapm_mixer_named_ctl:
 		case snd_soc_dapm_supply:
 		case snd_soc_dapm_regulator_supply:
-		case snd_soc_dapm_pinctrl:
 		case snd_soc_dapm_clock_supply:
 			if (w->name)
 				count += sprintf(buf + count, "%s: %s\n",
@@ -2432,7 +2429,7 @@ static ssize_t dapm_widget_show(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR_RO(dapm_widget);
+static DEVICE_ATTR(dapm_widget, 0444, dapm_widget_show, NULL);
 
 struct attribute *soc_dapm_dev_attrs[] = {
 	&dev_attr_dapm_widget.attr,
@@ -2454,7 +2451,6 @@ void snd_soc_dapm_free_widget(struct snd_soc_dapm_widget *w)
 	enum snd_soc_dapm_direction dir;
 
 	list_del(&w->list);
-	list_del(&w->dirty);
 	/*
 	 * remove source and sink paths associated to this widget.
 	 * While removing the path, remove reference to it from both
@@ -2511,16 +2507,10 @@ static struct snd_soc_dapm_widget *dapm_find_widget(
 	return NULL;
 }
 
-/*
- * set the DAPM pin status:
- * returns 1 when the value has been updated, 0 when unchanged, or a negative
- * error code; called from kcontrol put callback
- */
-static int __snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
-				  const char *pin, int status)
+static int snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
+				const char *pin, int status)
 {
 	struct snd_soc_dapm_widget *w = dapm_find_widget(dapm, pin, true);
-	int ret = 0;
 
 	dapm_assert_locked(dapm);
 
@@ -2533,26 +2523,13 @@ static int __snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
 		dapm_mark_dirty(w, "pin configuration");
 		dapm_widget_invalidate_input_paths(w);
 		dapm_widget_invalidate_output_paths(w);
-		ret = 1;
 	}
 
 	w->connected = status;
 	if (status == 0)
 		w->force = 0;
 
-	return ret;
-}
-
-/*
- * similar as __snd_soc_dapm_set_pin(), but returns 0 when successful;
- * called from several API functions below
- */
-static int snd_soc_dapm_set_pin(struct snd_soc_dapm_context *dapm,
-				const char *pin, int status)
-{
-	int ret = __snd_soc_dapm_set_pin(dapm, pin, status);
-
-	return ret < 0 ? ret : 0;
+	return 0;
 }
 
 /**
@@ -2796,8 +2773,7 @@ static int snd_soc_dapm_add_path(struct snd_soc_dapm_context *dapm,
 		dapm_mark_dirty(widgets[dir], "Route added");
 	}
 
-	if (dapm->card->instantiated && path->connect)
-		dapm_path_invalidate(path);
+	dapm_path_invalidate(path);
 
 	return 0;
 err:
@@ -2972,7 +2948,7 @@ int snd_soc_dapm_add_routes(struct snd_soc_dapm_context *dapm,
 {
 	int i, r, ret = 0;
 
-	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_INIT);
 	for (i = 0; i < num; i++) {
 		r = snd_soc_dapm_add_route(dapm, route);
 		if (r < 0) {
@@ -3003,7 +2979,7 @@ int snd_soc_dapm_del_routes(struct snd_soc_dapm_context *dapm,
 {
 	int i;
 
-	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
+	mutex_lock_nested(&dapm->card->dapm_mutex, SND_SOC_DAPM_CLASS_INIT);
 	for (i = 0; i < num; i++) {
 		snd_soc_dapm_del_route(dapm, route);
 		route++;
@@ -3115,7 +3091,7 @@ int snd_soc_dapm_new_widgets(struct snd_soc_card *card)
 			continue;
 
 		if (w->num_kcontrols) {
-			w->kcontrols = kcalloc(w->num_kcontrols,
+			w->kcontrols = kzalloc(w->num_kcontrols *
 						sizeof(struct snd_kcontrol *),
 						GFP_KERNEL);
 			if (!w->kcontrols) {
@@ -3253,7 +3229,7 @@ int snd_soc_dapm_put_volsw(struct snd_kcontrol *kcontrol,
 	unsigned int invert = mc->invert;
 	unsigned int val, rval = 0;
 	int connect, rconnect = -1, change, reg_change = 0;
-	struct snd_soc_dapm_update update = {};
+	struct snd_soc_dapm_update update = { NULL };
 	int ret = 0;
 
 	val = (ucontrol->value.integer.value[0] & mask);
@@ -3304,6 +3280,7 @@ int snd_soc_dapm_put_volsw(struct snd_kcontrol *kcontrol,
 			update.val = val;
 			card->update = &update;
 		}
+		change |= reg_change;
 
 		ret = soc_dapm_mixer_update_power(card, kcontrol, connect,
 						  rconnect);
@@ -3379,7 +3356,7 @@ int snd_soc_dapm_put_enum_double(struct snd_kcontrol *kcontrol,
 	unsigned int *item = ucontrol->value.enumerated.item;
 	unsigned int val, change, reg_change = 0;
 	unsigned int mask;
-	struct snd_soc_dapm_update update = {};
+	struct snd_soc_dapm_update update = { NULL };
 	int ret = 0;
 
 	if (item[0] >= e->items)
@@ -3409,6 +3386,7 @@ int snd_soc_dapm_put_enum_double(struct snd_kcontrol *kcontrol,
 			update.val = val;
 			card->update = &update;
 		}
+		change |= reg_change;
 
 		ret = soc_dapm_mux_update_power(card, kcontrol, item[0], e);
 
@@ -3478,15 +3456,14 @@ int snd_soc_dapm_put_pin_switch(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	const char *pin = (const char *)kcontrol->private_value;
-	int ret;
 
-	mutex_lock_nested(&card->dapm_mutex, SND_SOC_DAPM_CLASS_RUNTIME);
-	ret = __snd_soc_dapm_set_pin(&card->dapm, pin,
-				     !!ucontrol->value.integer.value[0]);
-	mutex_unlock(&card->dapm_mutex);
+	if (ucontrol->value.integer.value[0])
+		snd_soc_dapm_enable_pin(&card->dapm, pin);
+	else
+		snd_soc_dapm_disable_pin(&card->dapm, pin);
 
 	snd_soc_dapm_sync(&card->dapm);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(snd_soc_dapm_put_pin_switch);
 
@@ -3549,17 +3526,6 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 				dev_warn(w->dapm->dev,
 					 "ASoC: Failed to bypass %s: %d\n",
 					 w->name, ret);
-		}
-		break;
-	case snd_soc_dapm_pinctrl:
-		w->pinctrl = devm_pinctrl_get(dapm->dev);
-		if (IS_ERR(w->pinctrl)) {
-			ret = PTR_ERR(w->pinctrl);
-			if (ret == -EPROBE_DEFER)
-				return ERR_PTR(ret);
-			dev_err(dapm->dev, "ASoC: Failed to request %s: %d\n",
-				w->name, ret);
-			return NULL;
 		}
 		break;
 	case snd_soc_dapm_clock_supply:
@@ -3641,7 +3607,6 @@ snd_soc_dapm_new_control_unlocked(struct snd_soc_dapm_context *dapm,
 		break;
 	case snd_soc_dapm_supply:
 	case snd_soc_dapm_regulator_supply:
-	case snd_soc_dapm_pinctrl:
 	case snd_soc_dapm_clock_supply:
 	case snd_soc_dapm_kcontrol:
 		w->is_supply = 1;
@@ -3717,13 +3682,12 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 {
 	struct snd_soc_dapm_path *source_p, *sink_p;
 	struct snd_soc_dai *source, *sink;
-	struct snd_soc_pcm_runtime *rtd = w->priv;
 	const struct snd_soc_pcm_stream *config = w->params + w->params_select;
 	struct snd_pcm_substream substream;
 	struct snd_pcm_hw_params *params = NULL;
 	struct snd_pcm_runtime *runtime = NULL;
-	unsigned int fmt;
-	int ret = 0;
+	u64 fmt;
+	int ret;
 
 	if (WARN_ON(!config) ||
 	    WARN_ON(list_empty(&w->edges[SND_SOC_DAPM_DIR_OUT]) ||
@@ -3777,12 +3741,11 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 		goto out;
 	}
 	substream.runtime = runtime;
-	substream.private_data = rtd;
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
 		substream.stream = SNDRV_PCM_STREAM_CAPTURE;
-		if (source->driver->ops->startup) {
+		if (source->driver->ops && source->driver->ops->startup) {
 			ret = source->driver->ops->startup(&substream, source);
 			if (ret < 0) {
 				dev_err(source->dev,
@@ -3796,7 +3759,7 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 			goto out;
 
 		substream.stream = SNDRV_PCM_STREAM_PLAYBACK;
-		if (sink->driver->ops->startup) {
+		if (sink->driver->ops && sink->driver->ops->startup) {
 			ret = sink->driver->ops->startup(&substream, sink);
 			if (ret < 0) {
 				dev_err(sink->dev,
@@ -3826,13 +3789,13 @@ static int snd_soc_dai_link_event(struct snd_soc_dapm_widget *w,
 		ret = 0;
 
 		source->active--;
-		if (source->driver->ops->shutdown) {
+		if (source->driver->ops && source->driver->ops->shutdown) {
 			substream.stream = SNDRV_PCM_STREAM_CAPTURE;
 			source->driver->ops->shutdown(&substream, source);
 		}
 
 		sink->active--;
-		if (sink->driver->ops->shutdown) {
+		if (sink->driver->ops && sink->driver->ops->shutdown) {
 			substream.stream = SNDRV_PCM_STREAM_PLAYBACK;
 			sink->driver->ops->shutdown(&substream, sink);
 		}
@@ -3876,34 +3839,21 @@ static int snd_soc_dapm_dai_link_put(struct snd_kcontrol *kcontrol,
 
 	w->params_select = ucontrol->value.enumerated.item[0];
 
-	return 1;
+	return 0;
 }
 
-static void
-snd_soc_dapm_free_kcontrol(struct snd_soc_card *card,
-			unsigned long *private_value,
-			int num_params,
-			const char **w_param_text)
+int snd_soc_dapm_new_pcm(struct snd_soc_card *card,
+			 const struct snd_soc_pcm_stream *params,
+			 unsigned int num_params,
+			 struct snd_soc_dapm_widget *source,
+			 struct snd_soc_dapm_widget *sink)
 {
-	int count;
-
-	devm_kfree(card->dev, (void *)*private_value);
-
-	if (!w_param_text)
-		return;
-
-	for (count = 0 ; count < num_params; count++)
-		devm_kfree(card->dev, (void *)w_param_text[count]);
-	devm_kfree(card->dev, w_param_text);
-}
-
-static struct snd_kcontrol_new *
-snd_soc_dapm_alloc_kcontrol(struct snd_soc_card *card,
-			char *link_name,
-			const struct snd_soc_pcm_stream *params,
-			int num_params, const char **w_param_text,
-			unsigned long *private_value)
-{
+	struct snd_soc_dapm_widget template;
+	struct snd_soc_dapm_widget *w;
+	char *link_name;
+	int ret, count;
+	unsigned long private_value;
+	const char **w_param_text;
 	struct soc_enum w_param_enum[] = {
 		SOC_ENUM_SINGLE(0, 0, 0, NULL),
 	};
@@ -3912,9 +3862,19 @@ snd_soc_dapm_alloc_kcontrol(struct snd_soc_card *card,
 			     snd_soc_dapm_dai_link_get,
 			     snd_soc_dapm_dai_link_put),
 	};
-	struct snd_kcontrol_new *kcontrol_news;
 	const struct snd_soc_pcm_stream *config = params;
-	int count;
+
+	w_param_text = devm_kcalloc(card->dev, num_params,
+					sizeof(char *), GFP_KERNEL);
+	if (!w_param_text)
+		return -ENOMEM;
+
+	link_name = devm_kasprintf(card->dev, GFP_KERNEL, "%s-%s",
+				   source->name, sink->name);
+	if (!link_name) {
+		ret = -ENOMEM;
+		goto outfree_w_param;
+	}
 
 	for (count = 0 ; count < num_params; count++) {
 		if (!config->stream_name) {
@@ -3925,64 +3885,24 @@ snd_soc_dapm_alloc_kcontrol(struct snd_soc_card *card,
 				devm_kasprintf(card->dev, GFP_KERNEL,
 					       "Anonymous Configuration %d",
 					       count);
+			if (!w_param_text[count]) {
+				ret = -ENOMEM;
+				goto outfree_link_name;
+			}
 		} else {
 			w_param_text[count] = devm_kmemdup(card->dev,
 						config->stream_name,
 						strlen(config->stream_name) + 1,
 						GFP_KERNEL);
+			if (!w_param_text[count]) {
+				ret = -ENOMEM;
+				goto outfree_link_name;
+			}
 		}
-		if (!w_param_text[count])
-			goto outfree_w_param;
 		config++;
 	}
-
 	w_param_enum[0].items = num_params;
 	w_param_enum[0].texts = w_param_text;
-
-	*private_value =
-		(unsigned long) devm_kmemdup(card->dev,
-			(void *)(kcontrol_dai_link[0].private_value),
-			sizeof(struct soc_enum), GFP_KERNEL);
-	if (!*private_value) {
-		dev_err(card->dev, "ASoC: Failed to create control for %s widget\n",
-			link_name);
-		goto outfree_w_param;
-	}
-	kcontrol_dai_link[0].private_value = *private_value;
-	/* duplicate kcontrol_dai_link on heap so that memory persists */
-	kcontrol_news = devm_kmemdup(card->dev, &kcontrol_dai_link[0],
-					sizeof(struct snd_kcontrol_new),
-					GFP_KERNEL);
-	if (!kcontrol_news) {
-		dev_err(card->dev, "ASoC: Failed to create control for %s widget\n",
-			link_name);
-		goto outfree_w_param;
-	}
-	return kcontrol_news;
-
-outfree_w_param:
-	snd_soc_dapm_free_kcontrol(card, private_value, num_params, w_param_text);
-	return NULL;
-}
-
-int snd_soc_dapm_new_pcm(struct snd_soc_card *card,
-			 struct snd_soc_pcm_runtime *rtd,
-			 const struct snd_soc_pcm_stream *params,
-			 unsigned int num_params,
-			 struct snd_soc_dapm_widget *source,
-			 struct snd_soc_dapm_widget *sink)
-{
-	struct snd_soc_dapm_widget template;
-	struct snd_soc_dapm_widget *w;
-	const char **w_param_text;
-	unsigned long private_value;
-	char *link_name;
-	int ret;
-
-	link_name = devm_kasprintf(card->dev, GFP_KERNEL, "%s-%s",
-				   source->name, sink->name);
-	if (!link_name)
-		return -ENOMEM;
 
 	memset(&template, 0, sizeof(template));
 	template.reg = SND_SOC_NOPM;
@@ -3991,29 +3911,31 @@ int snd_soc_dapm_new_pcm(struct snd_soc_card *card,
 	template.event = snd_soc_dai_link_event;
 	template.event_flags = SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
 		SND_SOC_DAPM_PRE_PMD;
-	template.kcontrol_news = NULL;
-
-	/* allocate memory for control, only in case of multiple configs */
-	if (num_params > 1) {
-		w_param_text = devm_kcalloc(card->dev, num_params,
-					sizeof(char *), GFP_KERNEL);
-		if (!w_param_text) {
-			ret = -ENOMEM;
-			goto param_fail;
-		}
-
-		template.num_kcontrols = 1;
-		template.kcontrol_news =
-					snd_soc_dapm_alloc_kcontrol(card,
-						link_name, params, num_params,
-						w_param_text, &private_value);
-		if (!template.kcontrol_news) {
-			ret = -ENOMEM;
-			goto param_fail;
-		}
-	} else {
-		w_param_text = NULL;
+	template.num_kcontrols = 1;
+	/* duplicate w_param_enum on heap so that memory persists */
+	private_value =
+		(unsigned long) devm_kmemdup(card->dev,
+			(void *)(kcontrol_dai_link[0].private_value),
+			sizeof(struct soc_enum), GFP_KERNEL);
+	if (!private_value) {
+		dev_err(card->dev, "ASoC: Failed to create control for %s widget\n",
+			link_name);
+		ret = -ENOMEM;
+		goto outfree_link_name;
 	}
+	kcontrol_dai_link[0].private_value = private_value;
+	/* duplicate kcontrol_dai_link on heap so that memory persists */
+	template.kcontrol_news =
+				devm_kmemdup(card->dev, &kcontrol_dai_link[0],
+					sizeof(struct snd_kcontrol_new),
+					GFP_KERNEL);
+	if (!template.kcontrol_news) {
+		dev_err(card->dev, "ASoC: Failed to create control for %s widget\n",
+			link_name);
+		ret = -ENOMEM;
+		goto outfree_private_value;
+	}
+
 	dev_dbg(card->dev, "ASoC: adding %s widget\n", link_name);
 
 	w = snd_soc_dapm_new_control_unlocked(&card->dapm, &template);
@@ -4035,7 +3957,6 @@ int snd_soc_dapm_new_pcm(struct snd_soc_card *card,
 
 	w->params = params;
 	w->num_params = num_params;
-	w->priv = rtd;
 
 	ret = snd_soc_dapm_add_path(&card->dapm, source, w, NULL, NULL);
 	if (ret)
@@ -4046,9 +3967,15 @@ outfree_w:
 	devm_kfree(card->dev, w);
 outfree_kcontrol_news:
 	devm_kfree(card->dev, (void *)template.kcontrol_news);
-	snd_soc_dapm_free_kcontrol(card, &private_value, num_params, w_param_text);
-param_fail:
+outfree_private_value:
+	devm_kfree(card->dev, (void *)private_value);
+outfree_link_name:
 	devm_kfree(card->dev, link_name);
+outfree_w_param:
+	for (count = 0 ; count < num_params; count++)
+		devm_kfree(card->dev, (void *)w_param_text[count]);
+	devm_kfree(card->dev, w_param_text);
+
 	return ret;
 }
 
@@ -4190,6 +4117,9 @@ static void dapm_connect_dai_link_widgets(struct snd_soc_card *card,
 	for (i = 0; i < rtd->num_codecs; i++) {
 		struct snd_soc_dai *codec_dai = rtd->codec_dais[i];
 
+		if (!cpu_dai->component->codec)
+			continue;
+
 		/* connect BE DAI playback if widgets are valid */
 		if (codec_dai->playback_widget && cpu_dai->playback_widget) {
 			source = cpu_dai->playback_widget;
@@ -4266,8 +4196,7 @@ void snd_soc_dapm_connect_dai_link_widgets(struct snd_soc_card *card)
 		 * dynamic FE links have no fixed DAI mapping.
 		 * CODEC<->CODEC links have no direct connection.
 		 */
-		if (rtd->dai_link->dynamic || rtd->dai_link->params ||
-		    rtd->dai_link->dynamic_be)
+		if (rtd->dai_link->dynamic || rtd->dai_link->params)
 			continue;
 
 		dapm_connect_dai_link_widgets(card, rtd);
