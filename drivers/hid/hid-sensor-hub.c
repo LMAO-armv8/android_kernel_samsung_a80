@@ -223,21 +223,16 @@ int sensor_hub_set_feature(struct hid_sensor_hub_device *hsdev, u32 report_id,
 	buffer_size = buffer_size / sizeof(__s32);
 	if (buffer_size) {
 		for (i = 0; i < buffer_size; ++i) {
-			ret = hid_set_field(report->field[field_index], i,
-					    (__force __s32)cpu_to_le32(*buf32));
-			if (ret)
-				goto done_proc;
-
+			hid_set_field(report->field[field_index], i,
+				      (__force __s32)cpu_to_le32(*buf32));
 			++buf32;
 		}
 	}
 	if (remaining_bytes) {
 		value = 0;
 		memcpy(&value, (u8 *)buf32, remaining_bytes);
-		ret = hid_set_field(report->field[field_index], i,
-				    (__force __s32)cpu_to_le32(value));
-		if (ret)
-			goto done_proc;
+		hid_set_field(report->field[field_index], i,
+			      (__force __s32)cpu_to_le32(value));
 	}
 	hid_hw_request(hsdev->hdev, report, HID_REQ_SET_REPORT);
 	hid_hw_wait(hsdev->hdev);
@@ -501,8 +496,7 @@ static int sensor_hub_raw_event(struct hid_device *hdev,
 		return 1;
 
 	ptr = raw_data;
-	if (report->id)
-		ptr++; /* Skip report id */
+	ptr++; /* Skip report id */
 
 	spin_lock_irqsave(&pdata->lock, flags);
 
@@ -659,8 +653,7 @@ static int sensor_hub_probe(struct hid_device *hdev,
 		ret = -EINVAL;
 		goto err_stop_hw;
 	}
-	sd->hid_sensor_hub_client_devs = devm_kcalloc(&hdev->dev,
-						      dev_cnt,
+	sd->hid_sensor_hub_client_devs = devm_kzalloc(&hdev->dev, dev_cnt *
 						      sizeof(struct mfd_cell),
 						      GFP_KERNEL);
 	if (sd->hid_sensor_hub_client_devs == NULL) {

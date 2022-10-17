@@ -30,10 +30,17 @@
 #include <linux/io.h>
 #include <linux/uio.h>
 
+#ifdef CONFIG_KNOX_KAP
+#include <linux/knox_kap.h>
+#endif
+
 #include <linux/uaccess.h>
 
 #ifdef CONFIG_IA64
 # include <linux/efi.h>
+#endif
+#ifdef CONFIG_MST_LDO
+#include <linux/mst_ctrl.h>
 #endif
 
 #define DEVPORT_MINOR	4
@@ -370,10 +377,6 @@ static int mmap_mem(struct file *file, struct vm_area_struct *vma)
 {
 	size_t size = vma->vm_end - vma->vm_start;
 	phys_addr_t offset = (phys_addr_t)vma->vm_pgoff << PAGE_SHIFT;
-
-	/* Does it even fit in phys_addr_t? */
-	if (offset >> PAGE_SHIFT != vma->vm_pgoff)
-		return -EINVAL;
 
 	/* It's illegal to wrap around the end of the physical address space. */
 	if (offset + (phys_addr_t)size - 1 < offset)
@@ -729,7 +732,6 @@ static int mmap_zero(struct file *file, struct vm_area_struct *vma)
 #endif
 	if (vma->vm_flags & VM_SHARED)
 		return shmem_zero_setup(vma);
-	vma_set_anonymous(vma);
 	return 0;
 }
 
@@ -787,7 +789,6 @@ static loff_t memory_lseek(struct file *file, loff_t offset, int orig)
 	switch (orig) {
 	case SEEK_CUR:
 		offset += file->f_pos;
-		/* fall through */
 	case SEEK_SET:
 		/* to avoid userland mistaking f_pos=-9 as -EBADF=-9 */
 		if ((unsigned long long)offset >= -MAX_ERRNO) {
@@ -897,6 +898,12 @@ static const struct memdev {
 	 [9] = { "urandom", 0666, &urandom_fops, 0 },
 #ifdef CONFIG_PRINTK
 	[11] = { "kmsg", 0644, &kmsg_fops, 0 },
+#endif
+#ifdef CONFIG_MST_LDO
+	[12] = { "mst_ctrl", 0666, &mst_ctrl_fops, 0 },
+#endif
+#ifdef CONFIG_KNOX_KAP
+	[13] = { "knox_kap", 0664, &knox_kap_fops, 0 },
 #endif
 };
 

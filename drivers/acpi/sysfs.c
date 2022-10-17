@@ -169,8 +169,7 @@ module_param_cb(debug_level, &param_ops_debug_level, &acpi_dbg_level, 0644);
 
 static char trace_method_name[1024];
 
-static int param_set_trace_method_name(const char *val,
-				       const struct kernel_param *kp)
+int param_set_trace_method_name(const char *val, const struct kernel_param *kp)
 {
 	u32 saved_flags = 0;
 	bool is_abs_path = true;
@@ -439,29 +438,18 @@ static ssize_t acpi_data_show(struct file *filp, struct kobject *kobj,
 {
 	struct acpi_data_attr *data_attr;
 	void __iomem *base;
-	ssize_t size;
+	ssize_t rc;
 
 	data_attr = container_of(bin_attr, struct acpi_data_attr, attr);
-	size = data_attr->attr.size;
 
-	if (offset < 0)
-		return -EINVAL;
-
-	if (offset >= size)
-		return 0;
-
-	if (count > size - offset)
-		count = size - offset;
-
-	base = acpi_os_map_iomem(data_attr->addr, size);
+	base = acpi_os_map_memory(data_attr->addr, data_attr->attr.size);
 	if (!base)
 		return -ENOMEM;
+	rc = memory_read_from_buffer(buf, count, &offset, base,
+				     data_attr->attr.size);
+	acpi_os_unmap_memory(base, data_attr->attr.size);
 
-	memcpy_fromio(buf, base + offset, count);
-
-	acpi_os_unmap_iomem(base, size);
-
-	return count;
+	return rc;
 }
 
 static int acpi_bert_data_init(void *th, struct acpi_data_attr *data_attr)
@@ -827,16 +815,22 @@ end:
  * interface:
  *   echo unmask > /sys/firmware/acpi/interrupts/gpe00
  */
-#define ACPI_MASKABLE_GPE_MAX	0x100
-static DECLARE_BITMAP(acpi_masked_gpes_map, ACPI_MASKABLE_GPE_MAX) __initdata;
+
+/*
+ * Currently, the GPE flooding prevention only supports to mask the GPEs
+ * numbered from 00 to 7f.
+ */
+#define ACPI_MASKABLE_GPE_MAX	0x80
+
+static u64 __initdata acpi_masked_gpes;
 
 static int __init acpi_gpe_set_masked_gpes(char *val)
 {
 	u8 gpe;
 
-	if (kstrtou8(val, 0, &gpe))
+	if (kstrtou8(val, 0, &gpe) || gpe > ACPI_MASKABLE_GPE_MAX)
 		return -EINVAL;
-	set_bit(gpe, acpi_masked_gpes_map);
+	acpi_masked_gpes |= ((u64)1<<gpe);
 
 	return 1;
 }
@@ -846,13 +840,17 @@ void __init acpi_gpe_apply_masked_gpes(void)
 {
 	acpi_handle handle;
 	acpi_status status;
-	u16 gpe;
+	u8 gpe;
 
-	for_each_set_bit(gpe, acpi_masked_gpes_map, ACPI_MASKABLE_GPE_MAX) {
-		status = acpi_get_gpe_device(gpe, &handle);
-		if (ACPI_SUCCESS(status)) {
-			pr_info("Masking GPE 0x%x.\n", gpe);
-			(void)acpi_mask_gpe(handle, gpe, TRUE);
+	for (gpe = 0;
+	     gpe < min_t(u8, ACPI_MASKABLE_GPE_MAX, acpi_current_gpe_count);
+	     gpe++) {
+		if (acpi_masked_gpes & ((u64)1<<gpe)) {
+			status = acpi_get_gpe_device(gpe, &handle);
+			if (ACPI_SUCCESS(status)) {
+				pr_info("Masking GPE 0x%x.\n", gpe);
+				(void)acpi_mask_gpe(handle, gpe, TRUE);
+			}
 		}
 	}
 }
@@ -868,12 +866,12 @@ void acpi_irq_stats_init(void)
 	num_gpes = acpi_current_gpe_count;
 	num_counters = num_gpes + ACPI_NUM_FIXED_EVENTS + NUM_COUNTERS_EXTRA;
 
-	all_attrs = kcalloc(num_counters + 1, sizeof(struct attribute *),
+	all_attrs = kzalloc(sizeof(struct attribute *) * (num_counters + 1),
 			    GFP_KERNEL);
 	if (all_attrs == NULL)
 		return;
 
-	all_counters = kcalloc(num_counters, sizeof(struct event_counter),
+	all_counters = kzalloc(sizeof(struct event_counter) * (num_counters),
 			       GFP_KERNEL);
 	if (all_counters == NULL)
 		goto fail;
@@ -882,7 +880,7 @@ void acpi_irq_stats_init(void)
 	if (ACPI_FAILURE(status))
 		goto fail;
 
-	counter_attrs = kcalloc(num_counters, sizeof(struct kobj_attribute),
+	counter_attrs = kzalloc(sizeof(struct kobj_attribute) * (num_counters),
 				GFP_KERNEL);
 	if (counter_attrs == NULL)
 		goto fail;

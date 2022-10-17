@@ -1,9 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * CS2000  --  CIRRUS LOGIC Fractional-N Clock Synthesizer & Clock Multiplier
  *
  * Copyright (C) 2015 Renesas Electronics Corporation
  * Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
@@ -418,7 +421,7 @@ static int cs2000_clk_register(struct cs2000_priv *priv)
 {
 	struct device *dev = priv_to_dev(priv);
 	struct device_node *np = dev->of_node;
-	struct clk_init_data init = {};
+	struct clk_init_data init;
 	const char *name = np->name;
 	static const char *parent_names[CLK_MAX];
 	int ch = 0; /* it uses ch0 only at this point */
@@ -538,7 +541,7 @@ probe_err:
 	return ret;
 }
 
-static int __maybe_unused cs2000_resume(struct device *dev)
+static int cs2000_resume(struct device *dev)
 {
 	struct cs2000_priv *priv = dev_get_drvdata(dev);
 
@@ -546,7 +549,7 @@ static int __maybe_unused cs2000_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops cs2000_pm_ops = {
-	SET_LATE_SYSTEM_SLEEP_PM_OPS(NULL, cs2000_resume)
+	.resume_early	= cs2000_resume,
 };
 
 static struct i2c_driver cs2000_driver = {

@@ -682,11 +682,13 @@ static ssize_t pvr2fb_write(struct fb_info *info, const char *buf,
 
 	nr_pages = (count + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
-	pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	pages = kmalloc(nr_pages * sizeof(struct page *), GFP_KERNEL);
 	if (!pages)
 		return -ENOMEM;
 
-	ret = get_user_pages_fast((unsigned long)buf, nr_pages, true, pages);
+	ret = get_user_pages_unlocked((unsigned long)buf, nr_pages, pages,
+			FOLL_WRITE);
+
 	if (ret < nr_pages) {
 		nr_pages = ret;
 		ret = -EINVAL;
@@ -1026,8 +1028,6 @@ static int __init pvr2fb_setup(char *options)
 
 	if (!options || !*options)
 		return 0;
-
-	cable_arg[0] = output_arg[0] = 0;
 
 	while ((this_opt = strsep(&options, ","))) {
 		if (!*this_opt)

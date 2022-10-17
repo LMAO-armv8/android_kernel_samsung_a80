@@ -115,7 +115,7 @@ static int ql_sem_spinlock(struct ql3_adapter *qdev,
 		value = readl(&port_regs->CommonRegs.semaphoreReg);
 		if ((value & (sem_mask >> 16)) == sem_bits)
 			return 0;
-		mdelay(1000);
+		ssleep(1);
 	} while (--seconds);
 	return -1;
 }
@@ -155,7 +155,7 @@ static int ql_wait_for_drvr_lock(struct ql3_adapter *qdev)
 				      "driver lock acquired\n");
 			return 1;
 		}
-		mdelay(1000);
+		ssleep(1);
 	} while (++i < 10);
 
 	netdev_err(qdev->ndev, "Timed out waiting for driver lock...\n");
@@ -1856,9 +1856,8 @@ static void ql_update_small_bufq_prod_index(struct ql3_adapter *qdev)
 			qdev->small_buf_release_cnt -= 8;
 		}
 		wmb();
-		writel_relaxed(qdev->small_buf_q_producer_index,
-			       &port_regs->CommonRegs.rxSmallQProducerIndex);
-		mmiowb();
+		writel(qdev->small_buf_q_producer_index,
+			&port_regs->CommonRegs.rxSmallQProducerIndex);
 	}
 }
 
@@ -3292,7 +3291,7 @@ static int ql_adapter_reset(struct ql3_adapter *qdev)
 		if ((value & ISP_CONTROL_SR) == 0)
 			break;
 
-		mdelay(1000);
+		ssleep(1);
 	} while ((--max_wait_time));
 
 	/*
@@ -3328,7 +3327,7 @@ static int ql_adapter_reset(struct ql3_adapter *qdev)
 						   ispControlStatus);
 			if ((value & ISP_CONTROL_FSR) == 0)
 				break;
-			mdelay(1000);
+			ssleep(1);
 		} while ((--max_wait_time));
 	}
 	if (max_wait_time == 0)
@@ -3496,18 +3495,19 @@ static int ql_adapter_up(struct ql3_adapter *qdev)
 
 	spin_lock_irqsave(&qdev->hw_lock, hw_flags);
 
-	if (!ql_wait_for_drvr_lock(qdev)) {
+	err = ql_wait_for_drvr_lock(qdev);
+	if (err) {
+		err = ql_adapter_initialize(qdev);
+		if (err) {
+			netdev_err(ndev, "Unable to initialize adapter\n");
+			goto err_init;
+		}
+		netdev_err(ndev, "Releasing driver lock\n");
+		ql_sem_unlock(qdev, QL_DRVR_SEM_MASK);
+	} else {
 		netdev_err(ndev, "Could not acquire driver lock\n");
-		err = -ENODEV;
 		goto err_lock;
 	}
-
-	err = ql_adapter_initialize(qdev);
-	if (err) {
-		netdev_err(ndev, "Unable to initialize adapter\n");
-		goto err_init;
-	}
-	ql_sem_unlock(qdev, QL_DRVR_SEM_MASK);
 
 	spin_unlock_irqrestore(&qdev->hw_lock, hw_flags);
 
@@ -3630,8 +3630,7 @@ static void ql_reset_work(struct work_struct *work)
 		qdev->mem_map_registers;
 	unsigned long hw_flags;
 
-	if (test_bit(QL_RESET_PER_SCSI, &qdev->flags) ||
-	    test_bit(QL_RESET_START, &qdev->flags)) {
+	if (test_bit((QL_RESET_PER_SCSI | QL_RESET_START), &qdev->flags)) {
 		clear_bit(QL_LINK_MASTER, &qdev->flags);
 
 		/*
@@ -3749,9 +3748,9 @@ static void ql_get_board_info(struct ql3_adapter *qdev)
 	qdev->pci_slot = (u8) PCI_SLOT(qdev->pdev->devfn);
 }
 
-static void ql3xxx_timer(struct timer_list *t)
+static void ql3xxx_timer(unsigned long ptr)
 {
-	struct ql3_adapter *qdev = from_timer(qdev, t, adapter_timer);
+	struct ql3_adapter *qdev = (struct ql3_adapter *)ptr;
 	queue_delayed_work(qdev->workqueue, &qdev->link_state_work, 0);
 }
 
@@ -3891,8 +3890,10 @@ static int ql3xxx_probe(struct pci_dev *pdev,
 	INIT_DELAYED_WORK(&qdev->tx_timeout_work, ql_tx_timeout_work);
 	INIT_DELAYED_WORK(&qdev->link_state_work, ql_link_state_machine_work);
 
-	timer_setup(&qdev->adapter_timer, ql3xxx_timer, 0);
+	init_timer(&qdev->adapter_timer);
+	qdev->adapter_timer.function = ql3xxx_timer;
 	qdev->adapter_timer.expires = jiffies + HZ * 2;	/* two second delay */
+	qdev->adapter_timer.data = (unsigned long)qdev;
 
 	if (!cards_found) {
 		pr_alert("%s\n", DRV_STRING);

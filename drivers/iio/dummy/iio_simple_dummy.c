@@ -26,7 +26,7 @@
 #include <linux/iio/sw_device.h>
 #include "iio_simple_dummy.h"
 
-static const struct config_item_type iio_dummy_type = {
+static struct config_item_type iio_dummy_type = {
 	.ct_owner = THIS_MODULE,
 };
 
@@ -519,6 +519,7 @@ static int iio_dummy_write_raw(struct iio_dev *indio_dev,
  * Device type specific information.
  */
 static const struct iio_info iio_dummy_info = {
+	.driver_module = THIS_MODULE,
 	.read_raw = &iio_dummy_read_raw,
 	.write_raw = &iio_dummy_write_raw,
 #ifdef CONFIG_IIO_SIMPLE_DUMMY_EVENTS
@@ -571,9 +572,10 @@ static struct iio_sw_device *iio_dummy_probe(const char *name)
 	struct iio_sw_device *swd;
 
 	swd = kzalloc(sizeof(*swd), GFP_KERNEL);
-	if (!swd)
-		return ERR_PTR(-ENOMEM);
-
+	if (!swd) {
+		ret = -ENOMEM;
+		goto error_kzalloc;
+	}
 	/*
 	 * Allocate an IIO device.
 	 *
@@ -585,7 +587,7 @@ static struct iio_sw_device *iio_dummy_probe(const char *name)
 	indio_dev = iio_device_alloc(sizeof(*st));
 	if (!indio_dev) {
 		ret = -ENOMEM;
-		goto error_free_swd;
+		goto error_ret;
 	}
 
 	st = iio_priv(indio_dev);
@@ -616,10 +618,6 @@ static struct iio_sw_device *iio_dummy_probe(const char *name)
 	 *    indio_dev->name = spi_get_device_id(spi)->name;
 	 */
 	indio_dev->name = kstrdup(name, GFP_KERNEL);
-	if (!indio_dev->name) {
-		ret = -ENOMEM;
-		goto error_free_device;
-	}
 
 	/* Provide description of available channels */
 	indio_dev->channels = iio_dummy_channels;
@@ -636,7 +634,7 @@ static struct iio_sw_device *iio_dummy_probe(const char *name)
 
 	ret = iio_simple_dummy_events_register(indio_dev);
 	if (ret < 0)
-		goto error_free_name;
+		goto error_free_device;
 
 	ret = iio_simple_dummy_configure_buffer(indio_dev);
 	if (ret < 0)
@@ -653,12 +651,11 @@ error_unconfigure_buffer:
 	iio_simple_dummy_unconfigure_buffer(indio_dev);
 error_unregister_events:
 	iio_simple_dummy_events_unregister(indio_dev);
-error_free_name:
-	kfree(indio_dev->name);
 error_free_device:
 	iio_device_free(indio_dev);
-error_free_swd:
+error_ret:
 	kfree(swd);
+error_kzalloc:
 	return ERR_PTR(ret);
 }
 

@@ -1,9 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Driver core for Samsung SoC onboard UARTs.
  *
  * Ben Dooks, Copyright (c) 2003-2008 Simtec Electronics
  *	http://armlinux.simtec.co.uk/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
 */
 
 /* Hote on 2410 error handling
@@ -238,7 +241,8 @@ static void enable_tx_dma(struct s3c24xx_uart_port *ourport)
 	/* Enable tx dma mode */
 	ucon = rd_regl(port, S3C2410_UCON);
 	ucon &= ~(S3C64XX_UCON_TXBURST_MASK | S3C64XX_UCON_TXMODE_MASK);
-	ucon |= S3C64XX_UCON_TXBURST_1;
+	ucon |= (dma_get_cache_alignment() >= 16) ?
+		S3C64XX_UCON_TXBURST_16 : S3C64XX_UCON_TXBURST_1;
 	ucon |= S3C64XX_UCON_TXMODE_DMA;
 	wr_regl(port,  S3C2410_UCON, ucon);
 
@@ -511,7 +515,7 @@ static void enable_rx_dma(struct s3c24xx_uart_port *ourport)
 			S3C64XX_UCON_DMASUS_EN |
 			S3C64XX_UCON_TIMEOUT_EN |
 			S3C64XX_UCON_RXMODE_MASK);
-	ucon |= S3C64XX_UCON_RXBURST_1 |
+	ucon |= S3C64XX_UCON_RXBURST_16 |
 			0xf << S3C64XX_UCON_TIMEOUT_SHIFT |
 			S3C64XX_UCON_EMPTYINT_EN |
 			S3C64XX_UCON_TIMEOUT_EN |
@@ -760,8 +764,11 @@ static irqreturn_t s3c24xx_serial_tx_chars(int irq, void *id)
 		goto out;
 	}
 
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS) {
+		spin_unlock(&port->lock);
 		uart_write_wakeup(port);
+		spin_lock(&port->lock);
+	}
 
 	if (uart_circ_empty(xmit))
 		s3c24xx_serial_stop_tx(port);
@@ -852,8 +859,6 @@ static void s3c24xx_serial_break_ctl(struct uart_port *port, int break_state)
 static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 {
 	struct s3c24xx_uart_dma	*dma = p->dma;
-	struct dma_slave_caps dma_caps;
-	const char *reason = NULL;
 	int ret;
 
 	/* Default slave configuration parameters */
@@ -869,35 +874,15 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 
 	dma->rx_chan = dma_request_chan(p->port.dev, "rx");
 
-	if (IS_ERR(dma->rx_chan)) {
-		reason = "DMA RX channel request failed";
-		ret = PTR_ERR(dma->rx_chan);
-		goto err_warn;
-	}
-
-	ret = dma_get_slave_caps(dma->rx_chan, &dma_caps);
-	if (ret < 0 ||
-	    dma_caps.residue_granularity < DMA_RESIDUE_GRANULARITY_BURST) {
-		reason = "insufficient DMA RX engine capabilities";
-		ret = -EOPNOTSUPP;
-		goto err_release_rx;
-	}
+	if (IS_ERR(dma->rx_chan))
+		return PTR_ERR(dma->rx_chan);
 
 	dmaengine_slave_config(dma->rx_chan, &dma->rx_conf);
 
 	dma->tx_chan = dma_request_chan(p->port.dev, "tx");
 	if (IS_ERR(dma->tx_chan)) {
-		reason = "DMA TX channel request failed";
 		ret = PTR_ERR(dma->tx_chan);
 		goto err_release_rx;
-	}
-
-	ret = dma_get_slave_caps(dma->tx_chan, &dma_caps);
-	if (ret < 0 ||
-	    dma_caps.residue_granularity < DMA_RESIDUE_GRANULARITY_BURST) {
-		reason = "insufficient DMA TX engine capabilities";
-		ret = -EOPNOTSUPP;
-		goto err_release_tx;
 	}
 
 	dmaengine_slave_config(dma->tx_chan, &dma->tx_conf);
@@ -914,7 +899,6 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	dma->rx_addr = dma_map_single(p->port.dev, dma->rx_buf,
 				dma->rx_size, DMA_FROM_DEVICE);
 	if (dma_mapping_error(p->port.dev, dma->rx_addr)) {
-		reason = "DMA mapping error for RX buffer";
 		ret = -EIO;
 		goto err_free_rx;
 	}
@@ -923,7 +907,6 @@ static int s3c24xx_serial_request_dma(struct s3c24xx_uart_port *p)
 	dma->tx_addr = dma_map_single(p->port.dev, p->port.state->xmit.buf,
 				UART_XMIT_SIZE, DMA_TO_DEVICE);
 	if (dma_mapping_error(p->port.dev, dma->tx_addr)) {
-		reason = "DMA mapping error for TX buffer";
 		ret = -EIO;
 		goto err_unmap_rx;
 	}
@@ -939,9 +922,6 @@ err_release_tx:
 	dma_release_channel(dma->tx_chan);
 err_release_rx:
 	dma_release_channel(dma->rx_chan);
-err_warn:
-	if (reason)
-		dev_warn(p->port.dev, "%s, DMA will not be used\n", reason);
 	return ret;
 }
 
@@ -1060,6 +1040,8 @@ static int s3c64xx_serial_startup(struct uart_port *port)
 	if (ourport->dma) {
 		ret = s3c24xx_serial_request_dma(ourport);
 		if (ret < 0) {
+			dev_warn(port->dev,
+				 "DMA request failed, DMA will not be used\n");
 			devm_kfree(port->dev, ourport->dma);
 			ourport->dma = NULL;
 		}
@@ -1183,14 +1165,14 @@ static unsigned int s3c24xx_serial_getclk(struct s3c24xx_uart_port *ourport,
 	struct s3c24xx_uart_info *info = ourport->info;
 	struct clk *clk;
 	unsigned long rate;
-	unsigned int cnt, baud, quot, best_quot = 0;
+	unsigned int cnt, baud, quot, clk_sel, best_quot = 0;
 	char clkname[MAX_CLK_NAME_LENGTH];
 	int calc_deviation, deviation = (1 << 30) - 1;
 
+	clk_sel = (ourport->cfg->clk_sel) ? ourport->cfg->clk_sel :
+			ourport->info->def_clk_sel;
 	for (cnt = 0; cnt < info->num_clks; cnt++) {
-		/* Keep selected clock if provided */
-		if (ourport->cfg->clk_sel &&
-			!(ourport->cfg->clk_sel & (1 << cnt)))
+		if (!(clk_sel & (1 << cnt)))
 			continue;
 
 		sprintf(clkname, "clk_uart_baud%d", cnt);
@@ -1751,11 +1733,9 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 		ourport->tx_irq = ret + 1;
 	}
 
-	if (!s3c24xx_serial_has_interrupt_mask(port)) {
-		ret = platform_get_irq(platdev, 1);
-		if (ret > 0)
-			ourport->tx_irq = ret;
-	}
+	ret = platform_get_irq(platdev, 1);
+	if (ret > 0)
+		ourport->tx_irq = ret;
 	/*
 	 * DMA is currently supported only on DT platforms, if DMA properties
 	 * are specified.

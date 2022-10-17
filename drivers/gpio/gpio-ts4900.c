@@ -1,7 +1,7 @@
 /*
  * Digital I/O driver for Technologic Systems I2C FPGA Core
  *
- * Copyright (C) 2015, 2018 Technologic Systems
+ * Copyright (C) 2015 Technologic Systems
  * Copyright (C) 2016 Savoir-Faire Linux
  *
  * This program is free software; you can redistribute it and/or
@@ -52,32 +52,18 @@ static int ts4900_gpio_direction_input(struct gpio_chip *chip,
 {
 	struct ts4900_gpio_priv *priv = gpiochip_get_data(chip);
 
-	/* Only clear the OE bit here, requires a RMW. Prevents potential issue
-	 * with OE and data getting to the physical pin at different times.
+	/*
+	 * This will clear the output enable bit, the other bits are
+	 * dontcare when this is cleared
 	 */
-	return regmap_update_bits(priv->regmap, offset, TS4900_GPIO_OE, 0);
+	return regmap_write(priv->regmap, offset, 0);
 }
 
 static int ts4900_gpio_direction_output(struct gpio_chip *chip,
 					unsigned int offset, int value)
 {
 	struct ts4900_gpio_priv *priv = gpiochip_get_data(chip);
-	unsigned int reg;
 	int ret;
-
-	/* If changing from an input to an output, we need to first set the
-	 * proper data bit to what is requested and then set OE bit. This
-	 * prevents a glitch that can occur on the IO line
-	 */
-	regmap_read(priv->regmap, offset, &reg);
-	if (!(reg & TS4900_GPIO_OE)) {
-		if (value)
-			reg = TS4900_GPIO_OUT;
-		else
-			reg &= ~TS4900_GPIO_OUT;
-
-		regmap_write(priv->regmap, offset, reg);
-	}
 
 	if (value)
 		ret = regmap_write(priv->regmap, offset, TS4900_GPIO_OE |
@@ -142,9 +128,14 @@ MODULE_DEVICE_TABLE(of, ts4900_gpio_of_match_table);
 static int ts4900_gpio_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
+	const struct of_device_id *match;
 	struct ts4900_gpio_priv *priv;
 	u32 ngpio;
 	int ret;
+
+	match = of_match_device(ts4900_gpio_of_match_table, &client->dev);
+	if (!match)
+		return -EINVAL;
 
 	if (of_property_read_u32(client->dev.of_node, "ngpios", &ngpio))
 		ngpio = DEFAULT_PIN_NUMBER;
@@ -157,7 +148,7 @@ static int ts4900_gpio_probe(struct i2c_client *client,
 	priv->gpio_chip.label = "ts4900-gpio";
 	priv->gpio_chip.ngpio = ngpio;
 	priv->gpio_chip.parent = &client->dev;
-	priv->input_bit = (uintptr_t)of_device_get_match_data(&client->dev);
+	priv->input_bit = (uintptr_t)match->data;
 
 	priv->regmap = devm_regmap_init_i2c(client, &ts4900_regmap_config);
 	if (IS_ERR(priv->regmap)) {

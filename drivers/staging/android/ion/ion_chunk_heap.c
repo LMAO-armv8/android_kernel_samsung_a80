@@ -1,8 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/staging/android/ion/ion_chunk_heap.c
  *
  * Copyright (C) 2012 Google, Inc.
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
  */
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -91,6 +100,10 @@ static void ion_chunk_heap_free(struct ion_buffer *buffer)
 
 	ion_heap_buffer_zero(buffer);
 
+	if (ion_buffer_cached(buffer))
+		dma_sync_sg_for_device(NULL, table->sgl, table->nents,
+				       DMA_BIDIRECTIONAL);
+
 	for_each_sg(table->sgl, sg, table->nents, i) {
 		gen_pool_free(chunk_heap->pool, page_to_phys(sg_page(sg)),
 			      sg->length);
@@ -117,6 +130,8 @@ struct ion_heap *ion_chunk_heap_create(struct ion_platform_heap *heap_data)
 
 	page = pfn_to_page(PFN_DOWN(heap_data->base));
 	size = heap_data->size;
+
+	ion_pages_sync_for_device(NULL, page, size, DMA_BIDIRECTIONAL);
 
 	ret = ion_heap_pages_zero(page, size, pgprot_writecombine(PAGE_KERNEL));
 	if (ret)
@@ -150,4 +165,3 @@ error_gen_pool_create:
 	kfree(chunk_heap);
 	return ERR_PTR(ret);
 }
-

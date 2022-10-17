@@ -139,17 +139,12 @@ static int apply_constraint(struct dev_pm_qos_request *req,
 
 	switch(req->type) {
 	case DEV_PM_QOS_RESUME_LATENCY:
-		if (WARN_ON(action != PM_QOS_REMOVE_REQ && value < 0))
-			value = 0;
-
 		ret = pm_qos_update_target(&qos->resume_latency,
-					   &req->data.pnode, action, value,
-					   true);
+					   &req->data.pnode, action, value);
 		break;
 	case DEV_PM_QOS_LATENCY_TOLERANCE:
 		ret = pm_qos_update_target(&qos->latency_tolerance,
-					   &req->data.pnode, action, value,
-					   true);
+					   &req->data.pnode, action, value);
 		if (ret) {
 			value = pm_qos_read_value(&qos->latency_tolerance);
 			req->dev->power.set_latency_tolerance(req->dev, value);
@@ -194,7 +189,7 @@ static int dev_pm_qos_constraints_allocate(struct device *dev)
 	plist_head_init(&c->list);
 	c->target_value = PM_QOS_RESUME_LATENCY_DEFAULT_VALUE;
 	c->default_value = PM_QOS_RESUME_LATENCY_DEFAULT_VALUE;
-	c->no_constraint_value = PM_QOS_RESUME_LATENCY_NO_CONSTRAINT;
+	c->no_constraint_value = PM_QOS_RESUME_LATENCY_DEFAULT_VALUE;
 	c->type = PM_QOS_MIN;
 	c->notifiers = n;
 

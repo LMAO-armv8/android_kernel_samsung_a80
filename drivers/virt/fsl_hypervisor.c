@@ -157,7 +157,7 @@ static long ioctl_memcpy(struct fsl_hv_ioctl_memcpy __user *p)
 
 	unsigned int i;
 	long ret = 0;
-	int num_pinned = 0; /* return value from get_user_pages_fast() */
+	int num_pinned; /* return value from get_user_pages() */
 	phys_addr_t remote_paddr; /* The next address in the remote buffer */
 	uint32_t count; /* The number of bytes left to copy */
 
@@ -174,7 +174,7 @@ static long ioctl_memcpy(struct fsl_hv_ioctl_memcpy __user *p)
 		return -EINVAL;
 
 	/*
-	 * The array of pages returned by get_user_pages_fast() covers only
+	 * The array of pages returned by get_user_pages() covers only
 	 * page-aligned memory.  Since the user buffer is probably not
 	 * page-aligned, we need to handle the discrepancy.
 	 *
@@ -224,9 +224,9 @@ static long ioctl_memcpy(struct fsl_hv_ioctl_memcpy __user *p)
 
 	/*
 	 * 'pages' is an array of struct page pointers that's initialized by
-	 * get_user_pages_fast().
+	 * get_user_pages().
 	 */
-	pages = kcalloc(num_pages, sizeof(struct page *), GFP_KERNEL);
+	pages = kzalloc(num_pages * sizeof(struct page *), GFP_KERNEL);
 	if (!pages) {
 		pr_debug("fsl-hv: could not allocate page list\n");
 		return -ENOMEM;
@@ -241,15 +241,16 @@ static long ioctl_memcpy(struct fsl_hv_ioctl_memcpy __user *p)
 	if (!sg_list_unaligned) {
 		pr_debug("fsl-hv: could not allocate S/G list\n");
 		ret = -ENOMEM;
-		goto free_pages;
+		goto exit;
 	}
 	sg_list = PTR_ALIGN(sg_list_unaligned, sizeof(struct fh_sg_list));
 
 	/* Get the physical addresses of the source buffer */
-	num_pinned = get_user_pages_fast(param.local_vaddr - lb_offset,
-		num_pages, param.source != -1, pages);
+	num_pinned = get_user_pages_unlocked(param.local_vaddr - lb_offset,
+		num_pages, pages, (param.source == -1) ? 0 : FOLL_WRITE);
 
 	if (num_pinned != num_pages) {
+		/* get_user_pages() failed */
 		pr_debug("fsl-hv: could not lock source buffer\n");
 		ret = (num_pinned < 0) ? num_pinned : -EFAULT;
 		goto exit;
@@ -291,13 +292,13 @@ static long ioctl_memcpy(struct fsl_hv_ioctl_memcpy __user *p)
 		virt_to_phys(sg_list), num_pages);
 
 exit:
-	if (pages && (num_pinned > 0)) {
-		for (i = 0; i < num_pinned; i++)
-			put_page(pages[i]);
+	if (pages) {
+		for (i = 0; i < num_pages; i++)
+			if (pages[i])
+				put_page(pages[i]);
 	}
 
 	kfree(sg_list_unaligned);
-free_pages:
 	kfree(pages);
 
 	if (!ret)
@@ -567,16 +568,16 @@ static irqreturn_t fsl_hv_state_change_isr(int irq, void *data)
 /*
  * Returns a bitmask indicating whether a read will block
  */
-static __poll_t fsl_hv_poll(struct file *filp, struct poll_table_struct *p)
+static unsigned int fsl_hv_poll(struct file *filp, struct poll_table_struct *p)
 {
 	struct doorbell_queue *dbq = filp->private_data;
 	unsigned long flags;
-	__poll_t mask;
+	unsigned int mask;
 
 	spin_lock_irqsave(&dbq->lock, flags);
 
 	poll_wait(filp, &dbq->wait, p);
-	mask = (dbq->head == dbq->tail) ? 0 : (EPOLLIN | EPOLLRDNORM);
+	mask = (dbq->head == dbq->tail) ? 0 : (POLLIN | POLLRDNORM);
 
 	spin_unlock_irqrestore(&dbq->lock, flags);
 

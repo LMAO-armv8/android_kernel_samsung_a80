@@ -591,11 +591,11 @@ static irqreturn_t wil6210_irq_misc(int irq, void *cookie)
 
 	if (isr & BIT_DMA_EP_MISC_ICR_HALP) {
 		isr &= ~BIT_DMA_EP_MISC_ICR_HALP;
-		if (wil->halp.handle_icr) {
+		if (atomic_read(&wil->halp.handle_icr)) {
 			/* no need to handle HALP ICRs until next vote */
-			wil->halp.handle_icr = false;
+			atomic_set(&wil->halp.handle_icr, 0);
 			wil_dbg_irq(wil, "irq_misc: HALP IRQ invoked\n");
-			wil6210_mask_halp(wil);
+			wil6210_mask_irq_misc(wil, true);
 			complete(&wil->halp.comp);
 		}
 	}

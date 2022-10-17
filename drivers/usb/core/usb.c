@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/usb/core/usb.c
  *
@@ -14,6 +13,7 @@
  * (C) Copyright Greg Kroah-Hartman 2002-2003
  *
  * Released under the GPLv2 only.
+ * SPDX-License-Identifier: GPL-2.0
  *
  * NOTE! This is not actually a driver at all, rather this is
  * just a collection of helper routines that implement the
@@ -647,7 +647,8 @@ struct usb_device *usb_alloc_dev(struct usb_device *parent,
 			raw_port = usb_hcd_find_raw_port_number(usb_hcd,
 				port1);
 		}
-		dev->dev.of_node = usb_of_get_device_node(parent, raw_port);
+		dev->dev.of_node = usb_of_get_child_node(parent->dev.of_node,
+				raw_port);
 
 		/* hub driver sets up TT records */
 	}
@@ -851,7 +852,7 @@ usb_get_sec_event_ring_phys_addr(struct usb_device *dev,
 
 	return usb_hcd_get_sec_event_ring_phys_addr(dev, intr_num, dma);
 }
-EXPORT_SYMBOL_GPL(usb_get_sec_event_ring_phys_addr);
+EXPORT_SYMBOL(usb_get_sec_event_ring_phys_addr);
 
 phys_addr_t usb_get_xfer_ring_phys_addr(struct usb_device *dev,
 	struct usb_host_endpoint *ep, dma_addr_t *dma)
@@ -861,12 +862,8 @@ phys_addr_t usb_get_xfer_ring_phys_addr(struct usb_device *dev,
 
 	return usb_hcd_get_xfer_ring_phys_addr(dev, ep, dma);
 }
-EXPORT_SYMBOL_GPL(usb_get_xfer_ring_phys_addr);
+EXPORT_SYMBOL(usb_get_xfer_ring_phys_addr);
 
-/**
- * usb_get_controller_id - returns the host controller id.
- * @dev: the device whose host controller id is being queried.
- */
 int usb_get_controller_id(struct usb_device *dev)
 {
 	if (dev->state == USB_STATE_NOTATTACHED)
@@ -874,13 +871,13 @@ int usb_get_controller_id(struct usb_device *dev)
 
 	return usb_hcd_get_controller_id(dev);
 }
-EXPORT_SYMBOL_GPL(usb_get_controller_id);
+EXPORT_SYMBOL(usb_get_controller_id);
 
 int usb_stop_endpoint(struct usb_device *dev, struct usb_host_endpoint *ep)
 {
 	return usb_hcd_stop_endpoint(dev, ep);
 }
-EXPORT_SYMBOL_GPL(usb_stop_endpoint);
+EXPORT_SYMBOL(usb_stop_endpoint);
 
 /*-------------------------------------------------------------------*/
 /*
@@ -1226,16 +1223,30 @@ static struct notifier_block usb_bus_nb = {
 struct dentry *usb_debug_root;
 EXPORT_SYMBOL_GPL(usb_debug_root);
 
-static void usb_debugfs_init(void)
+static struct dentry *usb_debug_devices;
+
+static int usb_debugfs_init(void)
 {
 	usb_debug_root = debugfs_create_dir("usb", NULL);
-	debugfs_create_file("devices", 0444, usb_debug_root, NULL,
-			    &usbfs_devices_fops);
+	if (!usb_debug_root)
+		return -ENOENT;
+
+	usb_debug_devices = debugfs_create_file("devices", 0444,
+						usb_debug_root, NULL,
+						&usbfs_devices_fops);
+	if (!usb_debug_devices) {
+		debugfs_remove(usb_debug_root);
+		usb_debug_root = NULL;
+		return -ENOENT;
+	}
+
+	return 0;
 }
 
 static void usb_debugfs_cleanup(void)
 {
-	debugfs_remove_recursive(usb_debug_root);
+	debugfs_remove(usb_debug_devices);
+	debugfs_remove(usb_debug_root);
 }
 
 /*
@@ -1250,7 +1261,9 @@ static int __init usb_init(void)
 	}
 	usb_init_pool_max();
 
-	usb_debugfs_init();
+	retval = usb_debugfs_init();
+	if (retval)
+		goto out;
 
 	usb_acpi_register();
 	retval = bus_register(&usb_bus_type);
@@ -1302,7 +1315,6 @@ static void __exit usb_exit(void)
 	if (usb_disabled())
 		return;
 
-	usb_release_quirk_list();
 	usb_deregister_device_driver(&usb_generic_driver);
 	usb_major_cleanup();
 	usb_deregister(&usbfs_driver);

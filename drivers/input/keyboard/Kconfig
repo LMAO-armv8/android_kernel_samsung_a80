@@ -157,6 +157,15 @@ config KEYBOARD_QT2160
 	  This driver can also be built as a module. If so, the module
 	  will be called qt2160.
 
+config KEYBOARD_BFIN
+	tristate "Blackfin BF54x keypad support"
+	depends on (BF54x && !BF544)
+	help
+	  Say Y here if you want to use the BF54x keypad.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called bf54x-keys.
+
 config KEYBOARD_CLPS711X
 	tristate "CLPS711X Keypad support"
 	depends on OF_GPIO && (ARCH_CLPS711X || COMPILE_TEST)
@@ -201,6 +210,66 @@ config KEYBOARD_EP93XX
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called ep93xx_keypad.
+
+config SENSORS_HALL
+	bool "HALL"
+	default n
+	help
+	  Say Y here to enable the HALL
+	  and send a event when HALL state is changed.
+	  Active gpio state is low and active event value is 0.
+
+	  If unsure, say N.
+
+config CERTIFY_HALL
+	tristate "Enable CERTIFY HALL"
+	default n
+	help
+	  Say Y here to enable the CERTIFY HALL
+	  and send a event when CERTIFY HALL state is changed.
+	  Active gpio state is low and active event value is 0.
+
+	  If unsure, say N.
+
+config SUPPORT_HALL_ABNORMAL_TEST
+	bool "Enable HALL abnormal test"
+	depends on SEC_FACTORY
+	help
+	  Say Y here to support hall ic abnormal test.
+	  This enables a node to read how many hall ic is enabled,
+	  and send uevent when hall ic state has changed.
+
+	  If unsure, say N.
+
+config FOLDER_HALL
+	bool "FOLDER HALL"
+	default n
+	help
+	  Enable FOLDER Hall Feature
+
+config SLIDING_UP_HALL
+	bool "SLIDING UP HALL"
+	default n
+	help
+	  Enable SLIDING UP Hall Feature
+
+config SLIDING_DOWN_HALL
+	bool "SLIDING DOWN HALL"
+	default n
+	help
+	  Enable SLIDING DOWN Hall Feature
+
+config DW772X
+	bool "DW772X"
+	default n
+	help
+	  Enable DW772X Digtial Hall Feature
+
+config DW772X_REVERSE
+	bool "DW772X_REVERSE"
+	default n
+	help
+	  Enable DW772X Digtial Hall Feature (REVERSE SCL/SDA)
 
 config KEYBOARD_GPIO
 	tristate "GPIO Buttons"
@@ -721,7 +790,7 @@ config KEYBOARD_CROS_EC
 	help
 	  Say Y here to enable the matrix keyboard used by ChromeOS devices
 	  and implemented on the ChromeOS EC. You must enable one bus option
-	  (CROS_EC_I2C or CROS_EC_SPI) to use this.
+	  (MFD_CROS_EC_I2C or MFD_CROS_EC_SPI) to use this.
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called cros_ec_keyb.
@@ -746,14 +815,5 @@ config KEYBOARD_BCM
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called bcm-keypad.
-
-config KEYBOARD_MTK_PMIC
-	tristate "MediaTek PMIC keys support"
-	depends on MFD_MT6397
-	help
-	  Say Y here if you want to use the pmic keys (powerkey/homekey).
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called pmic-keys.
 
 endif

@@ -387,7 +387,8 @@ static void dsicm_get_resolution(struct omap_dss_device *dssdev,
 static ssize_t dsicm_num_errors_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	struct omap_dss_device *in = ddata->in;
 	u8 errors = 0;
 	int r;
@@ -412,13 +413,14 @@ static ssize_t dsicm_num_errors_show(struct device *dev,
 	if (r)
 		return r;
 
-	return sysfs_emit(buf, "%d\n", errors);
+	return snprintf(buf, PAGE_SIZE, "%d\n", errors);
 }
 
 static ssize_t dsicm_hw_revision_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	struct omap_dss_device *in = ddata->in;
 	u8 id1, id2, id3;
 	int r;
@@ -442,14 +444,15 @@ static ssize_t dsicm_hw_revision_show(struct device *dev,
 	if (r)
 		return r;
 
-	return sysfs_emit(buf, "%02x.%02x.%02x\n", id1, id2, id3);
+	return snprintf(buf, PAGE_SIZE, "%02x.%02x.%02x\n", id1, id2, id3);
 }
 
 static ssize_t dsicm_store_ulps(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t count)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	struct omap_dss_device *in = ddata->in;
 	unsigned long t;
 	int r;
@@ -483,21 +486,23 @@ static ssize_t dsicm_show_ulps(struct device *dev,
 		struct device_attribute *attr,
 		char *buf)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	unsigned t;
 
 	mutex_lock(&ddata->lock);
 	t = ddata->ulps_enabled;
 	mutex_unlock(&ddata->lock);
 
-	return sysfs_emit(buf, "%u\n", t);
+	return snprintf(buf, PAGE_SIZE, "%u\n", t);
 }
 
 static ssize_t dsicm_store_ulps_timeout(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t count)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	struct omap_dss_device *in = ddata->in;
 	unsigned long t;
 	int r;
@@ -528,14 +533,15 @@ static ssize_t dsicm_show_ulps_timeout(struct device *dev,
 		struct device_attribute *attr,
 		char *buf)
 {
-	struct panel_drv_data *ddata = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct panel_drv_data *ddata = platform_get_drvdata(pdev);
 	unsigned t;
 
 	mutex_lock(&ddata->lock);
 	t = ddata->ulps_timeout;
 	mutex_unlock(&ddata->lock);
 
-	return sysfs_emit(buf, "%u\n", t);
+	return snprintf(buf, PAGE_SIZE, "%u\n", t);
 }
 
 static DEVICE_ATTR(num_dsi_errors, S_IRUGO, dsicm_num_errors_show, NULL);

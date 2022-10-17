@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: BSD-3-Clause
 /*
  * Loopback test application
  *
@@ -664,7 +663,7 @@ static int open_poll_files(struct loopback_test *t)
 			goto err;
 		}
 		read(t->fds[fds_idx].fd, &dummy, 1);
-		t->fds[fds_idx].events = POLLERR | POLLPRI;
+		t->fds[fds_idx].events = POLLERR|POLLPRI;
 		t->fds[fds_idx].revents = 0;
 		fds_idx++;
 	}

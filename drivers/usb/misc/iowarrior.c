@@ -1,10 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  Native support for the I/O-Warrior USB devices
  *
- *  Copyright (c) 2003-2005, 2020  Code Mercenaries GmbH
- *  written by Christian Lucht <lucht@codemercs.com> and
- *  Christoph Jung <jung@codemercs.com>
+ *  Copyright (c) 2003-2005  Code Mercenaries GmbH
+ *  written by Christian Lucht <lucht@codemercs.com>
  *
  *  based on
 
@@ -90,6 +88,7 @@ struct iowarrior {
 	atomic_t write_busy;		/* number of write-urbs submitted */
 	atomic_t read_idx;
 	atomic_t intr_idx;
+	spinlock_t intr_idx_lock;	/* protects intr_idx */
 	atomic_t overflow_flag;		/* signals an index 'rollover' */
 	int present;			/* this is 1 as long as the device is connected */
 	int opened;			/* this is 1 if the device is currently open */
@@ -103,6 +102,10 @@ struct iowarrior {
 /*    globals   */
 /*--------------*/
 
+/*
+ *  USB spec identifies 5 second timeouts.
+ */
+#define GET_TIMEOUT 5
 #define USB_REQ_GET_REPORT  0x01
 //#if 0
 static int usb_get_report(struct usb_device *dev,
@@ -114,7 +117,7 @@ static int usb_get_report(struct usb_device *dev,
 			       USB_DIR_IN | USB_TYPE_CLASS |
 			       USB_RECIP_INTERFACE, (type << 8) + id,
 			       inter->desc.bInterfaceNumber, buf, size,
-			       USB_CTRL_GET_TIMEOUT);
+			       GET_TIMEOUT*HZ);
 }
 //#endif
 
@@ -129,7 +132,7 @@ static int usb_set_report(struct usb_interface *intf, unsigned char type,
 			       USB_TYPE_CLASS | USB_RECIP_INTERFACE,
 			       (type << 8) + id,
 			       intf->cur_altsetting->desc.bInterfaceNumber, buf,
-			       size, 1000);
+			       size, HZ);
 }
 
 /*---------------------*/
@@ -176,6 +179,7 @@ static void iowarrior_callback(struct urb *urb)
 		goto exit;
 	}
 
+	spin_lock(&dev->intr_idx_lock);
 	intr_idx = atomic_read(&dev->intr_idx);
 	/* aux_idx become previous intr_idx */
 	aux_idx = (intr_idx == 0) ? (MAX_INTERRUPT_BUFFER - 1) : (intr_idx - 1);
@@ -190,6 +194,7 @@ static void iowarrior_callback(struct urb *urb)
 		    (dev->read_queue + offset, urb->transfer_buffer,
 		     dev->report_size)) {
 			/* equal values on interface 0 will be ignored */
+			spin_unlock(&dev->intr_idx_lock);
 			goto exit;
 		}
 	}
@@ -210,6 +215,7 @@ static void iowarrior_callback(struct urb *urb)
 	*(dev->read_queue + offset + (dev->report_size)) = dev->serial_number++;
 
 	atomic_set(&dev->intr_idx, aux_idx);
+	spin_unlock(&dev->intr_idx_lock);
 	/* tell the blocking read about the new data */
 	wake_up_interruptible(&dev->read_wait);
 
@@ -693,25 +699,25 @@ static int iowarrior_release(struct inode *inode, struct file *file)
 	return retval;
 }
 
-static __poll_t iowarrior_poll(struct file *file, poll_table * wait)
+static unsigned iowarrior_poll(struct file *file, poll_table * wait)
 {
 	struct iowarrior *dev = file->private_data;
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 
 	if (!dev->present)
-		return EPOLLERR | EPOLLHUP;
+		return POLLERR | POLLHUP;
 
 	poll_wait(file, &dev->read_wait, wait);
 	poll_wait(file, &dev->write_wait, wait);
 
 	if (!dev->present)
-		return EPOLLERR | EPOLLHUP;
+		return POLLERR | POLLHUP;
 
 	if (read_index(dev) != -1)
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 
 	if (atomic_read(&dev->write_busy) < MAX_WRITES_IN_FLIGHT)
-		mask |= EPOLLOUT | EPOLLWRNORM;
+		mask |= POLLOUT | POLLWRNORM;
 	return mask;
 }
 
@@ -778,6 +784,7 @@ static int iowarrior_probe(struct usb_interface *interface,
 
 	atomic_set(&dev->intr_idx, 0);
 	atomic_set(&dev->read_idx, 0);
+	spin_lock_init(&dev->intr_idx_lock);
 	atomic_set(&dev->overflow_flag, 0);
 	init_waitqueue_head(&dev->read_wait);
 	atomic_set(&dev->write_busy, 0);
@@ -814,28 +821,14 @@ static int iowarrior_probe(struct usb_interface *interface,
 
 	/* we have to check the report_size often, so remember it in the endianness suitable for our machine */
 	dev->report_size = usb_endpoint_maxp(dev->int_in_endpoint);
-
-	/*
-	 * Some devices need the report size to be different than the
-	 * endpoint size.
-	 */
-	if (dev->interface->cur_altsetting->desc.bInterfaceNumber == 0) {
-		switch (dev->product_id) {
-		case USB_DEVICE_ID_CODEMERCS_IOW56:
-		case USB_DEVICE_ID_CODEMERCS_IOW56AM:
-			dev->report_size = 7;
-			break;
-
-		case USB_DEVICE_ID_CODEMERCS_IOW28:
-		case USB_DEVICE_ID_CODEMERCS_IOW28L:
-			dev->report_size = 4;
-			break;
-
-		case USB_DEVICE_ID_CODEMERCS_IOW100:
-			dev->report_size = 13;
-			break;
-		}
-	}
+	if ((dev->interface->cur_altsetting->desc.bInterfaceNumber == 0) &&
+	    ((dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW56) ||
+	     (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW56AM) ||
+	     (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW28) ||
+	     (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW28L) ||
+	     (dev->product_id == USB_DEVICE_ID_CODEMERCS_IOW100)))
+		/* IOWarrior56 has wMaxPacketSize different from report size */
+		dev->report_size = 7;
 
 	/* create the urb and buffer for reading */
 	dev->int_in_urb = usb_alloc_urb(0, GFP_KERNEL);

@@ -526,8 +526,7 @@ qla27xx_fwdt_entry_t268(struct scsi_qla_host *vha,
 {
 	ql_dbg(ql_dbg_misc, vha, 0xd20c,
 	    "%s: gethb(%x) [%lx]\n", __func__, ent->t268.buf_type, *len);
-	switch (ent->t268.buf_type) {
-	case T268_BUF_TYPE_EXTD_TRACE:
+	if (ent->t268.buf_type == T268_BUF_TYPE_EXTD_TRACE) {
 		if (vha->hw->eft) {
 			if (buf) {
 				ent->t268.buf_size = EFT_SIZE;
@@ -539,52 +538,10 @@ qla27xx_fwdt_entry_t268(struct scsi_qla_host *vha,
 			    "%s: missing eft\n", __func__);
 			qla27xx_skip_entry(ent, buf);
 		}
-		break;
-	case T268_BUF_TYPE_EXCH_BUFOFF:
-		if (vha->hw->exchoffld_buf) {
-			if (buf) {
-				ent->t268.buf_size = vha->hw->exchoffld_size;
-				ent->t268.start_addr =
-					vha->hw->exchoffld_buf_dma;
-			}
-			qla27xx_insertbuf(vha->hw->exchoffld_buf,
-			    vha->hw->exchoffld_size, buf, len);
-		} else {
-			ql_dbg(ql_dbg_misc, vha, 0xd028,
-			    "%s: missing exch offld\n", __func__);
-			qla27xx_skip_entry(ent, buf);
-		}
-		break;
-	case T268_BUF_TYPE_EXTD_LOGIN:
-		if (vha->hw->exlogin_buf) {
-			if (buf) {
-				ent->t268.buf_size = vha->hw->exlogin_size;
-				ent->t268.start_addr =
-					vha->hw->exlogin_buf_dma;
-			}
-			qla27xx_insertbuf(vha->hw->exlogin_buf,
-			    vha->hw->exlogin_size, buf, len);
-		} else {
-			ql_dbg(ql_dbg_misc, vha, 0xd028,
-			    "%s: missing ext login\n", __func__);
-			qla27xx_skip_entry(ent, buf);
-		}
-		break;
-
-	case T268_BUF_TYPE_REQ_MIRROR:
-	case T268_BUF_TYPE_RSP_MIRROR:
-		/*
-		 * Mirror pointers are not implemented in the
-		 * driver, instead shadow pointers are used by
-		 * the drier. Skip these entries.
-		 */
-		qla27xx_skip_entry(ent, buf);
-		break;
-	default:
-		ql_dbg(ql_dbg_async, vha, 0xd02b,
+	} else {
+		ql_dbg(ql_dbg_misc, vha, 0xd02b,
 		    "%s: unknown buffer %x\n", __func__, ent->t268.buf_type);
 		qla27xx_skip_entry(ent, buf);
-		break;
 	}
 
 	return false;
@@ -940,8 +897,7 @@ qla27xx_template_checksum(void *p, ulong size)
 static inline int
 qla27xx_verify_template_checksum(struct qla27xx_fwdt_template *tmp)
 {
-	return qla27xx_template_checksum(tmp,
-		le32_to_cpu(tmp->template_size)) == 0;
+	return qla27xx_template_checksum(tmp, tmp->template_size) == 0;
 }
 
 static inline int
@@ -957,7 +913,7 @@ qla27xx_execute_fwdt_template(struct scsi_qla_host *vha)
 	ulong len;
 
 	if (qla27xx_fwdt_template_valid(tmp)) {
-		len = le32_to_cpu(tmp->template_size);
+		len = tmp->template_size;
 		tmp = memcpy(vha->hw->fw_dump, tmp, len);
 		ql27xx_edit_template(vha, tmp);
 		qla27xx_walk_template(vha, tmp, tmp, &len);
@@ -973,7 +929,7 @@ qla27xx_fwdt_calculate_dump_size(struct scsi_qla_host *vha)
 	ulong len = 0;
 
 	if (qla27xx_fwdt_template_valid(tmp)) {
-		len = le32_to_cpu(tmp->template_size);
+		len = tmp->template_size;
 		qla27xx_walk_template(vha, tmp, NULL, &len);
 	}
 
@@ -985,7 +941,7 @@ qla27xx_fwdt_template_size(void *p)
 {
 	struct qla27xx_fwdt_template *tmp = p;
 
-	return le32_to_cpu(tmp->template_size);
+	return tmp->template_size;
 }
 
 ulong
@@ -1038,10 +994,8 @@ qla27xx_fwdump(scsi_qla_host_t *vha, int hardware_locked)
 		ql_log(ql_log_warn, vha, 0xd300,
 		    "Firmware has been previously dumped (%p),"
 		    " -- ignoring request\n", vha->hw->fw_dump);
-	else {
-		QLA_FW_STOPPED(vha->hw);
+	else
 		qla27xx_execute_fwdt_template(vha);
-	}
 
 #ifndef __CHECKER__
 	if (!hardware_locked)

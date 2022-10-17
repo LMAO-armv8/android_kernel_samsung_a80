@@ -16,7 +16,6 @@
  */
 
 #include <linux/firmware.h>
-#include <net/rsi_91x.h>
 #include "rsi_sdio.h"
 #include "rsi_common.h"
 
@@ -58,24 +57,6 @@ int rsi_sdio_master_access_msword(struct rsi_hw *adapter, u16 ms_word)
 					 SDIO_MASTER_ACCESS_LSBYTE,
 					 &byte);
 	return status;
-}
-
-static void rsi_rx_handler(struct rsi_hw *adapter);
-
-void rsi_sdio_rx_thread(struct rsi_common *common)
-{
-	struct rsi_hw *adapter = common->priv;
-	struct rsi_91x_sdiodev *sdev = adapter->rsi_dev;
-
-	do {
-		rsi_wait_event(&sdev->rx_thread.event, EVENT_WAIT_FOREVER);
-		rsi_reset_event(&sdev->rx_thread.event);
-		rsi_rx_handler(adapter);
-	} while (!atomic_read(&sdev->rx_thread.thread_done));
-
-	rsi_dbg(INFO_ZONE, "%s: Terminated SDIO RX thread\n", __func__);
-	atomic_inc(&sdev->rx_thread.thread_done);
-	complete_and_exit(&sdev->rx_thread.completion, 0);
 }
 
 /**
@@ -121,21 +102,27 @@ static int rsi_process_pkt(struct rsi_common *common)
 
 	rcv_pkt_len = (num_blks * 256);
 
-	status = rsi_sdio_host_intf_read_pkt(adapter, dev->pktbuffer,
+	common->rx_data_pkt = kmalloc(rcv_pkt_len, GFP_KERNEL);
+	if (!common->rx_data_pkt) {
+		rsi_dbg(ERR_ZONE, "%s: Failed in memory allocation\n",
+			__func__);
+		return -ENOMEM;
+	}
+
+	status = rsi_sdio_host_intf_read_pkt(adapter,
+					     common->rx_data_pkt,
 					     rcv_pkt_len);
 	if (status) {
 		rsi_dbg(ERR_ZONE, "%s: Failed to read packet from card\n",
 			__func__);
-		return status;
+		goto fail;
 	}
 
-	status = rsi_read_pkt(common, dev->pktbuffer, rcv_pkt_len);
-	if (status) {
-		rsi_dbg(ERR_ZONE, "Failed to read the packet\n");
-		return status;
-	}
+	status = rsi_read_pkt(common, rcv_pkt_len);
 
-	return 0;
+fail:
+	kfree(common->rx_data_pkt);
+	return status;
 }
 
 /**
@@ -225,12 +212,12 @@ int rsi_init_sdio_slave_regs(struct rsi_hw *adapter)
 }
 
 /**
- * rsi_rx_handler() - Read and process SDIO interrupts.
+ * rsi_interrupt_handler() - This function read and process SDIO interrupts.
  * @adapter: Pointer to the adapter structure.
  *
  * Return: None.
  */
-static void rsi_rx_handler(struct rsi_hw *adapter)
+void rsi_interrupt_handler(struct rsi_hw *adapter)
 {
 	struct rsi_common *common = adapter->priv;
 	struct rsi_91x_sdiodev *dev =

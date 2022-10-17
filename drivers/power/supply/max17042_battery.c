@@ -123,8 +123,6 @@ static int max17042_get_temperature(struct max17042_chip *chip, int *temp)
 static int max17042_get_status(struct max17042_chip *chip, int *status)
 {
 	int ret, charge_full, charge_now;
-	int avg_current;
-	u32 data;
 
 	ret = power_supply_am_i_supplied(chip->battery);
 	if (ret < 0) {
@@ -154,31 +152,10 @@ static int max17042_get_status(struct max17042_chip *chip, int *status)
 	if (ret < 0)
 		return ret;
 
-	if ((charge_full - charge_now) <= MAX17042_FULL_THRESHOLD) {
+	if ((charge_full - charge_now) <= MAX17042_FULL_THRESHOLD)
 		*status = POWER_SUPPLY_STATUS_FULL;
-		return 0;
-	}
-
-	/*
-	 * Even though we are supplied, we may still be discharging if the
-	 * supply is e.g. only delivering 5V 0.5A. Check current if available.
-	 */
-	if (!chip->pdata->enable_current_sense) {
-		*status = POWER_SUPPLY_STATUS_CHARGING;
-		return 0;
-	}
-
-	ret = regmap_read(chip->regmap, MAX17042_AvgCurrent, &data);
-	if (ret < 0)
-		return ret;
-
-	avg_current = sign_extend32(data, 15);
-	avg_current *= 1562500 / chip->pdata->r_sns;
-
-	if (avg_current > 0)
-		*status = POWER_SUPPLY_STATUS_CHARGING;
 	else
-		*status = POWER_SUPPLY_STATUS_DISCHARGING;
+		*status = POWER_SUPPLY_STATUS_CHARGING;
 
 	return 0;
 }
@@ -326,10 +303,7 @@ static int max17042_get_property(struct power_supply *psy,
 		val->intval = data * 625 / 8;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		if (chip->pdata->enable_current_sense)
-			ret = regmap_read(map, MAX17042_RepSOC, &data);
-		else
-			ret = regmap_read(map, MAX17042_VFSOC, &data);
+		ret = regmap_read(map, MAX17042_RepSOC, &data);
 		if (ret < 0)
 			return ret;
 
@@ -743,7 +717,7 @@ static inline void max17042_override_por_values(struct max17042_chip *chip)
 	struct max17042_config_data *config = chip->pdata->config_data;
 
 	max17042_override_por(map, MAX17042_TGAIN, config->tgain);
-	max17042_override_por(map, MAX17042_TOFF, config->toff);
+	max17042_override_por(map, MAx17042_TOFF, config->toff);
 	max17042_override_por(map, MAX17042_CGAIN, config->cgain);
 	max17042_override_por(map, MAX17042_COFF, config->coff);
 
@@ -851,8 +825,7 @@ static void max17042_set_soc_threshold(struct max17042_chip *chip, u16 off)
 	regmap_read(map, MAX17042_RepSOC, &soc);
 	soc >>= 8;
 	soc_tr = (soc + off) << 8;
-	if (off < soc)
-		soc_tr |= soc - off;
+	soc_tr |= (soc - off);
 	regmap_write(map, MAX17042_SALRT_Th, soc_tr);
 }
 
@@ -860,12 +833,8 @@ static irqreturn_t max17042_thread_handler(int id, void *dev)
 {
 	struct max17042_chip *chip = dev;
 	u32 val;
-	int ret;
 
-	ret = regmap_read(chip->regmap, MAX17042_STATUS, &val);
-	if (ret)
-		return IRQ_HANDLED;
-
+	regmap_read(chip->regmap, MAX17042_STATUS, &val);
 	if ((val & STATUS_INTR_SOCMIN_BIT) ||
 		(val & STATUS_INTR_SOCMAX_BIT)) {
 		dev_info(&chip->client->dev, "SOC threshold INTR\n");
@@ -894,12 +863,15 @@ static void max17042_init_worker(struct work_struct *work)
 
 #ifdef CONFIG_OF
 static struct max17042_platform_data *
-max17042_get_of_pdata(struct max17042_chip *chip)
+max17042_get_pdata(struct max17042_chip *chip)
 {
 	struct device *dev = &chip->client->dev;
 	struct device_node *np = dev->of_node;
 	u32 prop;
 	struct max17042_platform_data *pdata;
+
+	if (!np)
+		return dev->platform_data;
 
 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata)
@@ -925,8 +897,7 @@ max17042_get_of_pdata(struct max17042_chip *chip)
 
 	return pdata;
 }
-#endif
-
+#else
 static struct max17042_reg_data max17047_default_pdata_init_regs[] = {
 	/*
 	 * Some firmwares do not set FullSOCThr, Enable End-of-Charge Detection
@@ -936,11 +907,14 @@ static struct max17042_reg_data max17047_default_pdata_init_regs[] = {
 };
 
 static struct max17042_platform_data *
-max17042_get_default_pdata(struct max17042_chip *chip)
+max17042_get_pdata(struct max17042_chip *chip)
 {
 	struct device *dev = &chip->client->dev;
 	struct max17042_platform_data *pdata;
 	int ret, misc_cfg;
+
+	if (dev->platform_data)
+		return dev->platform_data;
 
 	/*
 	 * The MAX17047 gets used on x86 where we might not have pdata, assume
@@ -974,21 +948,7 @@ max17042_get_default_pdata(struct max17042_chip *chip)
 
 	return pdata;
 }
-
-static struct max17042_platform_data *
-max17042_get_pdata(struct max17042_chip *chip)
-{
-	struct device *dev = &chip->client->dev;
-
-#ifdef CONFIG_OF
-	if (dev->of_node)
-		return max17042_get_of_pdata(chip);
 #endif
-	if (dev->platform_data)
-		return dev->platform_data;
-
-	return max17042_get_default_pdata(chip);
-}
 
 static const struct regmap_config max17042_regmap_config = {
 	.reg_bits = 8,
@@ -1091,7 +1051,7 @@ static int max17042_probe(struct i2c_client *client,
 	}
 
 	if (client->irq) {
-		unsigned int flags = IRQF_ONESHOT;
+		unsigned int flags = IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
 
 		/*
 		 * On ACPI systems the IRQ may be handled by ACPI-event code,

@@ -15,10 +15,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <linux/moduleparam.h>
 #include <linux/etherdevice.h>
 #include <linux/rtnetlink.h>
 #include "wil6210.h"
 #include "txrx.h"
+
+static bool alt_ifname; /* = false; */
+module_param(alt_ifname, bool, 0444);
+MODULE_PARM_DESC(alt_ifname, " use an alternate interface name wigigN instead of wlanN");
 
 bool wil_has_other_active_ifaces(struct wil6210_priv *wil,
 				 struct net_device *ndev, bool up, bool ok)
@@ -91,12 +96,20 @@ static int wil_stop(struct net_device *ndev)
 	return rc;
 }
 
+static int wil_do_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
+{
+	struct wil6210_priv *wil = ndev_to_wil(ndev);
+
+	return wil_ioctl(wil, ifr->ifr_data, cmd);
+}
+
 static const struct net_device_ops wil_netdev_ops = {
 	.ndo_open		= wil_open,
 	.ndo_stop		= wil_stop,
 	.ndo_start_xmit		= wil_start_xmit,
 	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_do_ioctl		= wil_do_ioctl,
 };
 
 static int wil6210_netdev_poll_rx(struct napi_struct *napi, int budget)
@@ -211,6 +224,7 @@ static void wil_dev_setup(struct net_device *dev)
 
 static void wil_vif_deinit(struct wil6210_vif *vif)
 {
+	wil_ftm_deinit(vif);
 	del_timer_sync(&vif->scan_timer);
 	del_timer_sync(&vif->p2p.discovery_timer);
 	cancel_work_sync(&vif->disconnect_worker);
@@ -287,6 +301,8 @@ static void wil_vif_init(struct wil6210_vif *vif)
 
 	INIT_LIST_HEAD(&vif->probe_client_pending);
 
+	wil_ftm_init(vif);
+
 	vif->net_queue_stopped = 1;
 }
 
@@ -345,8 +361,7 @@ wil_vif_alloc(struct wil6210_priv *wil, const char *name,
 	ndev->ieee80211_ptr = wdev;
 	ndev->hw_features = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
 			    NETIF_F_SG | NETIF_F_GRO |
-			    NETIF_F_TSO | NETIF_F_TSO6 |
-			    NETIF_F_RXHASH;
+			    NETIF_F_TSO | NETIF_F_TSO6;
 
 	ndev->features |= ndev->hw_features;
 	SET_NETDEV_DEV(ndev, wiphy_dev(wdev->wiphy));
@@ -359,6 +374,7 @@ void *wil_if_alloc(struct device *dev)
 	struct wil6210_priv *wil;
 	struct wil6210_vif *vif;
 	int rc = 0;
+	const char *ifname = alt_ifname ? "wigig%d" : "wlan%d";
 
 	wil = wil_cfg80211_init(dev);
 	if (IS_ERR(wil)) {
@@ -374,7 +390,7 @@ void *wil_if_alloc(struct device *dev)
 
 	wil_dbg_misc(wil, "if_alloc\n");
 
-	vif = wil_vif_alloc(wil, "wlan%d", NET_NAME_UNKNOWN,
+	vif = wil_vif_alloc(wil, ifname, NET_NAME_UNKNOWN,
 			    NL80211_IFTYPE_STATION);
 	if (IS_ERR(vif)) {
 		dev_err(dev, "wil_vif_alloc failed\n");
@@ -513,7 +529,7 @@ void wil_vif_remove(struct wil6210_priv *wil, u8 mid)
 	}
 
 	mutex_lock(&wil->mutex);
-	wil6210_disconnect(vif, NULL, WLAN_REASON_DEAUTH_LEAVING, false);
+	wil6210_disconnect(vif, NULL, WLAN_REASON_DEAUTH_LEAVING);
 	mutex_unlock(&wil->mutex);
 
 	ndev = vif_to_ndev(vif);

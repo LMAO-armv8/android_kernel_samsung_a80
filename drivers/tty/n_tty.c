@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-1.0+
 /*
  * n_tty.c --- implements the N_TTY line discipline.
  *
@@ -15,6 +14,9 @@
  *
  * This file also contains code originally written by Linus Torvalds,
  * Copyright 1991, 1992, 1993, and by Julian Cowley, Copyright 1994.
+ *
+ * This file may be redistributed under the terms of the GNU General Public
+ * License.
  *
  * Reduced memory usage for older ARM systems  - Russell King.
  *
@@ -125,6 +127,10 @@ struct n_tty_data {
 };
 
 #define MASK(x) ((x) & (N_TTY_BUF_SIZE - 1))
+
+#if defined(CONFIG_TTY_FLUSH_LOCAL_ECHO)
+static void continue_process_echoes(struct work_struct *work);
+#endif
 
 static inline size_t read_cnt(struct n_tty_data *ldata)
 {
@@ -762,7 +768,17 @@ static size_t __process_echoes(struct tty_struct *tty)
 			tail++;
 	}
 
- not_yet_stored:
+#if defined(CONFIG_TTY_FLUSH_LOCAL_ECHO)
+	if (ldata->echo_commit != tail) {
+		if (!tty->delayed_work) {
+			INIT_DELAYED_WORK(&tty->echo_delayed_work, continue_process_echoes);
+			schedule_delayed_work(&tty->echo_delayed_work, 1);
+		}
+		tty->delayed_work = 1;
+	}
+#endif
+
+not_yet_stored:
 	ldata->echo_tail = tail;
 	return old_space - space;
 }
@@ -827,6 +843,20 @@ static void flush_echoes(struct tty_struct *tty)
 	__process_echoes(tty);
 	mutex_unlock(&ldata->output_lock);
 }
+
+#if defined(CONFIG_TTY_FLUSH_LOCAL_ECHO)
+static void continue_process_echoes(struct work_struct *work)
+{
+	struct tty_struct *tty =
+		container_of(work, struct tty_struct, echo_delayed_work.work);
+	struct n_tty_data *ldata = tty->disc_data;
+
+	mutex_lock(&ldata->output_lock);
+	tty->delayed_work = 0;
+	__process_echoes(tty);
+	mutex_unlock(&ldata->output_lock);
+}
+#endif
 
 /**
  *	add_echo_byte	-	add a byte to the echo buffer
@@ -1375,7 +1405,7 @@ handle_newline:
 			put_tty_queue(c, ldata);
 			smp_store_release(&ldata->canon_head, ldata->read_head);
 			kill_fasync(&tty->fasync, SIGIO, POLL_IN);
-			wake_up_interruptible_poll(&tty->read_wait, EPOLLIN | EPOLLRDNORM);
+			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
 			return 0;
 		}
 	}
@@ -1656,7 +1686,7 @@ static void __receive_buf(struct tty_struct *tty, const unsigned char *cp,
 
 	if (read_cnt(ldata)) {
 		kill_fasync(&tty->fasync, SIGIO, POLL_IN);
-		wake_up_interruptible_poll(&tty->read_wait, EPOLLIN | EPOLLRDNORM);
+		wake_up_interruptible_poll(&tty->read_wait, POLLIN);
 	}
 }
 
@@ -2397,30 +2427,30 @@ break_out:
  *	Called without the kernel lock held - fine
  */
 
-static __poll_t n_tty_poll(struct tty_struct *tty, struct file *file,
+static unsigned int n_tty_poll(struct tty_struct *tty, struct file *file,
 							poll_table *wait)
 {
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 
 	poll_wait(file, &tty->read_wait, wait);
 	poll_wait(file, &tty->write_wait, wait);
 	if (input_available_p(tty, 1))
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 	else {
 		tty_buffer_flush_work(tty->port);
 		if (input_available_p(tty, 1))
-			mask |= EPOLLIN | EPOLLRDNORM;
+			mask |= POLLIN | POLLRDNORM;
 	}
 	if (tty->packet && tty->link->ctrl_status)
-		mask |= EPOLLPRI | EPOLLIN | EPOLLRDNORM;
+		mask |= POLLPRI | POLLIN | POLLRDNORM;
 	if (test_bit(TTY_OTHER_CLOSED, &tty->flags))
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 	if (tty_hung_up_p(file))
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 	if (tty->ops->write && !tty_is_writelocked(tty) &&
 			tty_chars_in_buffer(tty) < WAKEUP_CHARS &&
 			tty_write_room(tty) > 0)
-		mask |= EPOLLOUT | EPOLLWRNORM;
+		mask |= POLLOUT | POLLWRNORM;
 	return mask;
 }
 

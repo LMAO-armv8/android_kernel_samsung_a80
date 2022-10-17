@@ -91,6 +91,7 @@ struct vscsibk_info {
 	unsigned int irq;
 
 	struct vscsiif_back_ring ring;
+	int ring_error;
 
 	spinlock_t ring_lock;
 	atomic_t nr_unreplied_reqs;
@@ -422,12 +423,12 @@ static int scsiback_gnttab_data_map_batch(struct gnttab_map_grant_ref *map,
 		return 0;
 
 	err = gnttab_map_refs(map, NULL, pg, cnt);
+	BUG_ON(err);
 	for (i = 0; i < cnt; i++) {
 		if (unlikely(map[i].status != GNTST_okay)) {
 			pr_err("invalid buffer -- could not remap it\n");
 			map[i].handle = SCSIBACK_INVALID_HANDLE;
-			if (!err)
-				err = -ENOMEM;
+			err = -ENOMEM;
 		} else {
 			get_page(pg[i]);
 		}
@@ -653,9 +654,9 @@ static struct vscsibk_pend *scsiback_get_pend_req(struct vscsiif_back_ring *ring
 	struct scsiback_nexus *nexus = tpg->tpg_nexus;
 	struct se_session *se_sess = nexus->tvn_se_sess;
 	struct vscsibk_pend *req;
-	int tag, cpu, i;
+	int tag, i;
 
-	tag = sbitmap_queue_get(&se_sess->sess_tag_pool, &cpu);
+	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
 	if (tag < 0) {
 		pr_err("Unable to obtain tag for vscsiif_request\n");
 		return ERR_PTR(-ENOMEM);
@@ -664,7 +665,6 @@ static struct vscsibk_pend *scsiback_get_pend_req(struct vscsiif_back_ring *ring
 	req = &((struct vscsibk_pend *)se_sess->sess_cmd_map)[tag];
 	memset(req, 0, sizeof(*req));
 	req->se_cmd.map_tag = tag;
-	req->se_cmd.map_cpu = cpu;
 
 	for (i = 0; i < VSCSI_MAX_GRANTS; i++)
 		req->grant_handles[i] = SCSIBACK_INVALID_HANDLE;
@@ -721,8 +721,7 @@ static struct vscsibk_pend *prepare_pending_reqs(struct vscsibk_info *info,
 	return pending_req;
 }
 
-static int scsiback_do_cmd_fn(struct vscsibk_info *info,
-			      unsigned int *eoi_flags)
+static int scsiback_do_cmd_fn(struct vscsibk_info *info)
 {
 	struct vscsiif_back_ring *ring = &info->ring;
 	struct vscsiif_request ring_req;
@@ -739,12 +738,11 @@ static int scsiback_do_cmd_fn(struct vscsibk_info *info,
 		rc = ring->rsp_prod_pvt;
 		pr_warn("Dom%d provided bogus ring requests (%#x - %#x = %u). Halting ring processing\n",
 			   info->domid, rp, rc, rp - rc);
-		return -EINVAL;
+		info->ring_error = 1;
+		return 0;
 	}
 
 	while ((rc != rp)) {
-		*eoi_flags &= ~XEN_EOI_FLAG_SPURIOUS;
-
 		if (RING_REQUEST_CONS_OVERFLOW(ring, rc))
 			break;
 
@@ -803,15 +801,12 @@ static int scsiback_do_cmd_fn(struct vscsibk_info *info,
 static irqreturn_t scsiback_irq_fn(int irq, void *dev_id)
 {
 	struct vscsibk_info *info = dev_id;
-	int rc;
-	unsigned int eoi_flags = XEN_EOI_FLAG_SPURIOUS;
 
-	while ((rc = scsiback_do_cmd_fn(info, &eoi_flags)) > 0)
+	if (info->ring_error)
+		return IRQ_HANDLED;
+
+	while (scsiback_do_cmd_fn(info))
 		cond_resched();
-
-	/* In case of a ring error we keep the event channel masked. */
-	if (!rc)
-		xen_irq_lateeoi(irq, eoi_flags);
 
 	return IRQ_HANDLED;
 }
@@ -833,7 +828,7 @@ static int scsiback_init_sring(struct vscsibk_info *info, grant_ref_t ring_ref,
 	sring = (struct vscsiif_sring *)area;
 	BACK_RING_INIT(&info->ring, sring, PAGE_SIZE);
 
-	err = bind_interdomain_evtchn_to_irq_lateeoi(info->domid, evtchn);
+	err = bind_interdomain_evtchn_to_irq(info->domid, evtchn);
 	if (err < 0)
 		goto unmap_page;
 
@@ -1256,6 +1251,7 @@ static int scsiback_probe(struct xenbus_device *dev,
 
 	info->domid = dev->otherend_id;
 	spin_lock_init(&info->ring_lock);
+	info->ring_error = 0;
 	atomic_set(&info->nr_unreplied_reqs, 0);
 	init_waitqueue_head(&info->waiting_to_free);
 	info->dev = dev;
@@ -1391,7 +1387,9 @@ static int scsiback_check_stop_free(struct se_cmd *se_cmd)
 
 static void scsiback_release_cmd(struct se_cmd *se_cmd)
 {
-	target_free_tag(se_cmd->se_sess, se_cmd);
+	struct se_session *se_sess = se_cmd->se_sess;
+
+	percpu_ida_free(&se_sess->sess_tag_pool, se_cmd->map_tag);
 }
 
 static u32 scsiback_sess_get_index(struct se_session *se_sess)
@@ -1534,7 +1532,7 @@ static int scsiback_make_nexus(struct scsiback_tpg *tpg,
 		goto out_unlock;
 	}
 
-	tv_nexus->tvn_se_sess = target_setup_session(&tpg->se_tpg,
+	tv_nexus->tvn_se_sess = target_alloc_session(&tpg->se_tpg,
 						     VSCSI_DEFAULT_SESSION_TAGS,
 						     sizeof(struct vscsibk_pend),
 						     TARGET_PROT_NORMAL, name,
@@ -1589,7 +1587,7 @@ static int scsiback_drop_nexus(struct scsiback_tpg *tpg)
 	/*
 	 * Release the SCSI I_T Nexus to the emulated xen-pvscsi Target Port
 	 */
-	target_remove_session(se_sess);
+	transport_deregister_session(tv_nexus->tvn_se_sess);
 	tpg->tpg_nexus = NULL;
 	mutex_unlock(&tpg->tv_tpg_mutex);
 
@@ -1745,7 +1743,9 @@ static void scsiback_port_unlink(struct se_portal_group *se_tpg,
 }
 
 static struct se_portal_group *
-scsiback_make_tpg(struct se_wwn *wwn, const char *name)
+scsiback_make_tpg(struct se_wwn *wwn,
+		   struct config_group *group,
+		   const char *name)
 {
 	struct scsiback_tport *tport = container_of(wwn,
 			struct scsiback_tport, tport_wwn);

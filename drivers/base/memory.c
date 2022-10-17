@@ -22,6 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/stat.h>
 #include <linux/slab.h>
+#include <linux/memblock.h>
 
 #include <linux/atomic.h>
 #include <linux/uaccess.h>
@@ -37,11 +38,6 @@ static int sections_per_block;
 static inline int base_memory_block_id(int section_nr)
 {
 	return section_nr / sections_per_block;
-}
-
-static inline int pfn_to_block_id(unsigned long pfn)
-{
-	return base_memory_block_id(pfn_to_section_nr(pfn));
 }
 
 static int memory_subsys_online(struct device *dev);
@@ -192,14 +188,13 @@ int memory_isolate_notify(unsigned long val, void *v)
 }
 
 /*
- * The probe routines leave the pages uninitialized, just as the bootmem code
- * does. Make sure we do not access them, but instead use only information from
- * within sections.
+ * The probe routines leave the pages reserved, just as the bootmem code does.
+ * Make sure they're still that way.
  */
-static bool pages_correctly_probed(unsigned long start_pfn)
+static bool pages_correctly_reserved(unsigned long start_pfn)
 {
-	unsigned long section_nr = pfn_to_section_nr(start_pfn);
-	unsigned long section_nr_end = section_nr + sections_per_block;
+	int i, j;
+	struct page *page;
 	unsigned long pfn = start_pfn;
 
 	/*
@@ -207,24 +202,21 @@ static bool pages_correctly_probed(unsigned long start_pfn)
 	 * SPARSEMEM_VMEMMAP. We lookup the page once per section
 	 * and assume memmap is contiguous within each section
 	 */
-	for (; section_nr < section_nr_end; section_nr++) {
+	for (i = 0; i < sections_per_block; i++, pfn += PAGES_PER_SECTION) {
 		if (WARN_ON_ONCE(!pfn_valid(pfn)))
 			return false;
+		page = pfn_to_page(pfn);
 
-		if (!present_section_nr(section_nr)) {
-			pr_warn("section %ld pfn[%lx, %lx) not present",
-				section_nr, pfn, pfn + PAGES_PER_SECTION);
-			return false;
-		} else if (!valid_section_nr(section_nr)) {
-			pr_warn("section %ld pfn[%lx, %lx) no valid memmap",
-				section_nr, pfn, pfn + PAGES_PER_SECTION);
-			return false;
-		} else if (online_section_nr(section_nr)) {
-			pr_warn("section %ld pfn[%lx, %lx) is already online",
-				section_nr, pfn, pfn + PAGES_PER_SECTION);
+		for (j = 0; j < PAGES_PER_SECTION; j++) {
+			if (PageReserved(page + j))
+				continue;
+
+			printk(KERN_WARNING "section number %ld page number %d "
+				"not reserved, was it already online?\n",
+				pfn_to_section_nr(pfn), j);
+
 			return false;
 		}
-		pfn += PAGES_PER_SECTION;
 	}
 
 	return true;
@@ -233,20 +225,20 @@ static bool pages_correctly_probed(unsigned long start_pfn)
 /*
  * MEMORY_HOTPLUG depends on SPARSEMEM in mm/Kconfig, so it is
  * OK to have direct references to sparsemem variables in here.
+ * Must already be protected by mem_hotplug_begin().
  */
 static int
-memory_block_action(unsigned long start_section_nr, unsigned long action,
-		    int online_type)
+memory_block_action(unsigned long phys_index, unsigned long action, int online_type)
 {
 	unsigned long start_pfn;
 	unsigned long nr_pages = PAGES_PER_SECTION * sections_per_block;
 	int ret;
 
-	start_pfn = section_nr_to_pfn(start_section_nr);
+	start_pfn = section_nr_to_pfn(phys_index);
 
 	switch (action) {
 	case MEM_ONLINE:
-		if (!pages_correctly_probed(start_pfn))
+		if (!pages_correctly_reserved(start_pfn))
 			return -EBUSY;
 
 		ret = online_pages(start_pfn, nr_pages, online_type);
@@ -256,7 +248,7 @@ memory_block_action(unsigned long start_section_nr, unsigned long action,
 		break;
 	default:
 		WARN(1, KERN_WARNING "%s(%ld, %ld) unknown action: "
-		     "%ld\n", __func__, start_section_nr, action, action);
+		     "%ld\n", __func__, phys_index, action, action);
 		ret = -EINVAL;
 	}
 
@@ -299,6 +291,7 @@ static int memory_subsys_online(struct device *dev)
 	if (mem->online_type < 0)
 		mem->online_type = MMOP_ONLINE_KEEP;
 
+	/* Already under protection of mem_hotplug_begin() */
 	ret = memory_block_change_state(mem, MEM_ONLINE, MEM_OFFLINE);
 
 	/* clear online_type */
@@ -345,11 +338,19 @@ store_mem_state(struct device *dev,
 		goto err;
 	}
 
+	/*
+	 * Memory hotplug needs to hold mem_hotplug_begin() for probe to find
+	 * the correct memory block to online before doing device_online(dev),
+	 * which will take dev->mutex.  Take the lock early to prevent an
+	 * inversion, memory_subsys_online() callbacks will be implemented by
+	 * assuming it's already protected.
+	 */
+	mem_hotplug_begin();
+
 	switch (online_type) {
 	case MMOP_ONLINE_KERNEL:
 	case MMOP_ONLINE_MOVABLE:
 	case MMOP_ONLINE_KEEP:
-		/* mem->online_type is protected by device_hotplug_lock */
 		mem->online_type = online_type;
 		ret = device_online(&mem->dev);
 		break;
@@ -360,6 +361,7 @@ store_mem_state(struct device *dev,
 		ret = -EINVAL; /* should never happen */
 	}
 
+	mem_hotplug_done();
 err:
 	unlock_device_hotplug();
 
@@ -412,23 +414,25 @@ static ssize_t show_valid_zones(struct device *dev,
 	int nid;
 
 	/*
+	 * The block contains more than one zone can not be offlined.
+	 * This can happen e.g. for ZONE_DMA and ZONE_DMA32
+	 */
+	if (!test_pages_in_a_zone(start_pfn, start_pfn + nr_pages, &valid_start_pfn, &valid_end_pfn))
+		return sprintf(buf, "none\n");
+
+	start_pfn = valid_start_pfn;
+	nr_pages = valid_end_pfn - start_pfn;
+
+	/*
 	 * Check the existing zone. Make sure that we do that only on the
 	 * online nodes otherwise the page_zone is not reliable
 	 */
 	if (mem->state == MEM_ONLINE) {
-		/*
-		 * The block contains more than one zone can not be offlined.
-		 * This can happen e.g. for ZONE_DMA and ZONE_DMA32
-		 */
-		if (!test_pages_in_a_zone(start_pfn, start_pfn + nr_pages,
-					  &valid_start_pfn, &valid_end_pfn))
-			return sprintf(buf, "none\n");
-		start_pfn = valid_start_pfn;
 		strcat(buf, page_zone(pfn_to_page(start_pfn))->name);
 		goto out;
 	}
 
-	nid = mem->nid;
+	nid = pfn_to_nid(start_pfn);
 	default_zone = zone_for_pfn_range(MMOP_ONLINE_KEEP, nid, start_pfn, nr_pages);
 	strcat(buf, default_zone->name);
 
@@ -444,10 +448,76 @@ out:
 static DEVICE_ATTR(valid_zones, 0444, show_valid_zones, NULL);
 #endif
 
+#ifdef CONFIG_MEMORY_HOTPLUG
+static int count_num_free_block_pages(struct zone *zone, int bid)
+{
+	int order, type;
+	unsigned long freecount = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&zone->lock, flags);
+	for (type = 0; type < MIGRATE_TYPES; type++) {
+		for (order = 0; order < MAX_ORDER; ++order) {
+			struct free_area *area;
+			struct page *page;
+
+			area = &(zone->free_area[order]);
+			list_for_each_entry(page, &area->free_list[type], lru) {
+				unsigned long pfn = page_to_pfn(page);
+				int section_nr = pfn_to_section_nr(pfn);
+
+				if (bid == base_memory_block_id(section_nr))
+					freecount += (1 << order);
+			}
+
+		}
+	}
+	spin_unlock_irqrestore(&zone->lock, flags);
+
+	return freecount;
+}
+
+static ssize_t show_allocated_bytes(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
+	struct memory_block *mem = to_memory_block(dev);
+	int block_id, free_pages;
+	struct zone *movable_zone =
+		&NODE_DATA(numa_node_id())->node_zones[ZONE_MOVABLE];
+	unsigned long used, block_sz = get_memory_block_size();
+
+	if (!populated_zone(movable_zone) || mem->state != MEM_ONLINE)
+		return snprintf(buf, 100, "0\n");
+
+	block_id = base_memory_block_id(mem->start_section_nr);
+	free_pages = count_num_free_block_pages(movable_zone, block_id);
+	used =  block_sz - (free_pages * PAGE_SIZE);
+
+	return snprintf(buf, 100, "%lu\n", used);
+}
+
+static ssize_t show_aligned_blocks_addr(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
+	return memblock_dump_aligned_blocks_addr(buf);
+}
+
+static ssize_t show_aligned_blocks_num(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
+	return memblock_dump_aligned_blocks_num(buf);
+}
+#endif
+
 static DEVICE_ATTR(phys_index, 0444, show_mem_start_phys_index, NULL);
 static DEVICE_ATTR(state, 0644, show_mem_state, store_mem_state);
 static DEVICE_ATTR(phys_device, 0444, show_phys_device, NULL);
 static DEVICE_ATTR(removable, 0444, show_mem_removable, NULL);
+#ifdef CONFIG_MEMORY_HOTPLUG
+static DEVICE_ATTR(allocated_bytes, 0444, show_allocated_bytes, NULL);
+static DEVICE_ATTR(aligned_blocks_addr, 0444, show_aligned_blocks_addr, NULL);
+static DEVICE_ATTR(aligned_blocks_num, 0444, show_aligned_blocks_num, NULL);
+#endif
 
 /*
  * Block size attribute stuff
@@ -532,7 +602,36 @@ out:
 }
 
 static DEVICE_ATTR(probe, S_IWUSR, NULL, memory_probe_store);
-#endif
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static ssize_t
+memory_remove_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	u64 phys_addr;
+	int nid, ret;
+	unsigned long pages_per_block = PAGES_PER_SECTION * sections_per_block;
+
+	ret = kstrtoull(buf, 0, &phys_addr);
+	if (ret)
+		return ret;
+
+	if (phys_addr & ((pages_per_block << PAGE_SHIFT) - 1))
+		return -EINVAL;
+
+	nid = memory_add_physaddr_to_nid(phys_addr);
+	ret = lock_device_hotplug_sysfs();
+	if (ret)
+		return ret;
+
+	remove_memory(nid, phys_addr,
+			 MIN_MEMORY_BLOCK_SIZE * sections_per_block);
+	unlock_device_hotplug();
+	return count;
+}
+static DEVICE_ATTR(remove, S_IWUSR, NULL, memory_remove_store);
+#endif /* CONFIG_MEMORY_HOTREMOVE */
+#endif /* CONFIG_ARCH_MEMORY_PROBE */
 
 #ifdef CONFIG_MEMORY_FAILURE
 /*
@@ -574,7 +673,7 @@ store_hard_offline_page(struct device *dev,
 	if (kstrtoull(buf, 0, &pfn) < 0)
 		return -EINVAL;
 	pfn >>= PAGE_SHIFT;
-	ret = memory_failure(pfn, 0);
+	ret = memory_failure(pfn, 0, 0);
 	return ret ? ret : count;
 }
 
@@ -596,9 +695,10 @@ int __weak arch_get_memory_phys_device(unsigned long start_pfn)
  * A reference for the returned object is held and the reference for the
  * hinted object is released.
  */
-static struct memory_block *find_memory_block_by_id(int block_id,
-						    struct memory_block *hint)
+struct memory_block *find_memory_block_hinted(struct mem_section *section,
+					      struct memory_block *hint)
 {
+	int block_id = base_memory_block_id(__section_nr(section));
 	struct device *hintdev = hint ? &hint->dev : NULL;
 	struct device *dev;
 
@@ -608,14 +708,6 @@ static struct memory_block *find_memory_block_by_id(int block_id,
 	if (!dev)
 		return NULL;
 	return to_memory_block(dev);
-}
-
-struct memory_block *find_memory_block_hinted(struct mem_section *section,
-					      struct memory_block *hint)
-{
-	int block_id = base_memory_block_id(__section_nr(section));
-
-	return find_memory_block_by_id(block_id, hint);
 }
 
 /*
@@ -639,6 +731,9 @@ static struct attribute *memory_memblk_attrs[] = {
 #ifdef CONFIG_MEMORY_HOTREMOVE
 	&dev_attr_valid_zones.attr,
 #endif
+#ifdef CONFIG_MEMORY_HOTPLUG
+	&dev_attr_allocated_bytes.attr,
+#endif
 	NULL
 };
 
@@ -657,43 +752,34 @@ static const struct attribute_group *memory_memblk_attr_groups[] = {
 static
 int register_memory(struct memory_block *memory)
 {
-	int ret;
-
 	memory->dev.bus = &memory_subsys;
 	memory->dev.id = memory->start_section_nr / sections_per_block;
 	memory->dev.release = memory_block_release;
 	memory->dev.groups = memory_memblk_attr_groups;
 	memory->dev.offline = memory->state == MEM_OFFLINE;
 
-	ret = device_register(&memory->dev);
-	if (ret)
-		put_device(&memory->dev);
-
-	return ret;
+	return device_register(&memory->dev);
 }
 
-static int init_memory_block(struct memory_block **memory, int block_id,
-			     unsigned long state)
+static int init_memory_block(struct memory_block **memory,
+			     struct mem_section *section, unsigned long state)
 {
 	struct memory_block *mem;
 	unsigned long start_pfn;
+	int scn_nr;
 	int ret = 0;
 
-	mem = find_memory_block_by_id(block_id, NULL);
-	if (mem) {
-		put_device(&mem->dev);
-		return -EEXIST;
-	}
 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
 	if (!mem)
 		return -ENOMEM;
 
-	mem->start_section_nr = block_id * sections_per_block;
+	scn_nr = __section_nr(section);
+	mem->start_section_nr =
+			base_memory_block_id(scn_nr) * sections_per_block;
 	mem->end_section_nr = mem->start_section_nr + sections_per_block - 1;
 	mem->state = state;
 	start_pfn = section_nr_to_pfn(mem->start_section_nr);
 	mem->phys_device = arch_get_memory_phys_device(start_pfn);
-	mem->nid = NUMA_NO_NODE;
 
 	ret = register_memory(mem);
 
@@ -704,98 +790,103 @@ static int init_memory_block(struct memory_block **memory, int block_id,
 static int add_memory_block(int base_section_nr)
 {
 	struct memory_block *mem;
-	int i, ret, section_count = 0;
+	int i, ret, section_count = 0, section_nr;
 
 	for (i = base_section_nr;
-	     i < base_section_nr + sections_per_block;
-	     i++)
-		if (present_section_nr(i))
-			section_count++;
+	     (i < base_section_nr + sections_per_block) && i < NR_MEM_SECTIONS;
+	     i++) {
+		if (!present_section_nr(i))
+			continue;
+		if (section_count == 0)
+			section_nr = i;
+		section_count++;
+	}
 
 	if (section_count == 0)
 		return 0;
-	ret = init_memory_block(&mem, base_memory_block_id(base_section_nr),
-				MEM_ONLINE);
+	ret = init_memory_block(&mem, __nr_to_section(section_nr), MEM_ONLINE);
 	if (ret)
 		return ret;
 	mem->section_count = section_count;
 	return 0;
 }
 
-static void unregister_memory(struct memory_block *memory)
-{
-	if (WARN_ON_ONCE(memory->dev.bus != &memory_subsys))
-		return;
-
-	/* drop the ref. we got via find_memory_block() */
-	put_device(&memory->dev);
-	device_unregister(&memory->dev);
-}
-
 /*
- * Create memory block devices for the given memory area. Start and size
- * have to be aligned to memory block granularity. Memory block devices
- * will be initialized as offline.
+ * need an interface for the VM to add new memory regions,
+ * but without onlining it.
  */
-int create_memory_block_devices(unsigned long start, unsigned long size)
+int register_new_memory(int nid, struct mem_section *section)
 {
-	const int start_block_id = pfn_to_block_id(PFN_DOWN(start));
-	int end_block_id = pfn_to_block_id(PFN_DOWN(start + size));
-	struct memory_block *mem;
-	unsigned long block_id;
 	int ret = 0;
-
-	if (WARN_ON_ONCE(!IS_ALIGNED(start, memory_block_size_bytes()) ||
-			 !IS_ALIGNED(size, memory_block_size_bytes())))
-		return -EINVAL;
+	struct memory_block *mem;
 
 	mutex_lock(&mem_sysfs_mutex);
-	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
-		ret = init_memory_block(&mem, block_id, MEM_OFFLINE);
+
+	mem = find_memory_block(section);
+	if (mem) {
+		mem->section_count++;
+		put_device(&mem->dev);
+	} else {
+		ret = init_memory_block(&mem, section, MEM_OFFLINE);
 		if (ret)
-			break;
-		mem->section_count = sections_per_block;
+			goto out;
+		mem->section_count++;
 	}
-	if (ret) {
-		end_block_id = block_id;
-		for (block_id = start_block_id; block_id != end_block_id;
-		     block_id++) {
-			mem = find_memory_block_by_id(block_id, NULL);
-			mem->section_count = 0;
-			unregister_memory(mem);
-		}
-	}
+
+	if (mem->section_count == sections_per_block)
+		ret = register_mem_sect_under_node(mem, nid);
+out:
 	mutex_unlock(&mem_sysfs_mutex);
 	return ret;
 }
 
-/*
- * Remove memory block devices for the given memory area. Start and size
- * have to be aligned to memory block granularity. Memory block devices
- * have to be offline.
- */
-void remove_memory_block_devices(unsigned long start, unsigned long size)
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static void
+unregister_memory(struct memory_block *memory)
 {
-	const int start_block_id = pfn_to_block_id(PFN_DOWN(start));
-	const int end_block_id = pfn_to_block_id(PFN_DOWN(start + size));
-	struct memory_block *mem;
-	int block_id;
+	BUG_ON(memory->dev.bus != &memory_subsys);
 
-	if (WARN_ON_ONCE(!IS_ALIGNED(start, memory_block_size_bytes()) ||
-			 !IS_ALIGNED(size, memory_block_size_bytes())))
-		return;
+	/* drop the ref. we got in remove_memory_block() */
+	put_device(&memory->dev);
+	device_unregister(&memory->dev);
+}
+
+static int remove_memory_section(unsigned long node_id,
+			       struct mem_section *section, int phys_device)
+{
+	struct memory_block *mem;
 
 	mutex_lock(&mem_sysfs_mutex);
-	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
-		mem = find_memory_block_by_id(block_id, NULL);
-		if (WARN_ON_ONCE(!mem))
-			continue;
-		mem->section_count = 0;
-		unregister_memory_block_under_nodes(mem);
+
+	/*
+	 * Some users of the memory hotplug do not want/need memblock to
+	 * track all sections. Skip over those.
+	 */
+	mem = find_memory_block(section);
+	if (!mem)
+		goto out_unlock;
+
+	unregister_mem_sect_under_nodes(mem, __section_nr(section));
+
+	mem->section_count--;
+	if (mem->section_count == 0)
 		unregister_memory(mem);
-	}
+	else
+		put_device(&mem->dev);
+
+out_unlock:
 	mutex_unlock(&mem_sysfs_mutex);
+	return 0;
 }
+
+int unregister_memory_section(struct mem_section *section)
+{
+	if (!present_section(section))
+		return -EINVAL;
+
+	return remove_memory_section(0, section, 0);
+}
+#endif /* CONFIG_MEMORY_HOTREMOVE */
 
 /* return true if the memory block is offlined, otherwise, return false */
 bool is_memblock_offlined(struct memory_block *mem)
@@ -806,6 +897,9 @@ bool is_memblock_offlined(struct memory_block *mem)
 static struct attribute *memory_root_attrs[] = {
 #ifdef CONFIG_ARCH_MEMORY_PROBE
 	&dev_attr_probe.attr,
+#ifdef CONFIG_MEMORY_HOTREMOVE
+	&dev_attr_remove.attr,
+#endif
 #endif
 
 #ifdef CONFIG_MEMORY_FAILURE
@@ -815,6 +909,10 @@ static struct attribute *memory_root_attrs[] = {
 
 	&dev_attr_block_size_bytes.attr,
 	&dev_attr_auto_online_blocks.attr,
+#ifdef CONFIG_MEMORY_HOTPLUG
+	&dev_attr_aligned_blocks_addr.attr,
+	&dev_attr_aligned_blocks_num.attr,
+#endif
 	NULL
 };
 
@@ -849,8 +947,11 @@ int __init memory_dev_init(void)
 	 * during boot and have been initialized
 	 */
 	mutex_lock(&mem_sysfs_mutex);
-	for (i = 0; i <= __highest_present_section_nr;
-		i += sections_per_block) {
+	for (i = 0; i < NR_MEM_SECTIONS; i += sections_per_block) {
+		/* Don't iterate over sections we know are !present: */
+		if (i > __highest_present_section_nr)
+			break;
+
 		err = add_memory_block(i);
 		if (!ret)
 			ret = err;
@@ -861,40 +962,4 @@ out:
 	if (ret)
 		printk(KERN_ERR "%s() failed: %d\n", __func__, ret);
 	return ret;
-}
-
-struct for_each_memory_block_cb_data {
-	walk_memory_blocks_func_t func;
-	void *arg;
-};
-
-static int for_each_memory_block_cb(struct device *dev, void *data)
-{
-	struct memory_block *mem = to_memory_block(dev);
-	struct for_each_memory_block_cb_data *cb_data = data;
-
-	return cb_data->func(mem, cb_data->arg);
-}
-
-/**
- * for_each_memory_block - walk through all present memory blocks
- *
- * @arg: argument passed to func
- * @func: callback for each memory block walked
- *
- * This function walks through all present memory blocks, calling func on
- * each memory block.
- *
- * In case func() returns an error, walking is aborted and the error is
- * returned.
- */
-int for_each_memory_block(void *arg, walk_memory_blocks_func_t func)
-{
-	struct for_each_memory_block_cb_data cb_data = {
-		.func = func,
-		.arg = arg,
-	};
-
-	return bus_for_each_dev(&memory_subsys, NULL, &cb_data,
-				for_each_memory_block_cb);
 }

@@ -233,10 +233,8 @@ static u32 to3264(u32 timing, int bpp, int is64)
 	switch (bpp) {
 	case 24:
 		timing *= 3;
-		/* fall through */
 	case 8:
 		timing >>= 1;
-		/* fall through */
 	case 16:
 		timing >>= 1;
 	case 32:
@@ -613,11 +611,6 @@ static int pm2fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
 	if (lpitch * var->yres_virtual > info->fix.smem_len) {
 		DPRINTK("no memory for screen (%ux%ux%u)\n",
 			var->xres, var->yres_virtual, var->bits_per_pixel);
-		return -EINVAL;
-	}
-
-	if (!var->pixclock) {
-		DPRINTK("pixclock is zero\n");
 		return -EINVAL;
 	}
 

@@ -162,10 +162,6 @@ void xenvif_napi_schedule_or_enable_events(struct xenvif_queue *queue)
 
 	if (more_to_do)
 		napi_schedule(&queue->napi);
-	else if (atomic_fetch_andnot(NETBK_TX_EOI | NETBK_COMMON_EOI,
-				     &queue->eoi_pending) &
-		 (NETBK_TX_EOI | NETBK_COMMON_EOI))
-		xen_irq_lateeoi(queue->tx_irq, 0);
 }
 
 static void tx_add_credit(struct xenvif_queue *queue)
@@ -187,9 +183,9 @@ static void tx_add_credit(struct xenvif_queue *queue)
 	queue->rate_limited = false;
 }
 
-void xenvif_tx_credit_callback(struct timer_list *t)
+void xenvif_tx_credit_callback(unsigned long data)
 {
-	struct xenvif_queue *queue = from_timer(queue, t, credit_timeout);
+	struct xenvif_queue *queue = (struct xenvif_queue *)data;
 	tx_add_credit(queue);
 	xenvif_napi_schedule_or_enable_events(queue);
 }
@@ -492,7 +488,7 @@ check_frags:
 				 * the header's copy failed, and they are
 				 * sharing a slot, send an error
 				 */
-				if (i == 0 && !first_shinfo && sharedslot)
+				if (i == 0 && sharedslot)
 					xenvif_idx_release(queue, pending_idx,
 							   XEN_NETIF_RSP_ERROR);
 				else
@@ -704,6 +700,8 @@ static bool tx_credit_exceeded(struct xenvif_queue *queue, unsigned size)
 
 	/* Still too big to send right now? Set a callback. */
 	if (size > queue->remaining_credit) {
+		queue->credit_timeout.data     =
+			(unsigned long)queue;
 		mod_timer(&queue->credit_timeout,
 			  next_credit);
 		queue->credit_window_start = next_credit;
@@ -1331,15 +1329,7 @@ int xenvif_tx_action(struct xenvif_queue *queue, int budget)
 				      NULL,
 				      queue->pages_to_map,
 				      nr_mops);
-		if (ret) {
-			unsigned int i;
-
-			netdev_err(queue->vif->dev, "Map fail: nr %u ret %d\n",
-				   nr_mops, ret);
-			for (i = 0; i < nr_mops; ++i)
-				WARN_ON_ONCE(queue->tx_map_ops[i].status ==
-				             GNTST_okay);
-		}
+		BUG_ON(ret);
 	}
 
 	work_done = xenvif_tx_submit(queue);
@@ -1617,22 +1607,17 @@ static void xenvif_ctrl_action(struct xenvif *vif)
 static bool xenvif_ctrl_work_todo(struct xenvif *vif)
 {
 	if (likely(RING_HAS_UNCONSUMED_REQUESTS(&vif->ctrl)))
-		return true;
+		return 1;
 
-	return false;
+	return 0;
 }
 
 irqreturn_t xenvif_ctrl_irq_fn(int irq, void *data)
 {
 	struct xenvif *vif = data;
-	unsigned int eoi_flag = XEN_EOI_FLAG_SPURIOUS;
 
-	while (xenvif_ctrl_work_todo(vif)) {
+	while (xenvif_ctrl_work_todo(vif))
 		xenvif_ctrl_action(vif);
-		eoi_flag = 0;
-	}
-
-	xen_irq_lateeoi(irq, eoi_flag);
 
 	return IRQ_HANDLED;
 }

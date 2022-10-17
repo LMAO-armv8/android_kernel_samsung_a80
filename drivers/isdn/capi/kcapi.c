@@ -534,8 +534,7 @@ int attach_capi_ctr(struct capi_ctr *ctr)
 	init_waitqueue_head(&ctr->state_wait_queue);
 
 	sprintf(ctr->procfn, "capi/controllers/%d", ctr->cnr);
-	ctr->procent = proc_create_single_data(ctr->procfn, 0, NULL,
-			ctr->proc_show, ctr);
+	ctr->procent = proc_create_data(ctr->procfn, 0, NULL, ctr->proc_fops, ctr);
 
 	ncontrollers++;
 
@@ -564,11 +563,6 @@ int detach_capi_ctr(struct capi_ctr *ctr)
 	mutex_lock(&capi_controller_lock);
 
 	ctr_down(ctr, CAPI_CTR_DETACHED);
-
-	if (ctr->cnr < 1 || ctr->cnr - 1 >= CAPI_MAXCONTR) {
-		err = -EINVAL;
-		goto unlock_out;
-	}
 
 	if (capi_controller[ctr->cnr - 1] != ctr) {
 		err = -EINVAL;
@@ -851,7 +845,7 @@ EXPORT_SYMBOL(capi20_put_message);
  * Return value: CAPI result code
  */
 
-u16 capi20_get_manufacturer(u32 contr, u8 buf[CAPI_MANUFACTURER_LEN])
+u16 capi20_get_manufacturer(u32 contr, u8 *buf)
 {
 	struct capi_ctr *ctr;
 	u16 ret;
@@ -921,7 +915,7 @@ EXPORT_SYMBOL(capi20_get_version);
  * Return value: CAPI result code
  */
 
-u16 capi20_get_serial(u32 contr, u8 serial[CAPI_SERIAL_LEN])
+u16 capi20_get_serial(u32 contr, u8 *serial)
 {
 	struct capi_ctr *ctr;
 	u16 ret;

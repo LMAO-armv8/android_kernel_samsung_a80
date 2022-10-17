@@ -180,11 +180,7 @@ struct vf610_adc {
 	u32 sample_freq_avail[5];
 
 	struct completion completion;
-	/* Ensure the timestamp is naturally aligned */
-	struct {
-		u16 chan;
-		s64 timestamp __aligned(8);
-	} scan;
+	u16 buffer[8];
 };
 
 static const u32 vf610_hw_avgs[] = { 1, 4, 8, 16, 32 };
@@ -596,9 +592,9 @@ static irqreturn_t vf610_adc_isr(int irq, void *dev_id)
 	if (coco & VF610_ADC_HS_COCO0) {
 		info->value = vf610_adc_read_data(info);
 		if (iio_buffer_enabled(indio_dev)) {
-			info->scan.chan = info->value;
+			info->buffer[0] = info->value;
 			iio_push_to_buffers_with_timestamp(indio_dev,
-					&info->scan,
+					info->buffer,
 					iio_get_time_ns(indio_dev));
 			iio_trigger_notify_done(indio_dev->trig);
 		} else
@@ -803,6 +799,7 @@ static int vf610_adc_reg_access(struct iio_dev *indio_dev,
 }
 
 static const struct iio_info vf610_adc_iio_info = {
+	.driver_module = THIS_MODULE,
 	.read_raw = &vf610_read_raw,
 	.write_raw = &vf610_write_raw,
 	.debugfs_reg_access = &vf610_adc_reg_access,

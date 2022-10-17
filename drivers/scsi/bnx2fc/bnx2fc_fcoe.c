@@ -80,7 +80,7 @@ static int bnx2fc_bind_pcidev(struct bnx2fc_hba *hba);
 static void bnx2fc_unbind_pcidev(struct bnx2fc_hba *hba);
 static struct fc_lport *bnx2fc_if_create(struct bnx2fc_interface *interface,
 				  struct device *parent, int npiv);
-static void bnx2fc_port_destroy(struct fcoe_port *port);
+static void bnx2fc_destroy_work(struct work_struct *work);
 
 static struct bnx2fc_hba *bnx2fc_hba_lookup(struct net_device *phys_dev);
 static struct bnx2fc_interface *bnx2fc_interface_lookup(struct net_device
@@ -515,8 +515,7 @@ static int bnx2fc_l2_rcv_thread(void *arg)
 
 static void bnx2fc_recv_frame(struct sk_buff *skb)
 {
-	u64 crc_err;
-	u32 fr_len, fr_crc;
+	u32 fr_len;
 	struct fc_lport *lport;
 	struct fcoe_rcv_info *fr;
 	struct fc_stats *stats;
@@ -549,11 +548,6 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
 	fh = (struct fc_frame_header *) skb_transport_header(skb);
 	skb_pull(skb, sizeof(struct fcoe_hdr));
 	fr_len = skb->len - sizeof(struct fcoe_crc_eof);
-
-	stats = per_cpu_ptr(lport->stats, get_cpu());
-	stats->RxFrames++;
-	stats->RxWords += fr_len / FCOE_WORD_TO_BYTE;
-	put_cpu();
 
 	fp = (struct fc_frame *)skb;
 	fc_frame_init(fp);
@@ -637,15 +631,16 @@ static void bnx2fc_recv_frame(struct sk_buff *skb)
 		return;
 	}
 
-	fr_crc = le32_to_cpu(fr_crc(fp));
+	stats = per_cpu_ptr(lport->stats, smp_processor_id());
+	stats->RxFrames++;
+	stats->RxWords += fr_len / FCOE_WORD_TO_BYTE;
 
-	if (unlikely(fr_crc != ~crc32(~0, skb->data, fr_len))) {
-		stats = per_cpu_ptr(lport->stats, get_cpu());
-		crc_err = (stats->InvalidCRCCount++);
-		put_cpu();
-		if (crc_err < 5)
+	if (le32_to_cpu(fr_crc(fp)) !=
+			~crc32(~0, skb->data, fr_len)) {
+		if (stats->InvalidCRCCount < 5)
 			printk(KERN_WARNING PFX "dropping frame with "
 			       "CRC error\n");
+		stats->InvalidCRCCount++;
 		kfree_skb(skb);
 		return;
 	}
@@ -828,7 +823,7 @@ static int bnx2fc_net_config(struct fc_lport *lport, struct net_device *netdev)
 
 	skb_queue_head_init(&port->fcoe_pending_queue);
 	port->fcoe_pending_queue_active = 0;
-	timer_setup(&port->timer, fcoe_queue_timer, 0);
+	setup_timer(&port->timer, fcoe_queue_timer, (unsigned long) lport);
 
 	fcoe_link_speed_update(lport);
 
@@ -850,9 +845,9 @@ static int bnx2fc_net_config(struct fc_lport *lport, struct net_device *netdev)
 	return 0;
 }
 
-static void bnx2fc_destroy_timer(struct timer_list *t)
+static void bnx2fc_destroy_timer(unsigned long data)
 {
-	struct bnx2fc_hba *hba = from_timer(hba, t, destroy_timer);
+	struct bnx2fc_hba *hba = (struct bnx2fc_hba *)data;
 
 	printk(KERN_ERR PFX "ERROR:bnx2fc_destroy_timer - "
 	       "Destroy compl not received!!\n");
@@ -916,6 +911,9 @@ static void bnx2fc_indicate_netevent(void *context, unsigned long event,
 				__bnx2fc_destroy(interface);
 		}
 		mutex_unlock(&bnx2fc_dev_lock);
+
+		/* Ensure ALL destroy work has been completed before return */
+		flush_workqueue(bnx2fc_wq);
 		return;
 
 	default:
@@ -1222,8 +1220,8 @@ static int bnx2fc_vport_destroy(struct fc_vport *vport)
 	mutex_unlock(&n_port->lp_mutex);
 	bnx2fc_free_vport(interface->hba, port->lport);
 	bnx2fc_port_shutdown(port->lport);
-	bnx2fc_port_destroy(port);
 	bnx2fc_interface_put(interface);
+	queue_work(bnx2fc_wq, &port->destroy_work);
 	return 0;
 }
 
@@ -1399,7 +1397,7 @@ static struct bnx2fc_hba *bnx2fc_hba_create(struct cnic_dev *cnic)
 	hba->next_conn_id = 0;
 
 	hba->tgt_ofld_list =
-		kcalloc(BNX2FC_NUM_MAX_SESS, sizeof(struct bnx2fc_rport *),
+		kzalloc(sizeof(struct bnx2fc_rport *) * BNX2FC_NUM_MAX_SESS,
 			GFP_KERNEL);
 	if (!hba->tgt_ofld_list) {
 		printk(KERN_ERR PFX "Unable to allocate tgt offload list\n");
@@ -1532,6 +1530,7 @@ static struct fc_lport *bnx2fc_if_create(struct bnx2fc_interface *interface,
 	port->lport = lport;
 	port->priv = interface;
 	port->get_netdev = bnx2fc_netdev;
+	INIT_WORK(&port->destroy_work, bnx2fc_destroy_work);
 
 	/* Configure fcoe_port */
 	rc = bnx2fc_lport_config(lport);
@@ -1553,7 +1552,7 @@ static struct fc_lport *bnx2fc_if_create(struct bnx2fc_interface *interface,
 
 	rc = bnx2fc_shost_config(lport, parent);
 	if (rc) {
-		printk(KERN_ERR PFX "Couldn't configure shost for %s\n",
+		printk(KERN_ERR PFX "Couldnt configure shost for %s\n",
 			interface->netdev->name);
 		goto lp_config_err;
 	}
@@ -1561,7 +1560,7 @@ static struct fc_lport *bnx2fc_if_create(struct bnx2fc_interface *interface,
 	/* Initialize the libfc library */
 	rc = bnx2fc_libfc_config(lport);
 	if (rc) {
-		printk(KERN_ERR PFX "Couldn't configure libfc\n");
+		printk(KERN_ERR PFX "Couldnt configure libfc\n");
 		goto shost_err;
 	}
 	fc_host_port_type(lport->host) = FC_PORTTYPE_UNKNOWN;
@@ -1659,8 +1658,8 @@ static void __bnx2fc_destroy(struct bnx2fc_interface *interface)
 	bnx2fc_interface_cleanup(interface);
 	bnx2fc_stop(interface);
 	list_del(&interface->list);
-	bnx2fc_port_destroy(port);
 	bnx2fc_interface_put(interface);
+	queue_work(bnx2fc_wq, &port->destroy_work);
 }
 
 /**
@@ -1701,12 +1700,15 @@ netdev_err:
 	return rc;
 }
 
-static void bnx2fc_port_destroy(struct fcoe_port *port)
+static void bnx2fc_destroy_work(struct work_struct *work)
 {
+	struct fcoe_port *port;
 	struct fc_lport *lport;
 
+	port = container_of(work, struct fcoe_port, destroy_work);
 	lport = port->lport;
-	BNX2FC_HBA_DBG(lport, "Entered %s, destroying lport %p\n", __func__, lport);
+
+	BNX2FC_HBA_DBG(lport, "Entered bnx2fc_destroy_work\n");
 
 	bnx2fc_if_destroy(lport);
 }
@@ -1944,10 +1946,11 @@ static void bnx2fc_fw_destroy(struct bnx2fc_hba *hba)
 {
 	if (test_and_clear_bit(BNX2FC_FLAG_FW_INIT_DONE, &hba->flags)) {
 		if (bnx2fc_send_fw_fcoe_destroy_msg(hba) == 0) {
-			timer_setup(&hba->destroy_timer, bnx2fc_destroy_timer,
-				    0);
+			init_timer(&hba->destroy_timer);
 			hba->destroy_timer.expires = BNX2FC_FW_TIMEOUT +
 								jiffies;
+			hba->destroy_timer.function = bnx2fc_destroy_timer;
+			hba->destroy_timer.data = (unsigned long)hba;
 			add_timer(&hba->destroy_timer);
 			wait_event_interruptible(hba->destroy_wait,
 					test_bit(BNX2FC_FLAG_DESTROY_CMPL,
@@ -2559,6 +2562,9 @@ static void bnx2fc_ulp_exit(struct cnic_dev *dev)
 		if (interface->hba == hba)
 			__bnx2fc_destroy(interface);
 	mutex_unlock(&bnx2fc_dev_lock);
+
+	/* Ensure ALL destroy work has been completed before return */
+	flush_workqueue(bnx2fc_wq);
 
 	bnx2fc_ulp_stop(hba);
 	/* unregister cnic device */

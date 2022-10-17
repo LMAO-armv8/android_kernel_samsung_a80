@@ -1,8 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (c) 2011-2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2012,2018 The Linux Foundation. All rights reserved.
  *
  * Description: CoreSight Embedded Trace Buffer driver
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  */
 
 #include <linux/atomic.h>
@@ -26,6 +33,7 @@
 #include <linux/mm.h>
 #include <linux/perf_event.h>
 
+#include <asm/local.h>
 
 #include "coresight-priv.h"
 #include "coresight-etm-perf.h"
@@ -736,13 +744,12 @@ static int etb_probe(struct amba_device *adev, const struct amba_id *id)
 	spin_lock_init(&drvdata->spinlock);
 
 	drvdata->buffer_depth = etb_get_buffer_depth(drvdata);
-	pm_runtime_put(&adev->dev);
 
 	if (drvdata->buffer_depth & 0x80000000)
 		return -EINVAL;
 
-	drvdata->buf = devm_kcalloc(dev,
-				    drvdata->buffer_depth, 4, GFP_KERNEL);
+	drvdata->buf = devm_kzalloc(dev,
+				    drvdata->buffer_depth * 4, GFP_KERNEL);
 	if (!drvdata->buf)
 		return -ENOMEM;
 
@@ -762,6 +769,7 @@ static int etb_probe(struct amba_device *adev, const struct amba_id *id)
 	ret = misc_register(&drvdata->miscdev);
 	if (ret)
 		goto err_misc_register;
+	pm_runtime_put(&adev->dev);
 
 	return 0;
 
@@ -798,8 +806,8 @@ static const struct dev_pm_ops etb_dev_pm_ops = {
 
 static const struct amba_id etb_ids[] = {
 	{
-		.id	= 0x000bb907,
-		.mask	= 0x000fffff,
+		.id	= 0x0003b907,
+		.mask	= 0x0003ffff,
 	},
 	{ 0, 0},
 };

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2012-2017 Qualcomm Atheros, Inc.
- * Copyright (c) 2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -218,6 +218,8 @@ static void wil_print_sring(struct seq_file *s, struct wil6210_priv *wil,
 		seq_puts(s, "???\n");
 	}
 	seq_printf(s, "  desc_rdy_pol   = %d\n", sring->desc_rdy_pol);
+	seq_printf(s, "  invalid_buff_id_cnt   = %d\n",
+		   sring->invalid_buff_id_cnt);
 
 	if (sring->va && (sring->size <= (1 << WIL_RING_SIZE_ORDER_MAX))) {
 		uint i;
@@ -279,6 +281,11 @@ static void wil_print_mbox_ring(struct seq_file *s, const char *prefix,
 	uint i;
 
 	wil_halp_vote(wil);
+
+	if (wil_mem_access_lock(wil)) {
+		wil_halp_unvote(wil);
+		return;
+	}
 
 	wil_memcpy_fromio_32(&r, off, sizeof(r));
 	wil_mbox_ring_le2cpus(&r);
@@ -345,6 +352,7 @@ static void wil_print_mbox_ring(struct seq_file *s, const char *prefix,
 	}
  out:
 	seq_puts(s, "}\n");
+	wil_mem_access_unlock(wil);
 	wil_halp_unvote(wil);
 }
 
@@ -390,7 +398,8 @@ static int wil_debugfs_iomem_x32_set(void *data, u64 val)
 	if (ret < 0)
 		return ret;
 
-	writel(val, (void __iomem *)d->offset);
+	writel_relaxed(val, (void __iomem *)d->offset);
+
 	wmb(); /* make sure write propagated to HW */
 
 	wil_pm_runtime_put(wil);
@@ -409,7 +418,7 @@ static int wil_debugfs_iomem_x32_get(void *data, u64 *val)
 	if (ret < 0)
 		return ret;
 
-	*val = readl((void __iomem *)d->offset);
+	*val = readl_relaxed((void __iomem *)d->offset);
 
 	wil_pm_runtime_put(wil);
 
@@ -632,12 +641,20 @@ static int wil_memread_debugfs_show(struct seq_file *s, void *data)
 	if (ret < 0)
 		return ret;
 
+	ret = wil_mem_access_lock(wil);
+	if (ret) {
+		wil_pm_runtime_put(wil);
+		return ret;
+	}
+
 	a = wmi_buffer(wil, cpu_to_le32(mem_addr));
 
 	if (a)
 		seq_printf(s, "[0x%08x] = 0x%08x\n", mem_addr, readl(a));
 	else
 		seq_printf(s, "[0x%08x] = INVALID\n", mem_addr);
+
+	wil_mem_access_unlock(wil);
 
 	wil_pm_runtime_put(wil);
 
@@ -668,10 +685,6 @@ static ssize_t wil_read_file_ioblob(struct file *file, char __user *user_buf,
 	size_t unaligned_bytes, aligned_count, ret;
 	int rc;
 
-	if (test_bit(wil_status_suspending, wil_blob->wil->status) ||
-	    test_bit(wil_status_suspended, wil_blob->wil->status))
-		return 0;
-
 	if (pos < 0)
 		return -EINVAL;
 
@@ -698,11 +711,19 @@ static ssize_t wil_read_file_ioblob(struct file *file, char __user *user_buf,
 		return rc;
 	}
 
+	rc = wil_mem_access_lock(wil);
+	if (rc) {
+		kfree(buf);
+		wil_pm_runtime_put(wil);
+		return rc;
+	}
+
 	wil_memcpy_fromio_32(buf, (const void __iomem *)
 			     wil_blob->blob.data + aligned_pos, aligned_count);
 
 	ret = copy_to_user(user_buf, buf + unaligned_bytes, count);
 
+	wil_mem_access_unlock(wil);
 	wil_pm_runtime_put(wil);
 
 	kfree(buf);
@@ -1002,14 +1023,20 @@ static ssize_t wil_write_file_wmi(struct file *file, const char __user *buf,
 	void *cmd;
 	int cmdlen = len - sizeof(struct wmi_cmd_hdr);
 	u16 cmdid;
-	int rc1;
+	int rc, rc1;
 
-	if (cmdlen < 0 || *ppos != 0)
+	if (cmdlen < 0)
 		return -EINVAL;
 
-	wmi = memdup_user(buf, len);
-	if (IS_ERR(wmi))
-		return PTR_ERR(wmi);
+	wmi = kmalloc(len, GFP_KERNEL);
+	if (!wmi)
+		return -ENOMEM;
+
+	rc = simple_write_to_buffer(wmi, len, ppos, buf, len);
+	if (rc < 0) {
+		kfree(wmi);
+		return rc;
+	}
 
 	cmd = (cmdlen > 0) ? &wmi[1] : NULL;
 	cmdid = le16_to_cpu(wmi->command_id);
@@ -1019,7 +1046,7 @@ static ssize_t wil_write_file_wmi(struct file *file, const char __user *buf,
 
 	wil_info(wil, "0x%04x[%d] -> %d\n", cmdid, cmdlen, rc1);
 
-	return len;
+	return rc;
 }
 
 static const struct file_operations fops_wmi = {
@@ -1365,6 +1392,50 @@ static const struct file_operations fops_bf = {
 	.llseek		= seq_lseek,
 };
 
+/*---------SSID------------*/
+static ssize_t wil_read_file_ssid(struct file *file, char __user *user_buf,
+				  size_t count, loff_t *ppos)
+{
+	struct wil6210_priv *wil = file->private_data;
+	struct wireless_dev *wdev = wil->main_ndev->ieee80211_ptr;
+
+	return simple_read_from_buffer(user_buf, count, ppos,
+				       wdev->ssid, wdev->ssid_len);
+}
+
+static ssize_t wil_write_file_ssid(struct file *file, const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	struct wil6210_priv *wil = file->private_data;
+	struct wireless_dev *wdev = wil->main_ndev->ieee80211_ptr;
+	struct net_device *ndev = wil->main_ndev;
+
+	if (*ppos != 0) {
+		wil_err(wil, "Unable to set SSID substring from [%d]\n",
+			(int)*ppos);
+		return -EINVAL;
+	}
+
+	if (count > sizeof(wdev->ssid)) {
+		wil_err(wil, "SSID too long, len = %d\n", (int)count);
+		return -EINVAL;
+	}
+	if (netif_running(ndev)) {
+		wil_err(wil, "Unable to change SSID on running interface\n");
+		return -EINVAL;
+	}
+
+	wdev->ssid_len = count;
+	return simple_write_to_buffer(wdev->ssid, wdev->ssid_len, ppos,
+				      buf, count);
+}
+
+static const struct file_operations fops_ssid = {
+	.read = wil_read_file_ssid,
+	.write = wil_write_file_ssid,
+	.open  = simple_open,
+};
+
 /*---------temp------------*/
 static void print_temp(struct seq_file *s, const char *prefix, s32 t)
 {
@@ -1437,12 +1508,8 @@ static const struct file_operations fops_freq = {
 static int wil_link_debugfs_show(struct seq_file *s, void *data)
 {
 	struct wil6210_priv *wil = s->private;
-	struct station_info *sinfo;
-	int i, rc = 0;
-
-	sinfo = kzalloc(sizeof(*sinfo), GFP_KERNEL);
-	if (!sinfo)
-		return -ENOMEM;
+	struct station_info sinfo;
+	int i, rc;
 
 	for (i = 0; i < ARRAY_SIZE(wil->sta); i++) {
 		struct wil_sta_info *p = &wil->sta[i];
@@ -1470,21 +1537,19 @@ static int wil_link_debugfs_show(struct seq_file *s, void *data)
 
 		vif = (mid < wil->max_vifs) ? wil->vifs[mid] : NULL;
 		if (vif) {
-			rc = wil_cid_fill_sinfo(vif, i, sinfo);
+			rc = wil_cid_fill_sinfo(vif, i, &sinfo);
 			if (rc)
-				goto out;
+				return rc;
 
-			seq_printf(s, "  Tx_mcs = %d\n", sinfo->txrate.mcs);
-			seq_printf(s, "  Rx_mcs = %d\n", sinfo->rxrate.mcs);
-			seq_printf(s, "  SQ     = %d\n", sinfo->signal);
+			seq_printf(s, "  Tx_mcs = %d\n", sinfo.txrate.mcs);
+			seq_printf(s, "  Rx_mcs = %d\n", sinfo.rxrate.mcs);
+			seq_printf(s, "  SQ     = %d\n", sinfo.signal);
 		} else {
 			seq_puts(s, "  INVALID MID\n");
 		}
 	}
 
-out:
-	kfree(sinfo);
-	return rc;
+	return 0;
 }
 
 static int wil_link_seq_open(struct inode *inode, struct file *file)
@@ -1673,6 +1738,7 @@ __acquires(&p->tid_rx_lock) __releases(&p->tid_rx_lock)
 		char *status = "unknown";
 		u8 aid = 0;
 		u8 mid;
+		bool sta_connected = false;
 
 		switch (p->status) {
 		case wil_sta_unused:
@@ -1687,8 +1753,20 @@ __acquires(&p->tid_rx_lock) __releases(&p->tid_rx_lock)
 			break;
 		}
 		mid = (p->status != wil_sta_unused) ? p->mid : U8_MAX;
-		seq_printf(s, "[%d] %pM %s MID %d AID %d\n", i, p->addr, status,
-			   mid, aid);
+		if (mid < wil->max_vifs) {
+			struct wil6210_vif *vif = wil->vifs[mid];
+
+			if (vif->wdev.iftype == NL80211_IFTYPE_STATION &&
+			    p->status == wil_sta_connected)
+				sta_connected = true;
+		}
+		/* print roam counter only for connected stations */
+		if (sta_connected)
+			seq_printf(s, "[%d] %pM connected (roam counter %d) MID %d AID %d\n",
+				   i, p->addr, p->stats.ft_roams, mid, aid);
+		else
+			seq_printf(s, "[%d] %pM %s MID %d AID %d\n", i,
+				   p->addr, status, mid, aid);
 
 		if (p->status == wil_sta_connected) {
 			spin_lock_bh(&p->tid_rx_lock);
@@ -2428,6 +2506,7 @@ static const struct {
 	{"mids",	0444,		&fops_mids},
 	{"desc",	0444,		&fops_txdesc},
 	{"bf",		0444,		&fops_bf},
+	{"ssid",	0644,		&fops_ssid},
 	{"mem_val",	0644,		&fops_memread},
 	{"rxon",	0244,		&fops_rxon},
 	{"tx_mgmt",	0244,		&fops_txmgmt},
@@ -2503,6 +2582,7 @@ static const struct dbg_off dbg_wil_off[] = {
 	WIL_FIELD(tx_status_ring_order, 0644,	doff_u32),
 	WIL_FIELD(rx_buff_id_count, 0644,	doff_u32),
 	WIL_FIELD(amsdu_en, 0644,	doff_u8),
+	WIL_FIELD(force_edmg_channel, 0644,	doff_u8),
 	{},
 };
 
@@ -2535,6 +2615,7 @@ int wil6210_debugfs_init(struct wil6210_priv *wil)
 {
 	struct dentry *dbg = wil->debug = debugfs_create_dir(WIL_NAME,
 			wil_to_wiphy(wil)->debugfsdir);
+
 	if (IS_ERR_OR_NULL(dbg))
 		return -ENODEV;
 

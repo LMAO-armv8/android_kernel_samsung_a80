@@ -26,7 +26,6 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/io-64-nonatomic-hi-lo.h>
-#include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/kconfig.h>
@@ -43,6 +42,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
+#include "io-pgtable.h"
 #include "arm-smmu-regs.h"
 
 #define SMMU_INTR_SEL_NS     0x2000
@@ -66,7 +66,6 @@ struct qcom_iommu_ctx {
 	void __iomem		*base;
 	bool			 secure_init;
 	u8			 asid;      /* asid and ctx bank # are 1:1 */
-	struct iommu_domain	*domain;
 };
 
 struct qcom_iommu_domain {
@@ -195,15 +194,12 @@ static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 	fsynr = iommu_readl(ctx, ARM_SMMU_CB_FSYNR0);
 	iova = iommu_readq(ctx, ARM_SMMU_CB_FAR);
 
-	if (!report_iommu_fault(ctx->domain, ctx->dev, iova, 0)) {
-		dev_err_ratelimited(ctx->dev,
-				    "Unhandled context fault: fsr=0x%x, "
-				    "iova=0x%016llx, fsynr=0x%x, cb=%d\n",
-				    fsr, iova, fsynr, ctx->asid);
-	}
+	dev_err_ratelimited(ctx->dev,
+			    "Unhandled context fault: fsr=0x%x, "
+			    "iova=0x%016llx, fsynr=0x%x, cb=%d\n",
+			    fsr, iova, fsynr, ctx->asid);
 
 	iommu_writel(ctx, ARM_SMMU_CB_FSR, fsr);
-	iommu_writel(ctx, ARM_SMMU_CB_RESUME, RESUME_TERMINATE);
 
 	return IRQ_HANDLED;
 }
@@ -278,14 +274,12 @@ static int qcom_iommu_init_domain(struct iommu_domain *domain,
 
 		/* SCTLR */
 		reg = SCTLR_CFIE | SCTLR_CFRE | SCTLR_AFE | SCTLR_TRE |
-			SCTLR_M | SCTLR_S1_ASIDPNE | SCTLR_CFCFG;
+			SCTLR_M | SCTLR_S1_ASIDPNE;
 
 		if (IS_ENABLED(CONFIG_BIG_ENDIAN))
 			reg |= SCTLR_E;
 
 		iommu_writel(ctx, ARM_SMMU_CB_SCTLR, reg);
-
-		ctx->domain = domain;
 	}
 
 	mutex_unlock(&qcom_domain->init_mutex);
@@ -399,8 +393,6 @@ static void qcom_iommu_detach_dev(struct iommu_domain *domain, struct device *de
 
 		/* Disable the context bank: */
 		iommu_writel(ctx, ARM_SMMU_CB_SCTLR, 0);
-
-		ctx->domain = NULL;
 	}
 	pm_runtime_put_sync(qcom_iommu->dev);
 }
@@ -445,19 +437,6 @@ static size_t qcom_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
 	pm_runtime_put_sync(qcom_domain->iommu->dev);
 
 	return ret;
-}
-
-static void qcom_iommu_iotlb_sync(struct iommu_domain *domain)
-{
-	struct qcom_iommu_domain *qcom_domain = to_qcom_iommu_domain(domain);
-	struct io_pgtable *pgtable = container_of(qcom_domain->pgtbl_ops,
-						  struct io_pgtable, ops);
-	if (!qcom_domain->pgtbl_ops)
-		return;
-
-	pm_runtime_get_sync(qcom_domain->iommu->dev);
-	qcom_iommu_tlb_sync(pgtable->cookie);
-	pm_runtime_put_sync(qcom_domain->iommu->dev);
 }
 
 static phys_addr_t qcom_iommu_iova_to_phys(struct iommu_domain *domain,
@@ -586,8 +565,7 @@ static const struct iommu_ops qcom_iommu_ops = {
 	.detach_dev	= qcom_iommu_detach_dev,
 	.map		= qcom_iommu_map,
 	.unmap		= qcom_iommu_unmap,
-	.flush_iotlb_all = qcom_iommu_iotlb_sync,
-	.iotlb_sync	= qcom_iommu_iotlb_sync,
+	.map_sg		= default_iommu_map_sg,
 	.iova_to_phys	= qcom_iommu_iova_to_phys,
 	.add_device	= qcom_iommu_add_device,
 	.remove_device	= qcom_iommu_remove_device,
@@ -767,12 +745,9 @@ static bool qcom_iommu_has_secure_context(struct qcom_iommu_dev *qcom_iommu)
 {
 	struct device_node *child;
 
-	for_each_child_of_node(qcom_iommu->dev->of_node, child) {
-		if (of_device_is_compatible(child, "qcom,msm-iommu-v1-sec")) {
-			of_node_put(child);
+	for_each_child_of_node(qcom_iommu->dev->of_node, child)
+		if (of_device_is_compatible(child, "qcom,msm-iommu-v1-sec"))
 			return true;
-		}
-	}
 
 	return false;
 }
@@ -886,14 +861,16 @@ static int qcom_iommu_device_remove(struct platform_device *pdev)
 
 static int __maybe_unused qcom_iommu_resume(struct device *dev)
 {
-	struct qcom_iommu_dev *qcom_iommu = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_iommu_dev *qcom_iommu = platform_get_drvdata(pdev);
 
 	return qcom_iommu_enable_clocks(qcom_iommu);
 }
 
 static int __maybe_unused qcom_iommu_suspend(struct device *dev)
 {
-	struct qcom_iommu_dev *qcom_iommu = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct qcom_iommu_dev *qcom_iommu = platform_get_drvdata(pdev);
 
 	qcom_iommu_disable_clocks(qcom_iommu);
 
@@ -945,6 +922,8 @@ static void __exit qcom_iommu_exit(void)
 
 module_init(qcom_iommu_init);
 module_exit(qcom_iommu_exit);
+
+IOMMU_OF_DECLARE(qcom_iommu_dev, "qcom,msm-iommu-v1", NULL);
 
 MODULE_DESCRIPTION("IOMMU API for QCOM IOMMU v1 implementations");
 MODULE_LICENSE("GPL v2");

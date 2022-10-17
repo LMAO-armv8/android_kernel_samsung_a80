@@ -125,7 +125,7 @@ static int sq905_command(struct gspca_dev *gspca_dev, u16 index)
 	}
 
 	ret = usb_control_msg(gspca_dev->dev,
-			      usb_rcvctrlpipe(gspca_dev->dev, 0),
+			      usb_sndctrlpipe(gspca_dev->dev, 0),
 			      USB_REQ_SYNCH_FRAME,                /* request */
 			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
 			      SQ905_PING, 0, gspca_dev->usb_buf, 1,
@@ -167,7 +167,7 @@ static int
 sq905_read_data(struct gspca_dev *gspca_dev, u8 *data, int size, int need_lock)
 {
 	int ret;
-	int act_len = 0;
+	int act_len;
 
 	gspca_dev->usb_buf[0] = '\0';
 	if (need_lock)
@@ -217,7 +217,7 @@ static void sq905_dostream(struct work_struct *work)
 	u8 *data;
 	u8 *buffer;
 
-	buffer = kmalloc(SQ905_MAX_TRANSFER, GFP_KERNEL);
+	buffer = kmalloc(SQ905_MAX_TRANSFER, GFP_KERNEL | GFP_DMA);
 	if (!buffer) {
 		pr_err("Couldn't allocate USB buffer\n");
 		goto quit_stream;
@@ -246,9 +246,9 @@ static void sq905_dostream(struct work_struct *work)
 			ret = sq905_read_data(gspca_dev, buffer, data_len, 1);
 			if (ret < 0)
 				goto quit_stream;
-			gspca_dbg(gspca_dev, D_PACK,
-				  "Got %d bytes out of %d for frame\n",
-				  data_len, bytes_left);
+			PDEBUG(D_PACK,
+				"Got %d bytes out of %d for frame",
+				data_len, bytes_left);
 			bytes_left -= data_len;
 			data = buffer;
 			if (!header_read) {
@@ -345,7 +345,7 @@ static int sd_init(struct gspca_dev *gspca_dev)
 	ret = sq905_command(gspca_dev, SQ905_CLEAR);
 	if (ret < 0)
 		return ret;
-	gspca_dbg(gspca_dev, D_CONF, "SQ905 camera ID %08x detected\n", ident);
+	PDEBUG(D_CONF, "SQ905 camera ID %08x detected", ident);
 	gspca_dev->cam.cam_mode = sq905_mode;
 	gspca_dev->cam.nmodes = ARRAY_SIZE(sq905_mode);
 	if (!(ident & SQ905_HIRES_MASK))
@@ -369,20 +369,20 @@ static int sd_start(struct gspca_dev *gspca_dev)
 	switch (gspca_dev->curr_mode) {
 	default:
 /*	case 2: */
-		gspca_dbg(gspca_dev, D_STREAM, "Start streaming at high resolution\n");
+		PDEBUG(D_STREAM, "Start streaming at high resolution");
 		ret = sq905_command(&dev->gspca_dev, SQ905_CAPTURE_HIGH);
 		break;
 	case 1:
-		gspca_dbg(gspca_dev, D_STREAM, "Start streaming at medium resolution\n");
+		PDEBUG(D_STREAM, "Start streaming at medium resolution");
 		ret = sq905_command(&dev->gspca_dev, SQ905_CAPTURE_MED);
 		break;
 	case 0:
-		gspca_dbg(gspca_dev, D_STREAM, "Start streaming at low resolution\n");
+		PDEBUG(D_STREAM, "Start streaming at low resolution");
 		ret = sq905_command(&dev->gspca_dev, SQ905_CAPTURE_LOW);
 	}
 
 	if (ret < 0) {
-		gspca_err(gspca_dev, "Start streaming command failed\n");
+		PERR("Start streaming command failed");
 		return ret;
 	}
 	/* Start the workqueue function to do the streaming */

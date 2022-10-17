@@ -182,7 +182,7 @@ static void qed_vf_pf_add_qid(struct qed_hwfn *p_hwfn,
 	p_qid_tlv->qid = p_cid->qid_usage_idx;
 }
 
-static int _qed_vf_pf_release(struct qed_hwfn *p_hwfn, bool b_final)
+int _qed_vf_pf_release(struct qed_hwfn *p_hwfn, bool b_final)
 {
 	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
 	struct pfvf_def_resp_tlv *resp;
@@ -539,9 +539,6 @@ int qed_vf_hw_prepare(struct qed_hwfn *p_hwfn)
 						    p_iov->bulletin.size,
 						    &p_iov->bulletin.phys,
 						    GFP_KERNEL);
-	if (!p_iov->bulletin.p_virt)
-		goto free_pf2vf_reply;
-
 	DP_VERBOSE(p_hwfn, QED_MSG_IOV,
 		   "VF's bulletin Board [%p virt 0x%llx phys 0x%08x bytes]\n",
 		   p_iov->bulletin.p_virt,
@@ -581,10 +578,6 @@ int qed_vf_hw_prepare(struct qed_hwfn *p_hwfn)
 
 	return rc;
 
-free_pf2vf_reply:
-	dma_free_coherent(&p_hwfn->cdev->pdev->dev,
-			  sizeof(union pfvf_tlvs),
-			  p_iov->pf2vf_reply, p_iov->pf2vf_reply_phys);
 free_vf2pf_request:
 	dma_free_coherent(&p_hwfn->cdev->pdev->dev,
 			  sizeof(union vfpf_tlvs),
@@ -1400,35 +1393,6 @@ int qed_vf_pf_get_coalesce(struct qed_hwfn *p_hwfn,
 exit:
 	qed_vf_pf_req_end(p_hwfn, rc);
 
-	return rc;
-}
-
-int
-qed_vf_pf_bulletin_update_mac(struct qed_hwfn *p_hwfn,
-			      u8 *p_mac)
-{
-	struct qed_vf_iov *p_iov = p_hwfn->vf_iov_info;
-	struct vfpf_bulletin_update_mac_tlv *p_req;
-	struct pfvf_def_resp_tlv *p_resp;
-	int rc;
-
-	if (!p_mac)
-		return -EINVAL;
-
-	/* clear mailbox and prep header tlv */
-	p_req = qed_vf_pf_prep(p_hwfn, CHANNEL_TLV_BULLETIN_UPDATE_MAC,
-			       sizeof(*p_req));
-	ether_addr_copy(p_req->mac, p_mac);
-	DP_VERBOSE(p_hwfn, QED_MSG_IOV,
-		   "Requesting bulletin update for MAC[%pM]\n", p_mac);
-
-	/* add list termination tlv */
-	qed_add_tlv(p_hwfn, &p_iov->offset, CHANNEL_TLV_LIST_END,
-		    sizeof(struct channel_list_end_tlv));
-
-	p_resp = &p_iov->pf2vf_reply->default_resp;
-	rc = qed_send_msg2pf(p_hwfn, &p_resp->hdr.status, sizeof(*p_resp));
-	qed_vf_pf_req_end(p_hwfn, rc);
 	return rc;
 }
 

@@ -1,10 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Freescale QUICC Engine UART device driver
  *
  * Author: Timur Tabi <timur@freescale.com>
  *
- * Copyright 2007 Freescale Semiconductor, Inc.
+ * Copyright 2007 Freescale Semiconductor, Inc.  This file is licensed under
+ * the terms of the GNU General Public License version 2.  This program
+ * is licensed "as is" without any warranty of any kind, whether express
+ * or implied.
  *
  * This driver adds support for UART devices via Freescale's QUICC Engine
  * found on some Freescale SOCs.
@@ -1140,8 +1142,6 @@ static unsigned int soc_info(unsigned int *rev_h, unsigned int *rev_l)
 	if (!soc_string)
 		/* No compatible property, so try the name. */
 		soc_string = np->name;
-
-	of_node_put(np);
 
 	/* Extract the SOC number from the "PowerPC," string */
 	if ((sscanf(soc_string, "PowerPC,%u", &soc) != 1) || !soc)

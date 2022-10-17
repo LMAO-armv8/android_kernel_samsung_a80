@@ -40,6 +40,15 @@
  * For such calls PSCI_FN_NATIVE(version, name) will choose the appropriate
  * (native-width) function ID.
  */
+
+#ifdef CONFIG_THUMB2_KERNEL
+#define cpu_resume_secondary cpu_resume_arm
+extern void cpu_resume_arm(void);
+#else
+#define cpu_resume_secondary cpu_resume
+extern void cpu_resume(void);
+#endif
+
 #ifdef CONFIG_64BIT
 #define PSCI_FN_NATIVE(version, name)	PSCI_##version##_FN64_##name
 #else
@@ -63,21 +72,6 @@ struct psci_operations psci_ops = {
 	.conduit = PSCI_CONDUIT_NONE,
 	.smccc_version = SMCCC_VERSION_1_0,
 };
-
-enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)
-{
-	if (psci_ops.smccc_version < SMCCC_VERSION_1_1)
-		return SMCCC_CONDUIT_NONE;
-
-	switch (psci_ops.conduit) {
-	case PSCI_CONDUIT_SMC:
-		return SMCCC_CONDUIT_SMC;
-	case PSCI_CONDUIT_HVC:
-		return SMCCC_CONDUIT_HVC;
-	default:
-		return SMCCC_CONDUIT_NONE;
-	}
-}
 
 typedef unsigned long (psci_fn)(unsigned long, unsigned long,
 				unsigned long, unsigned long);
@@ -283,8 +277,9 @@ static int __init psci_features(u32 psci_func_id)
 }
 
 #ifdef CONFIG_CPU_IDLE
-static DEFINE_PER_CPU_READ_MOSTLY(u32 *, psci_power_state);
+static __maybe_unused DEFINE_PER_CPU_READ_MOSTLY(u32 *, psci_power_state);
 
+#ifdef CONFIG_DT_IDLE_STATES
 static int psci_dt_cpu_init_idle(struct device_node *cpu_node, int cpu)
 {
 	int i, ret, count = 0;
@@ -337,6 +332,10 @@ free_mem:
 	kfree(psci_states);
 	return ret;
 }
+#else
+static int psci_dt_cpu_init_idle(struct device_node *cpu_node, int cpu)
+{ return 0; }
+#endif
 
 #ifdef CONFIG_ACPI
 #include <acpi/processor.h>
@@ -415,7 +414,7 @@ int psci_cpu_init_idle(unsigned int cpu)
 static int psci_suspend_finisher(unsigned long state_id)
 {
 	return psci_ops.cpu_suspend(state_id,
-				    __pa_symbol(cpu_resume));
+				    __pa_symbol(cpu_resume_secondary));
 }
 int psci_cpu_suspend_enter(unsigned long state_id)
 {
@@ -450,7 +449,7 @@ CPUIDLE_METHOD_OF_DECLARE(psci, "psci", &psci_cpuidle_ops);
 static int psci_system_suspend(unsigned long unused)
 {
 	return invoke_psci_fn(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND),
-			      __pa_symbol(cpu_resume), 0, 0);
+			      __pa_symbol(cpu_resume_secondary), 0, 0);
 }
 
 static int psci_system_suspend_enter(suspend_state_t state)

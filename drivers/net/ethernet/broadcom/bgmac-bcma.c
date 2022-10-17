@@ -184,19 +184,13 @@ static int bgmac_probe(struct bcma_device *core)
 
 	if (!bgmac_is_bcm4707_family(core) &&
 	    !(ci->id == BCMA_CHIP_ID_BCM53573 && core->core_unit == 1)) {
-		struct phy_device *phydev;
-
 		mii_bus = bcma_mdio_mii_register(bgmac);
 		if (IS_ERR(mii_bus)) {
 			err = PTR_ERR(mii_bus);
 			goto err;
 		}
-		bgmac->mii_bus = mii_bus;
 
-		phydev = mdiobus_get_phy(bgmac->mii_bus, bgmac->phyaddr);
-		if (ci->id == BCMA_CHIP_ID_BCM53573 && phydev &&
-		    (phydev->drv->phy_id & phydev->drv->phy_id_mask) == PHY_ID_BCM54210E)
-			phydev->dev_flags |= PHY_BRCM_EN_MASTER_MODE;
+		bgmac->mii_bus = mii_bus;
 	}
 
 	if (core->bus->hosttype == BCMA_HOSTTYPE_PCI) {
@@ -323,6 +317,7 @@ static void bgmac_remove(struct bcma_device *core)
 	bcma_mdio_mii_unregister(bgmac->mii_bus);
 	bgmac_enet_remove(bgmac);
 	bcma_set_drvdata(core, NULL);
+	kfree(bgmac);
 }
 
 static struct bcma_driver bgmac_bcma_driver = {

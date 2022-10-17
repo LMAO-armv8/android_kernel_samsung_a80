@@ -191,7 +191,7 @@ static char *res_strings[] = {
 	"reserved 37",
 	"reserved 38",
 	"reserved 39",
-	"reserved 40",
+	"reseverd 40",
 	"reserved 41", 
 	"reserved 42", 
 	"reserved 43", 
@@ -1013,7 +1013,6 @@ static int fs_open(struct atm_vcc *atm_vcc)
 				error = make_rate (pcr, r, &tmc0, NULL);
 				if (error) {
 					kfree(tc);
-					kfree(vcc);
 					return error;
 				}
 			}
@@ -1660,9 +1659,9 @@ static irqreturn_t fs_irq (int irq, void *dev_id)
 
 
 #ifdef FS_POLL_FREQ
-static void fs_poll (struct timer_list *t)
+static void fs_poll (unsigned long data)
 {
-	struct fs_dev *dev = from_timer(dev, t, timer);
+	struct fs_dev *dev = (struct fs_dev *) data;
   
 	fs_irq (0, dev);
 	dev->timer.expires = jiffies + FS_POLL_FREQ;
@@ -1692,8 +1691,6 @@ static int fs_init(struct fs_dev *dev)
 	dev->hw_base = pci_resource_start(pci_dev, 0);
 
 	dev->base = ioremap(dev->hw_base, 0x1000);
-	if (!dev->base)
-		return 1;
 
 	reset_chip (dev);
   
@@ -1891,7 +1888,9 @@ static int fs_init(struct fs_dev *dev)
 	}
 
 #ifdef FS_POLL_FREQ
-	timer_setup(&dev->timer, fs_poll, 0);
+	init_timer (&dev->timer);
+	dev->timer.data = (unsigned long) dev;
+	dev->timer.function = fs_poll;
 	dev->timer.expires = jiffies + FS_POLL_FREQ;
 	add_timer (&dev->timer);
 #endif

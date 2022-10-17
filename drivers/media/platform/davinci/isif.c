@@ -31,6 +31,8 @@
 #include <linux/err.h>
 #include <linux/module.h>
 
+#include <mach/mux.h>
+
 #include <media/davinci/isif.h>
 #include <media/davinci/vpss.h>
 
@@ -989,7 +991,7 @@ static int isif_close(struct device *device)
 	return 0;
 }
 
-static const struct ccdc_hw_device isif_hw_dev = {
+static struct ccdc_hw_device isif_hw_dev = {
 	.name = "ISIF",
 	.owner = THIS_MODULE,
 	.hw_ops = {
@@ -1018,7 +1020,7 @@ static int isif_probe(struct platform_device *pdev)
 {
 	void (*setup_pinmux)(void);
 	struct resource	*res;
-	void __iomem *addr;
+	void *__iomem addr;
 	int status = 0, i;
 
 	/* Platform data holds setup_pinmux function ptr */

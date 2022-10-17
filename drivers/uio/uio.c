@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/uio/uio.c
  *
@@ -10,6 +9,8 @@
  * Userspace IO
  *
  * Base Functions
+ *
+ * Licensed under the GPLv2 only.
  */
 
 #include <linux/module.h>
@@ -413,10 +414,10 @@ static int uio_get_minor(struct uio_device *idev)
 	return retval;
 }
 
-static void uio_free_minor(unsigned long minor)
+static void uio_free_minor(struct uio_device *idev)
 {
 	mutex_lock(&minor_lock);
-	idr_remove(&uio_idr, minor);
+	idr_remove(&uio_idr, idev->minor);
 	mutex_unlock(&minor_lock);
 }
 
@@ -540,11 +541,11 @@ static int uio_release(struct inode *inode, struct file *filep)
 	return ret;
 }
 
-static __poll_t uio_poll(struct file *filep, poll_table *wait)
+static unsigned int uio_poll(struct file *filep, poll_table *wait)
 {
 	struct uio_listener *listener = filep->private_data;
 	struct uio_device *idev = listener->dev;
-	__poll_t ret = 0;
+	unsigned int ret = 0;
 
 	mutex_lock(&idev->info_lock);
 	if (!idev->info || !idev->info->irq)
@@ -556,7 +557,7 @@ static __poll_t uio_poll(struct file *filep, poll_table *wait)
 
 	poll_wait(filep, &idev->wait, wait);
 	if (listener->event_count != atomic_read(&idev->event))
-		return EPOLLIN | EPOLLRDNORM;
+		return POLLIN | POLLRDNORM;
 	return 0;
 }
 
@@ -664,7 +665,7 @@ static int uio_find_mem_index(struct vm_area_struct *vma)
 	return -1;
 }
 
-static vm_fault_t uio_vma_fault(struct vm_fault *vmf)
+static int uio_vma_fault(struct vm_fault *vmf)
 {
 	struct uio_device *idev = vmf->vma->vm_private_data;
 	struct page *page;
@@ -988,7 +989,7 @@ err_request_irq:
 err_uio_dev_add_attributes:
 	device_del(&idev->dev);
 err_device_create:
-	uio_free_minor(idev->minor);
+	uio_free_minor(idev);
 	put_device(&idev->dev);
 	return ret;
 }
@@ -1002,13 +1003,13 @@ EXPORT_SYMBOL_GPL(__uio_register_device);
 void uio_unregister_device(struct uio_info *info)
 {
 	struct uio_device *idev;
-	unsigned long minor;
 
 	if (!info || !info->uio_dev)
 		return;
 
 	idev = info->uio_dev;
-	minor = idev->minor;
+
+	uio_free_minor(idev);
 
 	mutex_lock(&idev->info_lock);
 	uio_dev_del_attributes(idev);
@@ -1020,8 +1021,6 @@ void uio_unregister_device(struct uio_info *info)
 	mutex_unlock(&idev->info_lock);
 
 	device_unregister(&idev->dev);
-
-	uio_free_minor(minor);
 
 	return;
 }

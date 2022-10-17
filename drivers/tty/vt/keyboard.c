@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Written for linux by Johan Myreen as a translation from
  * the assembly version by Linus (with diacriticals added)
@@ -249,14 +248,14 @@ static int kd_sound_helper(struct input_handle *handle, void *data)
 	return 0;
 }
 
-static void kd_nosound(struct timer_list *unused)
+static void kd_nosound(unsigned long ignored)
 {
 	static unsigned int zero;
 
 	input_handler_for_each_handle(&kbd_handler, &zero, kd_sound_helper);
 }
 
-static DEFINE_TIMER(kd_mksound_timer, kd_nosound);
+static DEFINE_TIMER(kd_mksound_timer, kd_nosound, 0, 0);
 
 void kd_mksound(unsigned int hz, unsigned int ticks)
 {
@@ -310,7 +309,7 @@ int kbd_rate(struct kbd_repeat *rpt)
 static void put_queue(struct vc_data *vc, int ch)
 {
 	tty_insert_flip_char(&vc->port, ch, 0);
-	tty_flip_buffer_push(&vc->port);
+	tty_schedule_flip(&vc->port);
 }
 
 static void puts_queue(struct vc_data *vc, char *cp)
@@ -319,7 +318,7 @@ static void puts_queue(struct vc_data *vc, char *cp)
 		tty_insert_flip_char(&vc->port, *cp, 0);
 		cp++;
 	}
-	tty_flip_buffer_push(&vc->port);
+	tty_schedule_flip(&vc->port);
 }
 
 static void applkey(struct vc_data *vc, int key, char mode)
@@ -564,7 +563,7 @@ static void fn_inc_console(struct vc_data *vc)
 static void fn_send_intr(struct vc_data *vc)
 {
 	tty_insert_flip_char(&vc->port, 0, TTY_BREAK);
-	tty_flip_buffer_push(&vc->port);
+	tty_schedule_flip(&vc->port);
 }
 
 static void fn_scroll_forw(struct vc_data *vc)
@@ -695,35 +694,7 @@ static void k_dead2(struct vc_data *vc, unsigned char value, char up_flag)
  */
 static void k_dead(struct vc_data *vc, unsigned char value, char up_flag)
 {
-	static const unsigned char ret_diacr[NR_DEAD] = {
-		'`',	/* dead_grave */
-		'\'',	/* dead_acute */
-		'^',	/* dead_circumflex */
-		'~',	/* dead_tilda */
-		'"',	/* dead_diaeresis */
-		',',	/* dead_cedilla */
-		'_',	/* dead_macron */
-		'U',	/* dead_breve */
-		'.',	/* dead_abovedot */
-		'*',	/* dead_abovering */
-		'=',	/* dead_doubleacute */
-		'c',	/* dead_caron */
-		'k',	/* dead_ogonek */
-		'i',	/* dead_iota */
-		'#',	/* dead_voiced_sound */
-		'o',	/* dead_semivoiced_sound */
-		'!',	/* dead_belowdot */
-		'?',	/* dead_hook */
-		'+',	/* dead_horn */
-		'-',	/* dead_stroke */
-		')',	/* dead_abovecomma */
-		'(',	/* dead_abovereversedcomma */
-		':',	/* dead_doublegrave */
-		'n',	/* dead_invertedbreve */
-		';',	/* dead_belowcomma */
-		'$',	/* dead_currency */
-		'@',	/* dead_greek */
-	};
+	static const unsigned char ret_diacr[NR_DEAD] = {'`', '\'', '^', '~', '"', ',' };
 
 	k_deadunicode(vc, ret_diacr[value], up_flag);
 }
@@ -742,13 +713,8 @@ static void k_fn(struct vc_data *vc, unsigned char value, char up_flag)
 		return;
 
 	if ((unsigned)value < ARRAY_SIZE(func_table)) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&func_buf_lock, flags);
 		if (func_table[value])
 			puts_queue(vc, func_table[value]);
-		spin_unlock_irqrestore(&func_buf_lock, flags);
-
 	} else
 		pr_err("k_fn called with value=%d\n", value);
 }
@@ -999,7 +965,7 @@ struct kbd_led_trigger {
 	unsigned int mask;
 };
 
-static int kbd_led_trigger_activate(struct led_classdev *cdev)
+static void kbd_led_trigger_activate(struct led_classdev *cdev)
 {
 	struct kbd_led_trigger *trigger =
 		container_of(cdev->trigger, struct kbd_led_trigger, trigger);
@@ -1010,8 +976,6 @@ static int kbd_led_trigger_activate(struct led_classdev *cdev)
 				  ledstate & trigger->mask ?
 					LED_FULL : LED_OFF);
 	tasklet_enable(&keyboard_tasklet);
-
-	return 0;
 }
 
 #define KBD_LED_TRIGGER(_led_bit, _name) {			\
@@ -1666,7 +1630,7 @@ int vt_do_diacrit(unsigned int cmd, void __user *udp, int perm)
 		struct kbdiacr *dia;
 		int i;
 
-		dia = kmalloc_array(MAX_DIACR, sizeof(struct kbdiacr),
+		dia = kmalloc(MAX_DIACR * sizeof(struct kbdiacr),
 								GFP_KERNEL);
 		if (!dia)
 			return -ENOMEM;
@@ -1699,7 +1663,7 @@ int vt_do_diacrit(unsigned int cmd, void __user *udp, int perm)
 		struct kbdiacrsuc __user *a = udp;
 		void *buf;
 
-		buf = kmalloc_array(MAX_DIACR, sizeof(struct kbdiacruc),
+		buf = kmalloc(MAX_DIACR * sizeof(struct kbdiacruc),
 								GFP_KERNEL);
 		if (buf == NULL)
 			return -ENOMEM;
@@ -1995,11 +1959,13 @@ out:
 #undef s
 #undef v
 
-/* FIXME: This one needs untangling */
+/* FIXME: This one needs untangling and locking */
 int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
 {
 	struct kbsentry *kbs;
+	char *p;
 	u_char *q;
+	u_char __user *up;
 	int sz, fnw_sz;
 	int delta;
 	char *first_free, *fj, *fnw;
@@ -2025,19 +1991,23 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
 	i = kbs->kb_func;
 
 	switch (cmd) {
-	case KDGKBSENT: {
-		/* size should have been a struct member */
-		ssize_t len = sizeof(user_kdgkb->kb_string);
-
-		spin_lock_irqsave(&func_buf_lock, flags);
-		len = strlcpy(kbs->kb_string, func_table[i] ? : "", len);
-		spin_unlock_irqrestore(&func_buf_lock, flags);
-
-		ret = copy_to_user(user_kdgkb->kb_string, kbs->kb_string,
-				len + 1) ? -EFAULT : 0;
-
-		goto reterr;
-	}
+	case KDGKBSENT:
+		sz = sizeof(kbs->kb_string) - 1; /* sz should have been
+						  a struct member */
+		up = user_kdgkb->kb_string;
+		p = func_table[i];
+		if(p)
+			for ( ; *p && sz; p++, sz--)
+				if (put_user(*p, up++)) {
+					ret = -EFAULT;
+					goto reterr;
+				}
+		if (put_user('\0', up)) {
+			ret = -EFAULT;
+			goto reterr;
+		}
+		kfree(kbs);
+		return ((p && *p) ? -EOVERFLOW : 0);
 	case KDSKBSENT:
 		if (!perm) {
 			ret = -EPERM;

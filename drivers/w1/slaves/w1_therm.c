@@ -268,18 +268,17 @@ static inline int w1_therm_eeprom(struct device *device)
 	int ret, max_trying = 10;
 	u8 *family_data = sl->family_data;
 
+	ret = mutex_lock_interruptible(&dev->bus_mutex);
+	if (ret != 0)
+		goto post_unlock;
+
 	if (!sl->family_data) {
 		ret = -ENODEV;
-		goto error;
+		goto pre_unlock;
 	}
 
 	/* prevent the slave from going away in sleep */
 	atomic_inc(THERM_REFCNT(family_data));
-
-	ret = mutex_lock_interruptible(&dev->bus_mutex);
-	if (ret != 0)
-		goto dec_refcnt;
-
 	memset(rom, 0, sizeof(rom));
 
 	while (max_trying--) {
@@ -307,17 +306,17 @@ static inline int w1_therm_eeprom(struct device *device)
 				sleep_rem = msleep_interruptible(tm);
 				if (sleep_rem != 0) {
 					ret = -EINTR;
-					goto dec_refcnt;
+					goto post_unlock;
 				}
 
 				ret = mutex_lock_interruptible(&dev->bus_mutex);
 				if (ret != 0)
-					goto dec_refcnt;
+					goto post_unlock;
 			} else if (!w1_strong_pullup) {
 				sleep_rem = msleep_interruptible(tm);
 				if (sleep_rem != 0) {
 					ret = -EINTR;
-					goto mt_unlock;
+					goto pre_unlock;
 				}
 			}
 
@@ -325,11 +324,11 @@ static inline int w1_therm_eeprom(struct device *device)
 		}
 	}
 
-mt_unlock:
+pre_unlock:
 	mutex_unlock(&dev->bus_mutex);
-dec_refcnt:
+
+post_unlock:
 	atomic_dec(THERM_REFCNT(family_data));
-error:
 	return ret;
 }
 
@@ -351,22 +350,20 @@ static inline int w1_DS18B20_precision(struct device *device, int val)
 
 	if (val > 12 || val < 9) {
 		pr_warn("Unsupported precision\n");
-		ret = -EINVAL;
-		goto error;
+		return -1;
 	}
+
+	ret = mutex_lock_interruptible(&dev->bus_mutex);
+	if (ret != 0)
+		goto post_unlock;
 
 	if (!sl->family_data) {
 		ret = -ENODEV;
-		goto error;
+		goto pre_unlock;
 	}
 
 	/* prevent the slave from going away in sleep */
 	atomic_inc(THERM_REFCNT(family_data));
-
-	ret = mutex_lock_interruptible(&dev->bus_mutex);
-	if (ret != 0)
-		goto dec_refcnt;
-
 	memset(rom, 0, sizeof(rom));
 
 	/* translate precision to bitmask (see datasheet page 9) */
@@ -414,10 +411,11 @@ static inline int w1_DS18B20_precision(struct device *device, int val)
 		}
 	}
 
+pre_unlock:
 	mutex_unlock(&dev->bus_mutex);
-dec_refcnt:
+
+post_unlock:
 	atomic_dec(THERM_REFCNT(family_data));
-error:
 	return ret;
 }
 
@@ -492,18 +490,17 @@ static ssize_t read_therm(struct device *device,
 	int ret, max_trying = 10;
 	u8 *family_data = sl->family_data;
 
+	ret = mutex_lock_interruptible(&dev->bus_mutex);
+	if (ret != 0)
+		goto error;
+
 	if (!family_data) {
 		ret = -ENODEV;
-		goto error;
+		goto mt_unlock;
 	}
 
 	/* prevent the slave from going away in sleep */
 	atomic_inc(THERM_REFCNT(family_data));
-
-	ret = mutex_lock_interruptible(&dev->bus_mutex);
-	if (ret != 0)
-		goto dec_refcnt;
-
 	memset(info->rom, 0, sizeof(info->rom));
 
 	while (max_trying--) {
@@ -545,7 +542,7 @@ static ssize_t read_therm(struct device *device,
 				sleep_rem = msleep_interruptible(tm);
 				if (sleep_rem != 0) {
 					ret = -EINTR;
-					goto mt_unlock;
+					goto dec_refcnt;
 				}
 			}
 
@@ -570,10 +567,10 @@ static ssize_t read_therm(struct device *device,
 			break;
 	}
 
-mt_unlock:
-	mutex_unlock(&dev->bus_mutex);
 dec_refcnt:
 	atomic_dec(THERM_REFCNT(family_data));
+mt_unlock:
+	mutex_unlock(&dev->bus_mutex);
 error:
 	return ret;
 }
@@ -693,20 +690,16 @@ static ssize_t w1_seq_show(struct device *device,
 		if (sl->reg_num.id == reg_num->id)
 			seq = i;
 
-		if (w1_reset_bus(sl->master))
-			goto error;
-
-		/* Put the device into chain DONE state */
-		w1_write_8(sl->master, W1_MATCH_ROM);
-		w1_write_block(sl->master, (u8 *)&rn, 8);
 		w1_write_8(sl->master, W1_42_CHAIN);
 		w1_write_8(sl->master, W1_42_CHAIN_DONE);
 		w1_write_8(sl->master, W1_42_CHAIN_DONE_INV);
+		w1_read_block(sl->master, &ack, sizeof(ack));
 
 		/* check for acknowledgment */
 		ack = w1_read_8(sl->master);
 		if (ack != W1_42_SUCCESS_CONFIRM_BYTE)
 			goto error;
+
 	}
 
 	/* Exit from CHAIN state */

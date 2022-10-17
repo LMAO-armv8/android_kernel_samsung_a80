@@ -417,7 +417,7 @@ static int ad5592r_read_raw(struct iio_dev *iio_dev,
 			s64 tmp = *val * (3767897513LL / 25LL);
 			*val = div_s64_rem(tmp, 1000000000LL, val2);
 
-			return IIO_VAL_INT_PLUS_MICRO;
+			ret = IIO_VAL_INT_PLUS_MICRO;
 		} else {
 			int mult;
 
@@ -448,7 +448,7 @@ static int ad5592r_read_raw(struct iio_dev *iio_dev,
 		ret =  IIO_VAL_INT;
 		break;
 	default:
-		return -EINVAL;
+		ret = -EINVAL;
 	}
 
 unlock:
@@ -474,6 +474,7 @@ static const struct iio_info ad5592r_info = {
 	.read_raw = ad5592r_read_raw,
 	.write_raw = ad5592r_write_raw,
 	.write_raw_get_fmt = ad5592r_write_raw_get_fmt,
+	.driver_module = THIS_MODULE,
 };
 
 static ssize_t ad5592r_show_scale_available(struct iio_dev *iio_dev,
@@ -531,14 +532,13 @@ static int ad5592r_alloc_channels(struct ad5592r_state *st)
 		if (!ret)
 			st->channel_modes[reg] = tmp;
 
-		ret = fwnode_property_read_u32(child, "adi,off-state", &tmp);
+		fwnode_property_read_u32(child, "adi,off-state", &tmp);
 		if (!ret)
 			st->channel_offstate[reg] = tmp;
 	}
 
-	channels = devm_kcalloc(st->dev,
-			1 + 2 * num_channels, sizeof(*channels),
-			GFP_KERNEL);
+	channels = devm_kzalloc(st->dev,
+			(1 + 2 * num_channels) * sizeof(*channels), GFP_KERNEL);
 	if (!channels)
 		return -ENOMEM;
 

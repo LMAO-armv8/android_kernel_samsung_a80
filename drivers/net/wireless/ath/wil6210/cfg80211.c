@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2012-2017 Qualcomm Atheros, Inc.
- * Copyright (c) 2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -21,9 +21,12 @@
 #include <net/cfg80211.h>
 #include "wil6210.h"
 #include "wmi.h"
+#include "ftm.h"
 #include "fw.h"
 
 #define WIL_MAX_ROC_DURATION_MS 5000
+#define WIL_BRD_SUFFIX_CN "CN"
+#define WIL_BRD_SUFFIX_FCC "FCC"
 
 bool disable_ap_sme;
 module_param(disable_ap_sme, bool, 0444);
@@ -35,6 +38,14 @@ static struct wiphy_wowlan_support wil_wowlan_support = {
 };
 #endif
 
+static bool country_specific_board_file;
+module_param(country_specific_board_file, bool, 0444);
+MODULE_PARM_DESC(country_specific_board_file, " switch board file upon regulatory domain change (Default: false)");
+
+static bool ignore_reg_hints = true;
+module_param(ignore_reg_hints, bool, 0444);
+MODULE_PARM_DESC(ignore_reg_hints, " Ignore OTA regulatory hints (Default: true)");
+
 #define CHAN60G(_channel, _flags) {				\
 	.band			= NL80211_BAND_60GHZ,		\
 	.center_freq		= 56160 + (2160 * (_channel)),	\
@@ -44,12 +55,112 @@ static struct wiphy_wowlan_support wil_wowlan_support = {
 	.max_power		= 40,				\
 }
 
+#define WIL_BRP_ANT_LIMIT_MIN	(1)
+#define WIL_BRP_ANT_LIMIT_MAX	(27)
+
 static struct ieee80211_channel wil_60ghz_channels[] = {
 	CHAN60G(1, 0),
 	CHAN60G(2, 0),
 	CHAN60G(3, 0),
-/* channel 4 not supported yet */
+	CHAN60G(4, 0),
 };
+
+static void
+wil_memdup_ie(u8 **pdst, size_t *pdst_len, const u8 *src, size_t src_len)
+{
+	kfree(*pdst);
+	*pdst = NULL;
+	*pdst_len = 0;
+	if (src_len > 0) {
+		*pdst = kmemdup(src, src_len, GFP_KERNEL);
+		if (*pdst)
+			*pdst_len = src_len;
+	}
+}
+
+struct wil_regd_2_brd_suffix {
+	const char regdomain[3]; /* alpha2 */
+	const char *brd_suffix;
+};
+
+static struct wil_regd_2_brd_suffix wil_regd_2_brd_suffix_map[] = {
+	{"BO", WIL_BRD_SUFFIX_FCC},
+	{"CN", WIL_BRD_SUFFIX_CN},
+	{"EC", WIL_BRD_SUFFIX_FCC},
+	{"GU", WIL_BRD_SUFFIX_FCC},
+	{"HN", WIL_BRD_SUFFIX_FCC},
+	{"JM", WIL_BRD_SUFFIX_FCC},
+	{"MX", WIL_BRD_SUFFIX_FCC},
+	{"NI", WIL_BRD_SUFFIX_FCC},
+	{"PY", WIL_BRD_SUFFIX_FCC},
+	{"TT", WIL_BRD_SUFFIX_FCC},
+	{"US", WIL_BRD_SUFFIX_FCC},
+};
+
+enum wil_nl_60g_cmd_type {
+	NL_60G_CMD_FW_WMI,
+	NL_60G_CMD_DEBUG,
+	NL_60G_CMD_STATISTICS,
+	NL_60G_CMD_REGISTER,
+};
+
+enum wil_nl_60g_evt_type {
+	NL_60G_EVT_DRIVER_ERROR,
+	NL_60G_EVT_FW_ERROR,
+	NL_60G_EVT_FW_WMI,
+	NL_60G_EVT_DRIVER_SHUTOWN,
+	NL_60G_EVT_DRIVER_DEBUG_EVENT,
+};
+
+enum wil_nl_60g_debug_cmd {
+	NL_60G_DBG_FORCE_WMI_SEND,
+	NL_60G_GEN_RADAR_ALLOC_BUFFER,
+	NL_60G_GEN_FW_RESET,
+};
+
+struct wil_nl_60g_send_receive_wmi {
+	u32 cmd_id; /* enum wmi_command_id or enum wmi_event_id */
+	u8 reserved[2];
+	u8 dev_id; /* mid */
+	u16 buf_len;
+	u8 buf[0];
+} __packed;
+
+struct wil_nl_60g_event {
+	u32 evt_type; /* wil_nl_60g_evt_type */
+	u32 buf_len;
+	u8 reserved[9];
+	u8 buf[0];
+} __packed;
+
+struct wil_nl_60g_debug { /* NL_60G_CMD_DEBUG */
+	u32 cmd_id; /* wil_nl_60g_debug_cmd */
+} __packed;
+
+struct wil_nl_60g_debug_force_wmi {
+	struct wil_nl_60g_debug hdr;
+	u32 enable;
+} __packed;
+
+static int wil_num_supported_channels(struct wil6210_priv *wil)
+{
+	int num_channels = ARRAY_SIZE(wil_60ghz_channels);
+
+	if (!test_bit(WMI_FW_CAPABILITY_CHANNEL_4, wil->fw_capabilities))
+		num_channels--;
+
+	return num_channels;
+}
+
+void update_supported_bands(struct wil6210_priv *wil)
+{
+	struct wiphy *wiphy = wil_to_wiphy(wil);
+
+	wil_dbg_misc(wil, "update supported bands");
+
+	wiphy->bands[NL80211_BAND_60GHZ]->n_channels =
+						wil_num_supported_channels(wil);
+}
 
 /* Vendor id to be used in vendor specific command and events
  * to user space.
@@ -64,16 +175,23 @@ static struct ieee80211_channel wil_60ghz_channels[] = {
 #define WIL_MAX_RF_SECTORS (128)
 #define WIL_CID_ALL (0xff)
 
-enum qca_wlan_vendor_attr_rf_sector {
+enum qca_wlan_vendor_attr_wil {
 	QCA_ATTR_MAC_ADDR = 6,
+	QCA_ATTR_FEATURE_FLAGS = 7,
+	QCA_ATTR_TEST = 8,
 	QCA_ATTR_PAD = 13,
 	QCA_ATTR_TSF = 29,
 	QCA_ATTR_DMG_RF_SECTOR_INDEX = 30,
 	QCA_ATTR_DMG_RF_SECTOR_TYPE = 31,
 	QCA_ATTR_DMG_RF_MODULE_MASK = 32,
 	QCA_ATTR_DMG_RF_SECTOR_CFG = 33,
-	QCA_ATTR_DMG_RF_SECTOR_MAX,
+	QCA_ATTR_BRP_ANT_LIMIT_MODE = 38,
+	QCA_ATTR_BRP_ANT_NUM_LIMIT = 39,
+	QCA_ATTR_WIL_MAX,
 };
+
+#define WIL_ATTR_60G_CMD_TYPE QCA_ATTR_FEATURE_FLAGS
+#define WIL_ATTR_60G_BUF QCA_ATTR_TEST
 
 enum qca_wlan_vendor_attr_dmg_rf_sector_type {
 	QCA_ATTR_DMG_RF_SECTOR_TYPE_RX,
@@ -97,8 +215,22 @@ enum qca_wlan_vendor_attr_dmg_rf_sector_cfg {
 	QCA_ATTR_DMG_RF_SECTOR_CFG_AFTER_LAST - 1
 };
 
+enum qca_wlan_vendor_attr_brp_ant_limit_mode {
+	QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODE_DISABLE,
+	QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODE_EFFECTIVE,
+	QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODE_FORCE,
+	QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODES_NUM
+};
+
 static const struct
-nla_policy wil_rf_sector_policy[QCA_ATTR_DMG_RF_SECTOR_MAX + 1] = {
+nla_policy wil_brp_ant_limit_policy[QCA_ATTR_WIL_MAX + 1] = {
+	[QCA_ATTR_MAC_ADDR] = { .len = ETH_ALEN },
+	[QCA_ATTR_BRP_ANT_NUM_LIMIT] = { .type = NLA_U8 },
+	[QCA_ATTR_BRP_ANT_LIMIT_MODE] = { .type = NLA_U8 },
+};
+
+static const struct
+nla_policy wil_rf_sector_policy[QCA_ATTR_WIL_MAX + 1] = {
 	[QCA_ATTR_MAC_ADDR] = { .len = ETH_ALEN },
 	[QCA_ATTR_DMG_RF_SECTOR_INDEX] = { .type = NLA_U16 },
 	[QCA_ATTR_DMG_RF_SECTOR_TYPE] = { .type = NLA_U8 },
@@ -117,11 +249,28 @@ nla_policy wil_rf_sector_cfg_policy[QCA_ATTR_DMG_RF_SECTOR_CFG_MAX + 1] = {
 	[QCA_ATTR_DMG_RF_SECTOR_CFG_DTYPE_X16] = { .type = NLA_U32 },
 };
 
+static const struct
+nla_policy wil_nl_60g_policy[QCA_ATTR_WIL_MAX + 1] = {
+	[WIL_ATTR_60G_CMD_TYPE] = { .type = NLA_U32 },
+	[WIL_ATTR_60G_BUF] = { .type = NLA_BINARY },
+};
+
 enum qca_nl80211_vendor_subcmds {
+	QCA_NL80211_VENDOR_SUBCMD_UNSPEC = 0,
+	QCA_NL80211_VENDOR_SUBCMD_LOC_GET_CAPA = 128,
+	QCA_NL80211_VENDOR_SUBCMD_FTM_START_SESSION = 129,
+	QCA_NL80211_VENDOR_SUBCMD_FTM_ABORT_SESSION = 130,
+	QCA_NL80211_VENDOR_SUBCMD_FTM_MEAS_RESULT = 131,
+	QCA_NL80211_VENDOR_SUBCMD_FTM_SESSION_DONE = 132,
+	QCA_NL80211_VENDOR_SUBCMD_FTM_CFG_RESPONDER = 133,
+	QCA_NL80211_VENDOR_SUBCMD_AOA_MEAS = 134,
+	QCA_NL80211_VENDOR_SUBCMD_AOA_ABORT_MEAS = 135,
+	QCA_NL80211_VENDOR_SUBCMD_AOA_MEAS_RESULT = 136,
 	QCA_NL80211_VENDOR_SUBCMD_DMG_RF_GET_SECTOR_CFG = 139,
 	QCA_NL80211_VENDOR_SUBCMD_DMG_RF_SET_SECTOR_CFG = 140,
 	QCA_NL80211_VENDOR_SUBCMD_DMG_RF_GET_SELECTED_SECTOR = 141,
 	QCA_NL80211_VENDOR_SUBCMD_DMG_RF_SET_SELECTED_SECTOR = 142,
+	QCA_NL80211_VENDOR_SUBCMD_BRP_SET_ANT_LIMIT = 153,
 };
 
 static int wil_rf_sector_get_cfg(struct wiphy *wiphy,
@@ -136,9 +285,55 @@ static int wil_rf_sector_get_selected(struct wiphy *wiphy,
 static int wil_rf_sector_set_selected(struct wiphy *wiphy,
 				      struct wireless_dev *wdev,
 				      const void *data, int data_len);
+static int wil_brp_set_ant_limit(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 const void *data, int data_len);
 
+static int wil_nl_60g_handle_cmd(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 const void *data, int data_len);
 /* vendor specific commands */
 static const struct wiphy_vendor_command wil_nl80211_vendor_commands[] = {
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_LOC_GET_CAPA,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_ftm_get_capabilities
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FTM_START_SESSION,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_ftm_start_session
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FTM_ABORT_SESSION,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_ftm_abort_session
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_FTM_CFG_RESPONDER,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_ftm_configure_responder
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_AOA_MEAS,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_aoa_start_measurement
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_AOA_ABORT_MEAS,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_aoa_abort_measurement
+	},
 	{
 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
 		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_DMG_RF_GET_SECTOR_CFG,
@@ -168,6 +363,40 @@ static const struct wiphy_vendor_command wil_nl80211_vendor_commands[] = {
 		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
 			 WIPHY_VENDOR_CMD_NEED_RUNNING,
 		.doit = wil_rf_sector_set_selected
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_BRP_SET_ANT_LIMIT,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_RUNNING,
+		.doit = wil_brp_set_ant_limit
+	},
+	{
+		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_UNSPEC,
+		.flags = WIPHY_VENDOR_CMD_NEED_WDEV |
+			 WIPHY_VENDOR_CMD_NEED_NETDEV,
+		.doit = wil_nl_60g_handle_cmd
+	},
+};
+
+/* vendor specific events */
+static const struct nl80211_vendor_cmd_info wil_nl80211_vendor_events[] = {
+	[QCA_NL80211_VENDOR_EVENT_FTM_MEAS_RESULT_INDEX] = {
+			.vendor_id = QCA_NL80211_VENDOR_ID,
+			.subcmd = QCA_NL80211_VENDOR_SUBCMD_FTM_MEAS_RESULT
+	},
+	[QCA_NL80211_VENDOR_EVENT_FTM_SESSION_DONE_INDEX] = {
+			.vendor_id = QCA_NL80211_VENDOR_ID,
+			.subcmd = QCA_NL80211_VENDOR_SUBCMD_FTM_SESSION_DONE
+	},
+	[QCA_NL80211_VENDOR_EVENT_AOA_MEAS_RESULT_INDEX] = {
+			.vendor_id = QCA_NL80211_VENDOR_ID,
+			.subcmd = QCA_NL80211_VENDOR_SUBCMD_AOA_MEAS_RESULT
+	},
+	[QCA_NL80211_VENDOR_EVENT_UNSPEC_INDEX] = {
+			.vendor_id = QCA_NL80211_VENDOR_ID,
+			.subcmd = QCA_NL80211_VENDOR_SUBCMD_UNSPEC
 	},
 };
 
@@ -199,7 +428,9 @@ wil_mgmt_stypes[NUM_NL80211_IFTYPES] = {
 		.tx = BIT(IEEE80211_STYPE_ACTION >> 4) |
 		BIT(IEEE80211_STYPE_PROBE_RESP >> 4) |
 		BIT(IEEE80211_STYPE_ASSOC_RESP >> 4) |
-		BIT(IEEE80211_STYPE_DISASSOC >> 4),
+		BIT(IEEE80211_STYPE_DISASSOC >> 4) |
+		BIT(IEEE80211_STYPE_AUTH >> 4) |
+		BIT(IEEE80211_STYPE_REASSOC_RESP >> 4),
 		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
 		BIT(IEEE80211_STYPE_PROBE_REQ >> 4) |
 		BIT(IEEE80211_STYPE_ASSOC_REQ >> 4) |
@@ -261,6 +492,86 @@ int wil_iftype_nl2wmi(enum nl80211_iftype type)
 	return -EOPNOTSUPP;
 }
 
+int wil_spec2wmi_ch(u8 spec_ch, u8 *wmi_ch)
+{
+	switch (spec_ch) {
+	case 1:
+		*wmi_ch = WMI_CHANNEL_1;
+		break;
+	case 2:
+		*wmi_ch = WMI_CHANNEL_2;
+		break;
+	case 3:
+		*wmi_ch = WMI_CHANNEL_3;
+		break;
+	case 4:
+		*wmi_ch = WMI_CHANNEL_4;
+		break;
+	case 5:
+		*wmi_ch = WMI_CHANNEL_5;
+		break;
+	case 6:
+		*wmi_ch = WMI_CHANNEL_6;
+		break;
+	case 9:
+		*wmi_ch = WMI_CHANNEL_9;
+		break;
+	case 10:
+		*wmi_ch = WMI_CHANNEL_10;
+		break;
+	case 11:
+		*wmi_ch = WMI_CHANNEL_11;
+		break;
+	case 12:
+		*wmi_ch = WMI_CHANNEL_12;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+int wil_wmi2spec_ch(u8 wmi_ch, u8 *spec_ch)
+{
+	switch (wmi_ch) {
+	case WMI_CHANNEL_1:
+		*spec_ch = 1;
+		break;
+	case WMI_CHANNEL_2:
+		*spec_ch = 2;
+		break;
+	case WMI_CHANNEL_3:
+		*spec_ch = 3;
+		break;
+	case WMI_CHANNEL_4:
+		*spec_ch = 4;
+		break;
+	case WMI_CHANNEL_5:
+		*spec_ch = 5;
+		break;
+	case WMI_CHANNEL_6:
+		*spec_ch = 6;
+		break;
+	case WMI_CHANNEL_9:
+		*spec_ch = 9;
+		break;
+	case WMI_CHANNEL_10:
+		*spec_ch = 10;
+		break;
+	case WMI_CHANNEL_11:
+		*spec_ch = 11;
+		break;
+	case WMI_CHANNEL_12:
+		*spec_ch = 12;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
 		       struct station_info *sinfo)
 {
@@ -302,16 +613,16 @@ int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
 
 	sinfo->generation = wil->sinfo_gen;
 
-	sinfo->filled = BIT_ULL(NL80211_STA_INFO_RX_BYTES) |
-			BIT_ULL(NL80211_STA_INFO_TX_BYTES) |
-			BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
-			BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
-			BIT_ULL(NL80211_STA_INFO_RX_BITRATE) |
-			BIT_ULL(NL80211_STA_INFO_TX_BITRATE) |
-			BIT_ULL(NL80211_STA_INFO_RX_DROP_MISC) |
-			BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+	sinfo->filled = BIT(NL80211_STA_INFO_RX_BYTES) |
+			BIT(NL80211_STA_INFO_TX_BYTES) |
+			BIT(NL80211_STA_INFO_RX_PACKETS) |
+			BIT(NL80211_STA_INFO_TX_PACKETS) |
+			BIT(NL80211_STA_INFO_RX_BITRATE) |
+			BIT(NL80211_STA_INFO_TX_BITRATE) |
+			BIT(NL80211_STA_INFO_RX_DROP_MISC) |
+			BIT(NL80211_STA_INFO_TX_FAILED);
 
-	sinfo->txrate.flags = RATE_INFO_FLAGS_DMG;
+	sinfo->txrate.flags = RATE_INFO_FLAGS_60G;
 	sinfo->txrate.mcs = le16_to_cpu(reply.evt.bf_mcs);
 	sinfo->rxrate.mcs = stats->last_mcs_rx;
 	sinfo->rx_bytes = stats->rx_bytes;
@@ -322,7 +633,7 @@ int wil_cid_fill_sinfo(struct wil6210_vif *vif, int cid,
 	sinfo->tx_failed = stats->tx_errors;
 
 	if (test_bit(wil_vif_fwconnected, vif->status)) {
-		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+		sinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
 		if (test_bit(WMI_FW_CAPABILITY_RSSI_REPORTING,
 			     wil->fw_capabilities))
 			sinfo->signal = reply.evt.rssi;
@@ -608,6 +919,16 @@ out:
 	return rc;
 }
 
+static bool wil_is_safe_switch(enum nl80211_iftype from,
+			       enum nl80211_iftype to)
+{
+	if (from == NL80211_IFTYPE_STATION &&
+	    to == NL80211_IFTYPE_P2P_CLIENT)
+		return true;
+
+	return false;
+}
+
 static int wil_cfg80211_change_iface(struct wiphy *wiphy,
 				     struct net_device *ndev,
 				     enum nl80211_iftype type,
@@ -633,7 +954,8 @@ static int wil_cfg80211_change_iface(struct wiphy *wiphy,
 	 * because it can cause significant disruption
 	 */
 	if (!wil_has_other_active_ifaces(wil, ndev, true, false) &&
-	    netif_running(ndev) && !wil_is_recovery_blocked(wil)) {
+	    netif_running(ndev) && !wil_is_recovery_blocked(wil) &&
+	    !wil_is_safe_switch(wdev->iftype, type)) {
 		wil_dbg_misc(wil, "interface is up. resetting...\n");
 		mutex_lock(&wil->mutex);
 		__wil_down(wil);
@@ -871,6 +1193,26 @@ static void wil_print_crypto(struct wil6210_priv *wil,
 		     c->control_port_no_encrypt);
 }
 
+static const char *
+wil_get_auth_type_name(enum nl80211_auth_type auth_type)
+{
+	switch (auth_type) {
+	case NL80211_AUTHTYPE_OPEN_SYSTEM:
+		return "OPEN_SYSTEM";
+	case NL80211_AUTHTYPE_SHARED_KEY:
+		return "SHARED_KEY";
+	case NL80211_AUTHTYPE_FT:
+		return "FT";
+	case NL80211_AUTHTYPE_NETWORK_EAP:
+		return "NETWORK_EAP";
+	case NL80211_AUTHTYPE_SAE:
+		return "SAE";
+	case NL80211_AUTHTYPE_AUTOMATIC:
+		return "AUTOMATIC";
+	default:
+		return "unknown";
+	}
+}
 static void wil_print_connect_params(struct wil6210_priv *wil,
 				     struct cfg80211_connect_params *sme)
 {
@@ -884,9 +1226,80 @@ static void wil_print_connect_params(struct wil6210_priv *wil,
 	if (sme->ssid)
 		print_hex_dump(KERN_INFO, "  SSID: ", DUMP_PREFIX_OFFSET,
 			       16, 1, sme->ssid, sme->ssid_len, true);
+	if (sme->prev_bssid)
+		wil_info(wil, "  Previous BSSID=%pM\n", sme->prev_bssid);
+	wil_info(wil, "  Auth Type: %s\n",
+		 wil_get_auth_type_name(sme->auth_type));
 	wil_info(wil, "  Privacy: %s\n", sme->privacy ? "secure" : "open");
 	wil_info(wil, "  PBSS: %d\n", sme->pbss);
 	wil_print_crypto(wil, &sme->crypto);
+}
+
+static int wil_ft_connect(struct wiphy *wiphy,
+			  struct net_device *ndev,
+			  struct cfg80211_connect_params *sme)
+{
+	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	struct wil6210_vif *vif = ndev_to_vif(ndev);
+	struct wmi_ft_auth_cmd auth_cmd;
+	int rc;
+
+	if (!test_bit(WMI_FW_CAPABILITY_FT_ROAMING, wil->fw_capabilities)) {
+		wil_err(wil, "FT: FW does not support FT roaming\n");
+		return -EOPNOTSUPP;
+	}
+
+	if (!sme->prev_bssid) {
+		wil_err(wil, "FT: prev_bssid was not set\n");
+		return -EINVAL;
+	}
+
+	if (ether_addr_equal(sme->prev_bssid, sme->bssid)) {
+		wil_err(wil, "FT: can not roam to same AP\n");
+		return -EINVAL;
+	}
+
+	if (!test_bit(wil_vif_fwconnected, vif->status)) {
+		wil_err(wil, "FT: roam while not connected\n");
+		return -EINVAL;
+	}
+
+	if (vif->privacy != sme->privacy) {
+		wil_err(wil, "FT: privacy mismatch, current (%d) roam (%d)\n",
+			vif->privacy, sme->privacy);
+		return -EINVAL;
+	}
+
+	if (sme->pbss) {
+		wil_err(wil, "FT: roam is not valid for PBSS\n");
+		return -EINVAL;
+	}
+
+	memset(&auth_cmd, 0, sizeof(auth_cmd));
+	auth_cmd.channel = sme->channel->hw_value - 1;
+	ether_addr_copy(auth_cmd.bssid, sme->bssid);
+
+	if (test_bit(WMI_FW_CAPABILITY_CHANNEL_BONDING, wil->fw_capabilities))
+		if (wil->force_edmg_channel) {
+			rc = wil_spec2wmi_ch(wil->force_edmg_channel,
+					     &auth_cmd.channel);
+			if (rc)
+				wil_err(wil, "FT: wmi channel for channel %d not found",
+					wil->force_edmg_channel);
+		}
+
+	wil_info(wil, "FT: roaming\n");
+
+	set_bit(wil_vif_ft_roam, vif->status);
+	rc = wmi_send(wil, WMI_FT_AUTH_CMDID, vif->mid,
+		      &auth_cmd, sizeof(auth_cmd));
+	if (rc == 0)
+		mod_timer(&vif->connect_timer,
+			  jiffies + msecs_to_jiffies(5000));
+	else
+		clear_bit(wil_vif_ft_roam, vif->status);
+
+	return rc;
 }
 
 static int wil_cfg80211_connect(struct wiphy *wiphy,
@@ -901,14 +1314,23 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	const u8 *rsn_eid;
 	int ch;
 	int rc = 0;
+	bool is_ft_roam = false;
+	u8 network_type;
 	enum ieee80211_bss_type bss_type = IEEE80211_BSS_TYPE_ESS;
 
 	wil_dbg_misc(wil, "connect, mid=%d\n", vif->mid);
 	wil_print_connect_params(wil, sme);
 
-	if (test_bit(wil_vif_fwconnecting, vif->status) ||
+	if (sme->auth_type == NL80211_AUTHTYPE_FT)
+		is_ft_roam = true;
+	if (sme->auth_type == NL80211_AUTHTYPE_AUTOMATIC &&
 	    test_bit(wil_vif_fwconnected, vif->status))
-		return -EALREADY;
+		is_ft_roam = true;
+
+	if (!is_ft_roam)
+		if (test_bit(wil_vif_fwconnecting, vif->status) ||
+		    test_bit(wil_vif_fwconnected, vif->status))
+			return -EALREADY;
 
 	if (sme->ie_len > WMI_MAX_IE_LEN) {
 		wil_err(wil, "IE too large (%td bytes)\n", sme->ie_len);
@@ -918,8 +1340,13 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	rsn_eid = sme->ie ?
 			cfg80211_find_ie(WLAN_EID_RSN, sme->ie, sme->ie_len) :
 			NULL;
-	if (sme->privacy && !rsn_eid)
+	if (sme->privacy && !rsn_eid) {
 		wil_info(wil, "WSC connection\n");
+		if (is_ft_roam) {
+			wil_err(wil, "No WSC with FT roam\n");
+			return -EINVAL;
+		}
+	}
 
 	if (sme->pbss)
 		bss_type = IEEE80211_BSS_TYPE_PBSS;
@@ -941,6 +1368,45 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 	vif->privacy = sme->privacy;
 	vif->pbss = sme->pbss;
 
+	rc = wmi_set_ie(vif, WMI_FRAME_ASSOC_REQ, sme->ie_len, sme->ie);
+	if (rc)
+		goto out;
+
+	switch (bss->capability & WLAN_CAPABILITY_DMG_TYPE_MASK) {
+	case WLAN_CAPABILITY_DMG_TYPE_AP:
+		network_type = WMI_NETTYPE_INFRA;
+		break;
+	case WLAN_CAPABILITY_DMG_TYPE_PBSS:
+		network_type = WMI_NETTYPE_P2P;
+		break;
+	default:
+		wil_err(wil, "Unsupported BSS type, capability= 0x%04x\n",
+			bss->capability);
+		rc = -EINVAL;
+		goto out;
+	}
+
+	ch = bss->channel->hw_value;
+	if (ch == 0) {
+		wil_err(wil, "BSS at unknown frequency %dMhz\n",
+			bss->channel->center_freq);
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+
+	if (is_ft_roam) {
+		if (network_type != WMI_NETTYPE_INFRA) {
+			wil_err(wil, "FT: Unsupported BSS type, capability= 0x%04x\n",
+				bss->capability);
+			rc = -EINVAL;
+			goto out;
+		}
+		rc = wil_ft_connect(wiphy, ndev, sme);
+		if (rc == 0)
+			vif->bss = bss;
+		goto out;
+	}
+
 	if (vif->privacy) {
 		/* For secure assoc, remove old keys */
 		rc = wmi_del_cipher_key(vif, 0, bss->bssid,
@@ -957,28 +1423,9 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 		}
 	}
 
-	/* WMI_SET_APPIE_CMD. ie may contain rsn info as well as other info
-	 * elements. Send it also in case it's empty, to erase previously set
-	 * ies in FW.
-	 */
-	rc = wmi_set_ie(vif, WMI_FRAME_ASSOC_REQ, sme->ie_len, sme->ie);
-	if (rc)
-		goto out;
-
 	/* WMI_CONNECT_CMD */
 	memset(&conn, 0, sizeof(conn));
-	switch (bss->capability & WLAN_CAPABILITY_DMG_TYPE_MASK) {
-	case WLAN_CAPABILITY_DMG_TYPE_AP:
-		conn.network_type = WMI_NETTYPE_INFRA;
-		break;
-	case WLAN_CAPABILITY_DMG_TYPE_PBSS:
-		conn.network_type = WMI_NETTYPE_P2P;
-		break;
-	default:
-		wil_err(wil, "Unsupported BSS type, capability= 0x%04x\n",
-			bss->capability);
-		goto out;
-	}
+	conn.network_type = network_type;
 	if (vif->privacy) {
 		if (rsn_eid) { /* regular secure connection */
 			conn.dot11_auth_mode = WMI_AUTH11_SHARED;
@@ -998,15 +1445,17 @@ static int wil_cfg80211_connect(struct wiphy *wiphy,
 
 	conn.ssid_len = min_t(u8, ssid_eid[1], 32);
 	memcpy(conn.ssid, ssid_eid+2, conn.ssid_len);
-
-	ch = bss->channel->hw_value;
-	if (ch == 0) {
-		wil_err(wil, "BSS at unknown frequency %dMhz\n",
-			bss->channel->center_freq);
-		rc = -EOPNOTSUPP;
-		goto out;
-	}
 	conn.channel = ch - 1;
+
+	if (test_bit(WMI_FW_CAPABILITY_CHANNEL_BONDING, wil->fw_capabilities))
+		if (wil->force_edmg_channel) {
+			rc = wil_spec2wmi_ch(wil->force_edmg_channel,
+					     &conn.edmg_channel);
+			if (rc)
+				wil_err(wil,
+					"wmi channel for channel %d not found",
+					wil->force_edmg_channel);
+		}
 
 	ether_addr_copy(conn.bssid, bss->bssid);
 	ether_addr_copy(conn.dst_mac, bss->bssid);
@@ -1206,9 +1655,9 @@ wil_find_sta_by_key_usage(struct wil6210_priv *wil, u8 mid,
 	return &wil->sta[cid];
 }
 
-static void wil_set_crypto_rx(u8 key_index, enum wmi_key_usage key_usage,
-			      struct wil_sta_info *cs,
-			      struct key_params *params)
+void wil_set_crypto_rx(u8 key_index, enum wmi_key_usage key_usage,
+		       struct wil_sta_info *cs,
+		       struct key_params *params)
 {
 	struct wil_tid_crypto_rx_single *cc;
 	int tid;
@@ -1291,13 +1740,19 @@ static int wil_cfg80211_add_key(struct wiphy *wiphy,
 		     params->seq_len, params->seq);
 
 	if (IS_ERR(cs)) {
-		wil_err(wil, "Not connected, %pM %s[%d] PN %*phN\n",
-			mac_addr, key_usage_str[key_usage], key_index,
-			params->seq_len, params->seq);
-		return -EINVAL;
+		/* in FT, sta info may not be available as add_key may be
+		 * sent by host before FW sends WMI_CONNECT_EVENT
+		 */
+		if (!test_bit(wil_vif_ft_roam, vif->status)) {
+			wil_err(wil, "Not connected, %pM %s[%d] PN %*phN\n",
+				mac_addr, key_usage_str[key_usage], key_index,
+				params->seq_len, params->seq);
+			return -EINVAL;
+		}
 	}
 
-	wil_del_rx_key(key_index, key_usage, cs);
+	if (!IS_ERR(cs))
+		wil_del_rx_key(key_index, key_usage, cs);
 
 	if (params->seq && params->seq_len != IEEE80211_GCMP_PN_LEN) {
 		wil_err(wil,
@@ -1310,8 +1765,19 @@ static int wil_cfg80211_add_key(struct wiphy *wiphy,
 
 	rc = wmi_add_cipher_key(vif, key_index, mac_addr, params->key_len,
 				params->key, key_usage);
-	if (!rc)
+	if (!rc && !IS_ERR(cs)) {
+		/* update local storage used for AP recovery */
+		if (key_usage == WMI_KEY_USE_TX_GROUP && params->key &&
+		    params->key_len <= WMI_MAX_KEY_LEN) {
+			vif->gtk_index = key_index;
+			memcpy(vif->gtk, params->key, params->key_len);
+			vif->gtk_len = params->key_len;
+		}
+		/* in FT set crypto will take place upon receiving
+		 * WMI_RING_EN_EVENTID event
+		 */
 		wil_set_crypto_rx(key_index, key_usage, cs, params);
+	}
 
 	return rc;
 }
@@ -1481,21 +1947,44 @@ static void wil_print_bcon_data(struct cfg80211_beacon_data *b)
 }
 
 /* internal functions for device reset and starting AP */
+static u8 *
+_wil_cfg80211_get_proberesp_ies(const u8 *proberesp, u16 proberesp_len,
+				u16 *ies_len)
+{
+	u8 *ies = NULL;
+
+	if (proberesp) {
+		struct ieee80211_mgmt *f =
+			(struct ieee80211_mgmt *)proberesp;
+		size_t hlen = offsetof(struct ieee80211_mgmt,
+				       u.probe_resp.variable);
+
+		ies = f->u.probe_resp.variable;
+		if (ies_len)
+			*ies_len = proberesp_len - hlen;
+	}
+
+	return ies;
+}
+
 static int _wil_cfg80211_set_ies(struct wil6210_vif *vif,
 				 struct cfg80211_beacon_data *bcon)
 {
 	int rc;
 	u16 len = 0, proberesp_len = 0;
-	u8 *ies = NULL, *proberesp = NULL;
+	u8 *ies = NULL, *proberesp;
 
-	if (bcon->probe_resp) {
-		struct ieee80211_mgmt *f =
-			(struct ieee80211_mgmt *)bcon->probe_resp;
-		size_t hlen = offsetof(struct ieee80211_mgmt,
-				       u.probe_resp.variable);
-		proberesp = f->u.probe_resp.variable;
-		proberesp_len = bcon->probe_resp_len - hlen;
-	}
+	/* update local storage used for AP recovery */
+	wil_memdup_ie(&vif->proberesp, &vif->proberesp_len, bcon->probe_resp,
+		      bcon->probe_resp_len);
+	wil_memdup_ie(&vif->proberesp_ies, &vif->proberesp_ies_len,
+		      bcon->proberesp_ies, bcon->proberesp_ies_len);
+	wil_memdup_ie(&vif->assocresp_ies, &vif->assocresp_ies_len,
+		      bcon->assocresp_ies, bcon->assocresp_ies_len);
+
+	proberesp = _wil_cfg80211_get_proberesp_ies(bcon->probe_resp,
+						    bcon->probe_resp_len,
+						    &proberesp_len);
 	rc = _wil_cfg80211_merge_extra_ies(proberesp,
 					   proberesp_len,
 					   bcon->proberesp_ies,
@@ -1539,6 +2028,9 @@ static int _wil_cfg80211_start_ap(struct wiphy *wiphy,
 	struct wireless_dev *wdev = ndev->ieee80211_ptr;
 	u8 wmi_nettype = wil_iftype_nl2wmi(wdev->iftype);
 	u8 is_go = (wdev->iftype == NL80211_IFTYPE_P2P_GO);
+	u16 proberesp_len = 0;
+	u8 *proberesp;
+	bool ft = false;
 
 	if (pbss)
 		wmi_nettype = WMI_NETTYPE_P2P;
@@ -1550,6 +2042,25 @@ static int _wil_cfg80211_start_ap(struct wiphy *wiphy,
 	}
 
 	wil_set_recovery_state(wil, fw_recovery_idle);
+
+	proberesp = _wil_cfg80211_get_proberesp_ies(bcon->probe_resp,
+						    bcon->probe_resp_len,
+						    &proberesp_len);
+	/* check that the probe response IEs has a MDE */
+	if ((proberesp && proberesp_len > 0 &&
+	     cfg80211_find_ie(WLAN_EID_MOBILITY_DOMAIN,
+			      proberesp,
+			      proberesp_len)))
+		ft = true;
+
+	if (ft) {
+		if (!test_bit(WMI_FW_CAPABILITY_FT_ROAMING,
+			      wil->fw_capabilities)) {
+			wil_err(wil, "FW does not support FT roaming\n");
+			return -ENOTSUPP;
+		}
+		set_bit(wil_vif_ft_roam, vif->status);
+	}
 
 	mutex_lock(&wil->mutex);
 
@@ -1572,6 +2083,9 @@ static int _wil_cfg80211_start_ap(struct wiphy *wiphy,
 	vif->channel = chan;
 	vif->hidden_ssid = hidden_ssid;
 	vif->pbss = pbss;
+	vif->bi = bi;
+	memcpy(vif->ssid, ssid, ssid_len);
+	vif->ssid_len = ssid_len;
 
 	netif_carrier_on(ndev);
 	if (!wil_has_other_active_ifaces(wil, ndev, false, true))
@@ -1598,11 +2112,64 @@ out:
 	return rc;
 }
 
+void wil_cfg80211_ap_recovery(struct wil6210_priv *wil)
+{
+	int rc, i;
+	struct wiphy *wiphy = wil_to_wiphy(wil);
+
+	for (i = 0; i < wil->max_vifs; i++) {
+		struct wil6210_vif *vif = wil->vifs[i];
+		struct net_device *ndev;
+		struct cfg80211_beacon_data bcon = {};
+		struct key_params key_params = {};
+
+		if (!vif || vif->ssid_len == 0)
+			continue;
+
+		ndev = vif_to_ndev(vif);
+		bcon.proberesp_ies = vif->proberesp_ies;
+		bcon.assocresp_ies = vif->assocresp_ies;
+		bcon.probe_resp = vif->proberesp;
+		bcon.proberesp_ies_len = vif->proberesp_ies_len;
+		bcon.assocresp_ies_len = vif->assocresp_ies_len;
+		bcon.probe_resp_len = vif->proberesp_len;
+
+		wil_info(wil,
+			 "AP (vif %d) recovery: privacy %d, bi %d, channel %d, hidden %d, pbss %d\n",
+			 i, vif->privacy, vif->bi, vif->channel,
+			 vif->hidden_ssid, vif->pbss);
+		wil_hex_dump_misc("SSID ", DUMP_PREFIX_OFFSET, 16, 1,
+				  vif->ssid, vif->ssid_len, true);
+		rc = _wil_cfg80211_start_ap(wiphy, ndev,
+					    vif->ssid, vif->ssid_len,
+					    vif->privacy, vif->bi,
+					    vif->channel, &bcon,
+					    vif->hidden_ssid, vif->pbss);
+		if (rc) {
+			wil_err(wil, "vif %d recovery failed (%d)\n", i, rc);
+			continue;
+		}
+
+		if (!vif->privacy || vif->gtk_len == 0)
+			continue;
+
+		key_params.key = vif->gtk;
+		key_params.key_len = vif->gtk_len;
+		key_params.seq_len = IEEE80211_GCMP_PN_LEN;
+		rc = wil_cfg80211_add_key(wiphy, ndev, vif->gtk_index, false,
+					  NULL, &key_params);
+		if (rc)
+			wil_err(wil, "vif %d recovery add key failed (%d)\n",
+				i, rc);
+	}
+}
+
 static int wil_cfg80211_change_beacon(struct wiphy *wiphy,
 				      struct net_device *ndev,
 				      struct cfg80211_beacon_data *bcon)
 {
 	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	struct wireless_dev *wdev = ndev->ieee80211_ptr;
 	struct wil6210_vif *vif = ndev_to_vif(ndev);
 	int rc;
 	u32 privacy = 0;
@@ -1615,15 +2182,16 @@ static int wil_cfg80211_change_beacon(struct wiphy *wiphy,
 			     bcon->tail_len))
 		privacy = 1;
 
+	memcpy(vif->ssid, wdev->ssid, wdev->ssid_len);
+	vif->ssid_len = wdev->ssid_len;
+
 	/* in case privacy has changed, need to restart the AP */
 	if (vif->privacy != privacy) {
-		struct wireless_dev *wdev = ndev->ieee80211_ptr;
-
 		wil_dbg_misc(wil, "privacy changed %d=>%d. Restarting AP\n",
 			     vif->privacy, privacy);
 
-		rc = _wil_cfg80211_start_ap(wiphy, ndev, wdev->ssid,
-					    wdev->ssid_len, privacy,
+		rc = _wil_cfg80211_start_ap(wiphy, ndev, vif->ssid,
+					    vif->ssid_len, privacy,
 					    wdev->beacon_interval,
 					    vif->channel, bcon,
 					    vif->hidden_ssid,
@@ -1712,6 +2280,13 @@ static int wil_cfg80211_stop_ap(struct wiphy *wiphy,
 	mutex_lock(&wil->mutex);
 
 	wmi_pcp_stop(vif);
+	clear_bit(wil_vif_ft_roam, vif->status);
+	vif->ssid_len = 0;
+	wil_memdup_ie(&vif->proberesp, &vif->proberesp_len, NULL, 0);
+	wil_memdup_ie(&vif->proberesp_ies, &vif->proberesp_ies_len, NULL, 0);
+	wil_memdup_ie(&vif->assocresp_ies, &vif->assocresp_ies_len, NULL, 0);
+	memset(vif->gtk, 0, WMI_MAX_KEY_LEN);
+	vif->gtk_len = 0;
 
 	if (last)
 		__wil_down(wil);
@@ -1731,8 +2306,9 @@ static int wil_cfg80211_add_station(struct wiphy *wiphy,
 	struct wil6210_vif *vif = ndev_to_vif(dev);
 	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
 
-	wil_dbg_misc(wil, "add station %pM aid %d mid %d\n",
-		     mac, params->aid, vif->mid);
+	wil_dbg_misc(wil, "add station %pM aid %d mid %d mask 0x%x set 0x%x\n",
+		     mac, params->aid, vif->mid,
+		     params->sta_flags_mask, params->sta_flags_set);
 
 	if (!disable_ap_sme) {
 		wil_err(wil, "not supported with AP SME enabled\n");
@@ -1758,7 +2334,7 @@ static int wil_cfg80211_del_station(struct wiphy *wiphy,
 		     params->mac, params->reason_code, vif->mid);
 
 	mutex_lock(&wil->mutex);
-	wil6210_disconnect(vif, params->mac, params->reason_code, false);
+	wil6210_disconnect(vif, params->mac, params->reason_code);
 	mutex_unlock(&wil->mutex);
 
 	return 0;
@@ -1824,8 +2400,7 @@ static void wil_probe_client_handle(struct wil6210_priv *wil,
 	 */
 	bool alive = (sta->status == wil_sta_connected);
 
-	cfg80211_probe_status(ndev, sta->addr, req->cookie, alive,
-			      0, false, GFP_KERNEL);
+	cfg80211_probe_status(ndev, sta->addr, req->cookie, alive, GFP_KERNEL);
 }
 
 static struct list_head *next_probe_client(struct wil6210_vif *vif)
@@ -1963,6 +2538,7 @@ static int wil_cfg80211_suspend(struct wiphy *wiphy,
 
 	mutex_lock(&wil->mutex);
 	mutex_lock(&wil->vif_mutex);
+	wil_ftm_stop_operations(wil);
 	wil_p2p_stop_radio_operations(wil);
 	wil_abort_scan_all_vifs(wil, true);
 	mutex_unlock(&wil->vif_mutex);
@@ -2053,6 +2629,132 @@ wil_cfg80211_sched_scan_stop(struct wiphy *wiphy, struct net_device *dev,
 	return 0;
 }
 
+static void wil_get_brd_reg_suffix(struct wil6210_priv *wil,
+				   const u8 *new_regdomain,
+				   char *brd_reg_suffix, size_t len)
+{
+	int i;
+	struct wil_regd_2_brd_suffix *entry;
+
+	for (i = 0; i < ARRAY_SIZE(wil_regd_2_brd_suffix_map); i++) {
+		entry = &wil_regd_2_brd_suffix_map[i];
+		if (!memcmp(entry->regdomain, new_regdomain, 2)) {
+			strlcpy(brd_reg_suffix, entry->brd_suffix, len);
+			return;
+		}
+	}
+
+	/* regdomain not found in our map, set suffix to none */
+	brd_reg_suffix[0] = '\0';
+}
+
+static int wil_switch_board_file(struct wil6210_priv *wil,
+				 const u8 *new_regdomain)
+{
+	int rc = 0;
+	char brd_reg_suffix[WIL_BRD_SUFFIX_LEN];
+
+	if (!country_specific_board_file)
+		return 0;
+
+	wil_get_brd_reg_suffix(wil, new_regdomain, brd_reg_suffix,
+			       sizeof(brd_reg_suffix));
+	if (!strcmp(wil->board_file_reg_suffix, brd_reg_suffix))
+		return 0;
+
+	wil_info(wil, "switch board file suffix '%s' => '%s'\n",
+		 wil->board_file_reg_suffix, brd_reg_suffix);
+	strlcpy(wil->board_file_reg_suffix, brd_reg_suffix,
+		sizeof(wil->board_file_reg_suffix));
+
+	/* need to switch board file - reset the device */
+
+	mutex_lock(&wil->mutex);
+
+	if (!wil_has_active_ifaces(wil, true, false) ||
+	    wil_is_recovery_blocked(wil))
+		/* new board file will be used in next FW load */
+		goto out;
+
+	__wil_down(wil);
+	rc = __wil_up(wil);
+
+out:
+	mutex_unlock(&wil->mutex);
+	return rc;
+}
+
+static void wil_cfg80211_reg_notify(struct wiphy *wiphy,
+				    struct regulatory_request *request)
+{
+	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	int rc;
+
+	wil_info(wil, "cfg reg_notify %c%c%s%s initiator %d hint_type %d\n",
+		 request->alpha2[0], request->alpha2[1],
+		 request->intersect ? " intersect" : "",
+		 request->processed ? " processed" : "",
+		 request->initiator, request->user_reg_hint_type);
+
+	if (memcmp(wil->regdomain, request->alpha2, 2) == 0)
+		/* reg domain did not change */
+		return;
+
+	rc = wil_switch_board_file(wil, request->alpha2);
+	if (rc)
+		wil_err(wil, "switch board file failed %d\n", rc);
+
+	memcpy(wil->regdomain, request->alpha2, 2);
+}
+
+static int
+wil_cfg80211_update_ft_ies(struct wiphy *wiphy, struct net_device *dev,
+			   struct cfg80211_update_ft_ies_params *ftie)
+{
+	struct wil6210_priv *wil = wiphy_to_wil(wiphy);
+	struct wil6210_vif *vif = ndev_to_vif(dev);
+	struct cfg80211_bss *bss;
+	struct wmi_ft_reassoc_cmd reassoc;
+	int rc = 0;
+
+	wil_dbg_misc(wil, "update ft ies, mid=%d\n", vif->mid);
+	wil_hex_dump_misc("FT IE ", DUMP_PREFIX_OFFSET, 16, 1,
+			  ftie->ie, ftie->ie_len, true);
+
+	if (!test_bit(WMI_FW_CAPABILITY_FT_ROAMING, wil->fw_capabilities)) {
+		wil_err(wil, "FW does not support FT roaming\n");
+		return -EOPNOTSUPP;
+	}
+
+	rc = wmi_update_ft_ies(vif, ftie->ie_len, ftie->ie);
+	if (rc)
+		return rc;
+
+	if (!test_bit(wil_vif_ft_roam, vif->status))
+		/* vif is not roaming */
+		return 0;
+
+	/* wil_vif_ft_roam is set. wil_cfg80211_update_ft_ies is used as
+	 * a trigger for reassoc
+	 */
+
+	bss = vif->bss;
+	if (!bss) {
+		wil_err(wil, "FT: bss is NULL\n");
+		return -EINVAL;
+	}
+
+	memset(&reassoc, 0, sizeof(reassoc));
+	ether_addr_copy(reassoc.bssid, bss->bssid);
+
+	rc = wmi_send(wil, WMI_FT_REASSOC_CMDID, vif->mid,
+		      &reassoc, sizeof(reassoc));
+	if (rc)
+		wil_err(wil, "FT: reassoc failed (%d)\n", rc);
+
+	return rc;
+}
+
 static const struct cfg80211_ops wil_cfg80211_ops = {
 	.add_virtual_intf = wil_cfg80211_add_iface,
 	.del_virtual_intf = wil_cfg80211_del_iface,
@@ -2088,6 +2790,7 @@ static const struct cfg80211_ops wil_cfg80211_ops = {
 	.resume = wil_cfg80211_resume,
 	.sched_scan_start = wil_cfg80211_sched_scan_start,
 	.sched_scan_stop = wil_cfg80211_sched_scan_stop,
+	.update_ft_ies = wil_cfg80211_update_ft_ies,
 };
 
 static void wil_wiphy_init(struct wiphy *wiphy)
@@ -2124,8 +2827,17 @@ static void wil_wiphy_init(struct wiphy *wiphy)
 	wiphy->mgmt_stypes = wil_mgmt_stypes;
 	wiphy->features |= NL80211_FEATURE_SK_TX_STATUS;
 
+	wiphy->reg_notifier = wil_cfg80211_reg_notify;
+
 	wiphy->n_vendor_commands = ARRAY_SIZE(wil_nl80211_vendor_commands);
 	wiphy->vendor_commands = wil_nl80211_vendor_commands;
+	wiphy->vendor_events = wil_nl80211_vendor_events;
+	wiphy->n_vendor_events = ARRAY_SIZE(wil_nl80211_vendor_events);
+
+	if (ignore_reg_hints) {
+		wiphy->regulatory_flags |= REGULATORY_DISABLE_BEACON_HINTS;
+		wiphy->regulatory_flags |= REGULATORY_COUNTRY_IE_IGNORE;
+	}
 
 #ifdef CONFIG_PM
 	wiphy->wowlan = &wil_wowlan_support;
@@ -2287,7 +2999,7 @@ static int wil_rf_sector_get_cfg(struct wiphy *wiphy,
 	struct wil6210_priv *wil = wdev_to_wil(wdev);
 	struct wil6210_vif *vif = wdev_to_vif(wil, wdev);
 	int rc;
-	struct nlattr *tb[QCA_ATTR_DMG_RF_SECTOR_MAX + 1];
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
 	u16 sector_index;
 	u8 sector_type;
 	u32 rf_modules_vec;
@@ -2306,7 +3018,7 @@ static int wil_rf_sector_get_cfg(struct wiphy *wiphy,
 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
 		return -EOPNOTSUPP;
 
-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
 		       wil_rf_sector_policy, NULL);
 	if (rc) {
 		wil_err(wil, "Invalid rf sector ATTR\n");
@@ -2408,7 +3120,7 @@ static int wil_rf_sector_set_cfg(struct wiphy *wiphy,
 	struct wil6210_priv *wil = wdev_to_wil(wdev);
 	struct wil6210_vif *vif = wdev_to_vif(wil, wdev);
 	int rc, tmp;
-	struct nlattr *tb[QCA_ATTR_DMG_RF_SECTOR_MAX + 1];
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
 	struct nlattr *tb2[QCA_ATTR_DMG_RF_SECTOR_CFG_MAX + 1];
 	u16 sector_index, rf_module_index;
 	u8 sector_type;
@@ -2426,7 +3138,7 @@ static int wil_rf_sector_set_cfg(struct wiphy *wiphy,
 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
 		return -EOPNOTSUPP;
 
-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
 		       wil_rf_sector_policy, NULL);
 	if (rc) {
 		wil_err(wil, "Invalid rf sector ATTR\n");
@@ -2518,7 +3230,7 @@ static int wil_rf_sector_get_selected(struct wiphy *wiphy,
 	struct wil6210_priv *wil = wdev_to_wil(wdev);
 	struct wil6210_vif *vif = wdev_to_vif(wil, wdev);
 	int rc;
-	struct nlattr *tb[QCA_ATTR_DMG_RF_SECTOR_MAX + 1];
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
 	u8 sector_type, mac_addr[ETH_ALEN];
 	int cid = 0;
 	struct wmi_get_selected_rf_sector_index_cmd cmd;
@@ -2533,7 +3245,7 @@ static int wil_rf_sector_get_selected(struct wiphy *wiphy,
 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
 		return -EOPNOTSUPP;
 
-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
 		       wil_rf_sector_policy, NULL);
 	if (rc) {
 		wil_err(wil, "Invalid rf sector ATTR\n");
@@ -2633,7 +3345,7 @@ static int wil_rf_sector_set_selected(struct wiphy *wiphy,
 	struct wil6210_priv *wil = wdev_to_wil(wdev);
 	struct wil6210_vif *vif = wdev_to_vif(wil, wdev);
 	int rc;
-	struct nlattr *tb[QCA_ATTR_DMG_RF_SECTOR_MAX + 1];
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
 	u16 sector_index;
 	u8 sector_type, mac_addr[ETH_ALEN], i;
 	int cid = 0;
@@ -2641,7 +3353,7 @@ static int wil_rf_sector_set_selected(struct wiphy *wiphy,
 	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
 		return -EOPNOTSUPP;
 
-	rc = nla_parse(tb, QCA_ATTR_DMG_RF_SECTOR_MAX, data, data_len,
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
 		       wil_rf_sector_policy, NULL);
 	if (rc) {
 		wil_err(wil, "Invalid rf sector ATTR\n");
@@ -2722,4 +3434,279 @@ static int wil_rf_sector_set_selected(struct wiphy *wiphy,
 	}
 
 	return rc;
+}
+
+static int
+wil_brp_wmi_set_ant_limit(struct wil6210_priv *wil, u8 mid, u8 cid,
+			  u8 limit_mode, u8 antenna_num_limit)
+{
+	int rc;
+	struct wmi_brp_set_ant_limit_cmd cmd = {
+		.cid = cid,
+		.limit_mode = limit_mode,
+		.ant_limit = antenna_num_limit,
+	};
+	struct {
+		struct wmi_cmd_hdr wmi;
+		struct wmi_brp_set_ant_limit_event evt;
+	} __packed reply;
+
+	reply.evt.status = WMI_FW_STATUS_FAILURE;
+
+	rc = wmi_call(wil, WMI_BRP_SET_ANT_LIMIT_CMDID, mid, &cmd, sizeof(cmd),
+		      WMI_BRP_SET_ANT_LIMIT_EVENTID, &reply,
+		      sizeof(reply), 250);
+	if (rc)
+		return rc;
+
+	if (reply.evt.status != WMI_FW_STATUS_SUCCESS) {
+		wil_err(wil, "brp set antenna limit failed with status %d\n",
+			reply.evt.status);
+		rc = -EINVAL;
+	}
+
+	return rc;
+}
+
+static int wil_brp_set_ant_limit(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 const void *data, int data_len)
+{
+	struct wil6210_priv *wil = wdev_to_wil(wdev);
+	struct wil6210_vif *vif = wdev_to_vif(wil, wdev);
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
+	u8 mac_addr[ETH_ALEN];
+	u8 antenna_num_limit = 0;
+	u8 limit_mode;
+	int cid = 0;
+	int rc;
+
+	if (!test_bit(WMI_FW_CAPABILITY_RF_SECTORS, wil->fw_capabilities))
+		return -ENOTSUPP;
+
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
+		       wil_brp_ant_limit_policy, NULL);
+	if (rc) {
+		wil_err(wil, "Invalid ant limit ATTR\n");
+		return rc;
+	}
+
+	if (!tb[QCA_ATTR_BRP_ANT_LIMIT_MODE] || !tb[QCA_ATTR_MAC_ADDR]) {
+		wil_err(wil, "Invalid antenna limit spec\n");
+		return -EINVAL;
+	}
+
+	limit_mode = nla_get_u8(tb[QCA_ATTR_BRP_ANT_LIMIT_MODE]);
+	if (limit_mode >= QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODES_NUM) {
+		wil_err(wil, "Invalid limit mode %d\n", limit_mode);
+		return -EINVAL;
+	}
+
+	if (limit_mode != QCA_WLAN_VENDOR_ATTR_BRP_ANT_LIMIT_MODE_DISABLE) {
+		if (!tb[QCA_ATTR_BRP_ANT_NUM_LIMIT]) {
+			wil_err(wil, "Invalid limit number\n");
+			return -EINVAL;
+		}
+
+		antenna_num_limit = nla_get_u8(tb[QCA_ATTR_BRP_ANT_NUM_LIMIT]);
+		if (antenna_num_limit > WIL_BRP_ANT_LIMIT_MAX ||
+		    antenna_num_limit < WIL_BRP_ANT_LIMIT_MIN) {
+			wil_err(wil, "Invalid number of antenna limit: %d\n",
+				antenna_num_limit);
+			return -EINVAL;
+		}
+	}
+
+	ether_addr_copy(mac_addr, nla_data(tb[QCA_ATTR_MAC_ADDR]));
+	cid = wil_find_cid(wil, vif->mid, mac_addr);
+	if (cid < 0) {
+		wil_err(wil, "invalid MAC address %pM\n", mac_addr);
+		return -ENOENT;
+	}
+
+	return wil_brp_wmi_set_ant_limit(wil, vif->mid, cid, limit_mode,
+					 antenna_num_limit);
+}
+
+static int wil_nl_60g_handle_cmd(struct wiphy *wiphy, struct wireless_dev *wdev,
+				 const void *data, int data_len)
+{
+	struct wil6210_priv *wil = wdev_to_wil(wdev);
+	struct nlattr *tb[QCA_ATTR_WIL_MAX + 1];
+	struct wil_nl_60g_send_receive_wmi *cmd;
+	struct wil_nl_60g_debug_force_wmi debug_force_wmi;
+	int rc, len;
+	u32 wil_nl_60g_cmd_type, publish;
+
+	rc = nla_parse(tb, QCA_ATTR_WIL_MAX, data, data_len,
+		       wil_nl_60g_policy, NULL);
+	if (rc) {
+		wil_err(wil, "Invalid nl_60g_cmd ATTR\n");
+		return rc;
+	}
+
+	if (!tb[WIL_ATTR_60G_CMD_TYPE]) {
+		wil_err(wil, "Invalid nl_60g_cmd type\n");
+		return -EINVAL;
+	}
+
+	wil_nl_60g_cmd_type = nla_get_u32(tb[WIL_ATTR_60G_CMD_TYPE]);
+
+	switch (wil_nl_60g_cmd_type) {
+	case NL_60G_CMD_REGISTER:
+		if (!tb[WIL_ATTR_60G_BUF]) {
+			wil_err(wil, "Invalid nl_60g_cmd spec\n");
+			return -EINVAL;
+		}
+
+		len = nla_len(tb[WIL_ATTR_60G_BUF]);
+		if (len != sizeof(publish)) {
+			wil_err(wil, "cmd buffer wrong len %d\n", len);
+			return -EINVAL;
+		}
+		memcpy(&publish, nla_data(tb[WIL_ATTR_60G_BUF]), len);
+		wil->publish_nl_evt = publish;
+
+		wil_dbg_wmi(wil, "Publish wmi event %s\n",
+			    publish ? "enabled" : "disabled");
+		break;
+	case NL_60G_CMD_DEBUG:
+		if (!tb[WIL_ATTR_60G_BUF]) {
+			wil_err(wil, "Invalid nl_60g_cmd spec\n");
+			return -EINVAL;
+		}
+
+		len = nla_len(tb[WIL_ATTR_60G_BUF]);
+		if (len < sizeof(struct wil_nl_60g_debug)) {
+			wil_err(wil, "cmd buffer too short %d\n", len);
+			return -EINVAL;
+		}
+
+		memcpy(&debug_force_wmi, nla_data(tb[WIL_ATTR_60G_BUF]),
+		       sizeof(struct wil_nl_60g_debug));
+
+		switch (debug_force_wmi.hdr.cmd_id) {
+		case NL_60G_DBG_FORCE_WMI_SEND:
+			if (len != sizeof(debug_force_wmi)) {
+				wil_err(wil, "cmd buffer wrong len %d\n", len);
+				return -EINVAL;
+			}
+
+			memcpy(&debug_force_wmi, nla_data(tb[WIL_ATTR_60G_BUF]),
+			       sizeof(debug_force_wmi));
+			wil->force_wmi_send = debug_force_wmi.enable;
+
+			wil_dbg_wmi(wil, "force sending wmi commands %d\n",
+				    wil->force_wmi_send);
+			break;
+		case NL_60G_GEN_FW_RESET:
+			if (!test_bit(WMI_FW_CAPABILITY_WMI_ONLY,
+				      wil->fw_capabilities)) {
+				rc = -EOPNOTSUPP;
+				break;
+			}
+
+			wil_dbg_misc(wil,
+				     "NL_60G_GEN_FW_RESET, resetting...\n");
+
+			mutex_lock(&wil->mutex);
+			down_write(&wil->mem_lock);
+			rc = wil_reset(wil, true);
+			up_write(&wil->mem_lock);
+			mutex_unlock(&wil->mutex);
+
+			break;
+		default:
+			rc = -EINVAL;
+			wil_err(wil, "invalid debug_cmd id %d",
+				debug_force_wmi.hdr.cmd_id);
+		}
+		break;
+	case NL_60G_CMD_FW_WMI:
+		if (!tb[WIL_ATTR_60G_BUF]) {
+			wil_err(wil, "Invalid nl_60g_cmd spec\n");
+			return -EINVAL;
+		}
+
+		len = nla_len(tb[WIL_ATTR_60G_BUF]);
+		if (len < offsetof(struct wil_nl_60g_send_receive_wmi, buf)) {
+			wil_err(wil, "wmi cmd buffer too small\n");
+			return -EINVAL;
+		}
+
+		cmd = kmalloc(len, GFP_KERNEL);
+		if (!cmd)
+			return -ENOMEM;
+
+		memcpy(cmd, nla_data(tb[WIL_ATTR_60G_BUF]), (unsigned int)len);
+
+		wil_dbg_wmi(wil, "sending user-space command (0x%04x) [%d]\n",
+			    cmd->cmd_id, cmd->buf_len);
+
+		if (wil->force_wmi_send)
+			rc = wmi_force_send(wil, cmd->cmd_id, cmd->dev_id,
+					    cmd->buf, cmd->buf_len);
+		else
+			rc = wmi_send(wil, cmd->cmd_id, cmd->dev_id,
+				      cmd->buf, cmd->buf_len);
+
+		kfree(cmd);
+		break;
+	default:
+		rc = -EINVAL;
+		wil_err(wil, "invalid nl_60g_cmd type %d", wil_nl_60g_cmd_type);
+	}
+
+	return rc;
+}
+
+void wil_nl_60g_receive_wmi_evt(struct wil6210_priv *wil, u8 *cmd, int len)
+{
+	struct sk_buff *vendor_event = NULL;
+	struct wil_nl_60g_event *evt;
+	struct wil_nl_60g_send_receive_wmi *wmi_buf;
+	struct wmi_cmd_hdr *wmi_hdr = (struct wmi_cmd_hdr *)cmd;
+	int data_len;
+
+	if (!wil->publish_nl_evt)
+		return;
+
+	wil_dbg_wmi(wil, "report wmi event to user-space (0x%04x) [%d]\n",
+		    le16_to_cpu(wmi_hdr->command_id), len);
+
+	data_len = len - sizeof(struct wmi_cmd_hdr);
+
+	evt = kzalloc(sizeof(*evt) + sizeof(*wmi_buf) + data_len, GFP_KERNEL);
+	if (!evt)
+		return;
+
+	evt->evt_type = NL_60G_EVT_FW_WMI;
+	evt->buf_len = sizeof(*wmi_buf) + data_len;
+
+	wmi_buf = (struct wil_nl_60g_send_receive_wmi *)evt->buf;
+
+	wmi_buf->cmd_id = le16_to_cpu(wmi_hdr->command_id);
+	wmi_buf->dev_id = wmi_hdr->mid;
+	wmi_buf->buf_len = data_len;
+	memcpy(wmi_buf->buf, cmd + sizeof(struct wmi_cmd_hdr), data_len);
+
+	vendor_event = cfg80211_vendor_event_alloc(
+				wil_to_wiphy(wil),
+				NULL,
+				data_len + 4 + NLMSG_HDRLEN +
+				sizeof(*evt) + sizeof(*wmi_buf),
+				QCA_NL80211_VENDOR_EVENT_UNSPEC_INDEX,
+				GFP_KERNEL);
+	if (!vendor_event)
+		goto out;
+
+	if (nla_put(vendor_event, WIL_ATTR_60G_BUF,
+		    sizeof(*evt) + sizeof(*wmi_buf) + data_len, evt)) {
+		wil_err(wil, "failed to fill WIL_ATTR_60G_BUF\n");
+		goto out;
+	}
+
+	cfg80211_vendor_event(vendor_event, GFP_KERNEL);
+
+out:
+	kfree(evt);
 }

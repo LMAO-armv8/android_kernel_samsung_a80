@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016, 2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -506,6 +506,7 @@ static int vadc_of_xlate(struct iio_dev *indio_dev,
 static const struct iio_info vadc_info = {
 	.read_raw = vadc_read_raw,
 	.of_xlate = vadc_of_xlate,
+	.driver_module = THIS_MODULE,
 };
 
 struct vadc_channels {
@@ -560,7 +561,7 @@ static const struct vadc_channels vadc_chans[] = {
 	VADC_CHAN_NO_SCALE(SPARE1_03, 1)
 	VADC_CHAN_NO_SCALE(USB_ID_MV, 1)
 	VADC_CHAN_VOLT(VCOIN, 1, SCALE_DEFAULT)
-	VADC_CHAN_NO_SCALE(VBAT_SNS, 1)
+	VADC_CHAN_VOLT(VBAT_SNS, 1, SCALE_DEFAULT)
 	VADC_CHAN_VOLT(VSYS, 1, SCALE_DEFAULT)
 	VADC_CHAN_TEMP(DIE_TEMP, 0, SCALE_PMIC_THERM)
 	VADC_CHAN_VOLT(REF_625MV, 0, SCALE_DEFAULT)

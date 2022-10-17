@@ -50,16 +50,7 @@ static int rtl28xxu_ctrl_msg(struct dvb_usb_device *d, struct rtl28xxu_req *req)
 	} else {
 		/* read */
 		requesttype = (USB_TYPE_VENDOR | USB_DIR_IN);
-
-		/*
-		 * Zero-length transfers must use usb_sndctrlpipe() and
-		 * rtl28xxu_identify_state() uses a zero-length i2c read
-		 * command to determine the chip type.
-		 */
-		if (req->size)
-			pipe = usb_rcvctrlpipe(d->udev, 0);
-		else
-			pipe = usb_sndctrlpipe(d->udev, 0);
+		pipe = usb_rcvctrlpipe(d->udev, 0);
 	}
 
 	ret = usb_control_msg(d->udev, pipe, 0, requesttype, req->value,
@@ -1607,7 +1598,7 @@ static int rtl2831u_rc_query(struct dvb_usb_device *d)
 	struct rtl28xxu_dev *dev = d->priv;
 	u8 buf[5];
 	u32 rc_code;
-	static const struct rtl28xxu_reg_val rc_nec_tab[] = {
+	struct rtl28xxu_reg_val rc_nec_tab[] = {
 		{ 0x3033, 0x80 },
 		{ 0x3020, 0x43 },
 		{ 0x3021, 0x16 },
@@ -1741,7 +1732,7 @@ static int rtl2832u_rc_query(struct dvb_usb_device *d)
 		goto exit;
 
 	ret = rtl28xxu_rd_reg(d, IR_RX_BC, &buf[0]);
-	if (ret || buf[0] > sizeof(buf))
+	if (ret)
 		goto err;
 
 	len = buf[0];

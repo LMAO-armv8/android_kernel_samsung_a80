@@ -1010,7 +1010,7 @@ ccio_unmap_sg(struct device *dev, struct scatterlist *sglist, int nents,
 	ioc->usg_calls++;
 #endif
 
-	while (nents && sg_dma_len(sglist)) {
+	while(sg_dma_len(sglist) && nents--) {
 
 #ifdef CCIO_COLLECT_STATS
 		ioc->usg_pages += sg_dma_len(sglist) >> PAGE_SHIFT;
@@ -1018,7 +1018,6 @@ ccio_unmap_sg(struct device *dev, struct scatterlist *sglist, int nents,
 		ccio_unmap_page(dev, sg_dma_address(sglist),
 				  sg_dma_len(sglist), direction, 0);
 		++sglist;
-		nents--;
 	}
 
 	DBG_RUN_SG("%s() DONE (nents %d)\n", __func__, nents);
@@ -1107,6 +1106,19 @@ static int ccio_proc_info(struct seq_file *m, void *p)
 	return 0;
 }
 
+static int ccio_proc_info_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, &ccio_proc_info, NULL);
+}
+
+static const struct file_operations ccio_proc_info_fops = {
+	.owner = THIS_MODULE,
+	.open = ccio_proc_info_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int ccio_proc_bitmap_info(struct seq_file *m, void *p)
 {
 	struct ioc *ioc = ioc_list;
@@ -1121,6 +1133,19 @@ static int ccio_proc_bitmap_info(struct seq_file *m, void *p)
 
 	return 0;
 }
+
+static int ccio_proc_bitmap_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, &ccio_proc_bitmap_info, NULL);
+}
+
+static const struct file_operations ccio_proc_bitmap_fops = {
+	.owner = THIS_MODULE,
+	.open = ccio_proc_bitmap_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 #endif /* CONFIG_PROC_FS */
 
 /**
@@ -1168,7 +1193,7 @@ void * ccio_get_iommu(const struct parisc_device *dev)
  * to/from certain pages.  To avoid this happening, we mark these pages
  * as `used', and ensure that nothing will try to allocate from them.
  */
-void __init ccio_cujo20_fixup(struct parisc_device *cujo, u32 iovp)
+void ccio_cujo20_fixup(struct parisc_device *cujo, u32 iovp)
 {
 	unsigned int idx;
 	struct parisc_device *dev = parisc_parent(cujo);
@@ -1236,7 +1261,7 @@ static struct parisc_driver ccio_driver __refdata = {
  * I/O Page Directory, the resource map, and initalizing the
  * U2/Uturn chip into virtual mode.
  */
-static void __init
+static void
 ccio_ioc_init(struct ioc *ioc)
 {
 	int i;
@@ -1390,17 +1415,15 @@ ccio_init_resource(struct resource *res, char *name, void __iomem *ioaddr)
 	}
 }
 
-static int __init ccio_init_resources(struct ioc *ioc)
+static void __init ccio_init_resources(struct ioc *ioc)
 {
 	struct resource *res = ioc->mmio_region;
 	char *name = kmalloc(14, GFP_KERNEL);
-	if (unlikely(!name))
-		return -ENOMEM;
+
 	snprintf(name, 14, "GSC Bus [%d/]", ioc->hw_path);
 
 	ccio_init_resource(res, name, &ioc->ioc_regs->io_io_low);
 	ccio_init_resource(res + 1, name, &ioc->ioc_regs->io_io_low_hv);
-	return 0;
 }
 
 static int new_ioc_area(struct resource *res, unsigned long size,
@@ -1554,11 +1577,7 @@ static int __init ccio_probe(struct parisc_device *dev)
 		return -ENOMEM;
 	}
 	ccio_ioc_init(ioc);
-	if (ccio_init_resources(ioc)) {
-		iounmap(ioc->ioc_regs);
-		kfree(ioc);
-		return -ENOMEM;
-	}
+	ccio_init_resources(ioc);
 	hppa_dma_ops = &ccio_ops;
 	dev->dev.platform_data = kzalloc(sizeof(struct pci_hba_data), GFP_KERNEL);
 
@@ -1568,13 +1587,15 @@ static int __init ccio_probe(struct parisc_device *dev)
 
 #ifdef CONFIG_PROC_FS
 	if (ioc_count == 0) {
-		proc_create_single(MODULE_NAME, 0, proc_runway_root,
-				ccio_proc_info);
-		proc_create_single(MODULE_NAME"-bitmap", 0, proc_runway_root,
-				ccio_proc_bitmap_info);
+		proc_create(MODULE_NAME, 0, proc_runway_root,
+			    &ccio_proc_info_fops);
+		proc_create(MODULE_NAME"-bitmap", 0, proc_runway_root,
+			    &ccio_proc_bitmap_fops);
 	}
 #endif
 	ioc_count++;
+
+	parisc_has_iommu();
 	return 0;
 }
 

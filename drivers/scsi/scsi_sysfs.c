@@ -20,10 +20,13 @@
 #include <scsi/scsi_dh.h>
 #include <scsi/scsi_transport.h>
 #include <scsi/scsi_driver.h>
-#include <scsi/scsi_devinfo.h>
 
 #include "scsi_priv.h"
 #include "scsi_logging.h"
+
+#ifdef CONFIG_SCSI_UFSHCD
+#include "ufs/ufshcd.h"
+#endif
 
 static struct device_type scsi_dev_type;
 
@@ -265,6 +268,19 @@ show_shost_supported_mode(struct device *dev, struct device_attribute *attr,
 
 static DEVICE_ATTR(supported_mode, S_IRUGO | S_IWUSR, show_shost_supported_mode, NULL);
 
+/* for Argos */
+#ifdef CONFIG_SCSI_UFSHCD
+static ssize_t show_shost_transferred_cnt(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct Scsi_Host *shost = class_to_shost(dev);
+    struct ufs_hba *hba = shost_priv(shost);
+
+    return sprintf(buf, "%u\n", hba->transferred_sector);
+}
+
+static DEVICE_ATTR(transferred_cnt, S_IRUGO | S_IWUSR, show_shost_transferred_cnt, NULL);
+#endif
+
 static ssize_t
 show_shost_active_mode(struct device *dev,
 		       struct device_attribute *attr, char *buf)
@@ -382,7 +398,7 @@ static ssize_t
 show_host_busy(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct Scsi_Host *shost = class_to_shost(dev);
-	return snprintf(buf, 20, "%d\n", scsi_host_busy(shost));
+	return snprintf(buf, 20, "%d\n", atomic_read(&shost->host_busy));
 }
 static DEVICE_ATTR(host_busy, S_IRUGO, show_host_busy, NULL);
 
@@ -399,6 +415,9 @@ static struct attribute *scsi_sysfs_shost_attrs[] = {
 	&dev_attr_scan.attr,
 	&dev_attr_hstate.attr,
 	&dev_attr_supported_mode.attr,
+#ifdef CONFIG_SCSI_UFSHCD
+ 	&dev_attr_transferred_cnt.attr,
+#endif
 	&dev_attr_active_mode.attr,
 	&dev_attr_prot_capabilities.attr,
 	&dev_attr_prot_guard_type.attr,
@@ -431,11 +450,8 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 	struct list_head *this, *tmp;
 	struct scsi_vpd *vpd_pg80 = NULL, *vpd_pg83 = NULL;
 	unsigned long flags;
-	struct module *mod;
 
 	sdev = container_of(work, struct scsi_device, ew.work);
-
-	mod = sdev->host->hostt->module;
 
 	scsi_dh_release_device(sdev);
 
@@ -477,17 +493,11 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 
 	if (parent)
 		put_device(parent);
-	module_put(mod);
 }
 
 static void scsi_device_dev_release(struct device *dev)
 {
 	struct scsi_device *sdp = to_scsi_device(dev);
-
-	/* Set module pointer as NULL in case of module unloading */
-	if (!try_module_get(sdp->host->hostt->module))
-		sdp->host->hostt->module = NULL;
-
 	execute_in_process_context(scsi_device_dev_release_usercontext,
 				   &sdp->ew);
 }
@@ -682,8 +692,11 @@ sdev_store_timeout (struct device *dev, struct device_attribute *attr,
 {
 	struct scsi_device *sdev;
 	int timeout;
+	int res;
 	sdev = to_scsi_device(dev);
-	sscanf (buf, "%d\n", &timeout);
+	res = sscanf (buf, "%d\n", &timeout);
+	if (res != 1)
+		return -EINVAL;
 	blk_queue_rq_timeout(sdev->request_queue, timeout * HZ);
 	return count;
 }
@@ -1001,42 +1014,6 @@ sdev_show_wwid(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR(wwid, S_IRUGO, sdev_show_wwid, NULL);
 
-#define BLIST_FLAG_NAME(name)					\
-	[const_ilog2((__force __u64)BLIST_##name)] = #name
-static const char *const sdev_bflags_name[] = {
-#include "scsi_devinfo_tbl.c"
-};
-#undef BLIST_FLAG_NAME
-
-static ssize_t
-sdev_show_blacklist(struct device *dev, struct device_attribute *attr,
-		    char *buf)
-{
-	struct scsi_device *sdev = to_scsi_device(dev);
-	int i;
-	ssize_t len = 0;
-
-	for (i = 0; i < sizeof(sdev->sdev_bflags) * BITS_PER_BYTE; i++) {
-		const char *name = NULL;
-
-		if (!(sdev->sdev_bflags & (__force blist_flags_t)BIT(i)))
-			continue;
-		if (i < ARRAY_SIZE(sdev_bflags_name) && sdev_bflags_name[i])
-			name = sdev_bflags_name[i];
-
-		if (name)
-			len += snprintf(buf + len, PAGE_SIZE - len,
-					"%s%s", len ? " " : "", name);
-		else
-			len += snprintf(buf + len, PAGE_SIZE - len,
-					"%sINVALID_BIT(%d)", len ? " " : "", i);
-	}
-	if (len)
-		len += snprintf(buf + len, PAGE_SIZE - len, "\n");
-	return len;
-}
-static DEVICE_ATTR(blacklist, S_IRUGO, sdev_show_blacklist, NULL);
-
 #ifdef CONFIG_SCSI_DH
 static ssize_t
 sdev_show_dh_state(struct device *dev, struct device_attribute *attr,
@@ -1222,7 +1199,6 @@ static struct attribute *scsi_sdev_attrs[] = {
 	&dev_attr_queue_depth.attr,
 	&dev_attr_queue_type.attr,
 	&dev_attr_wwid.attr,
-	&dev_attr_blacklist.attr,
 #ifdef CONFIG_SCSI_DH
 	&dev_attr_dh_state.attr,
 	&dev_attr_access_state.attr,
@@ -1300,19 +1276,26 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
 	device_enable_async_suspend(&sdev->sdev_gendev);
 	scsi_autopm_get_target(starget);
 	pm_runtime_set_active(&sdev->sdev_gendev);
-	if (!sdev->rpm_autosuspend)
+	if (!sdev->use_rpm_auto)
 		pm_runtime_forbid(&sdev->sdev_gendev);
 	pm_runtime_enable(&sdev->sdev_gendev);
 	scsi_autopm_put_target(starget);
 
 	scsi_autopm_get_device(sdev);
 
-	scsi_dh_add_device(sdev);
+	error = scsi_dh_add_device(sdev);
+	if (error)
+		/*
+		 * device_handler is optional, so any error can be ignored
+		 */
+		sdev_printk(KERN_INFO, sdev,
+				"failed to add device handler: %d\n", error);
 
 	error = device_add(&sdev->sdev_gendev);
 	if (error) {
 		sdev_printk(KERN_INFO, sdev,
 				"failed to add device: %d\n", error);
+		scsi_dh_remove_device(sdev);
 		return error;
 	}
 
@@ -1321,13 +1304,15 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
 	if (error) {
 		sdev_printk(KERN_INFO, sdev,
 				"failed to add class device: %d\n", error);
+		scsi_dh_remove_device(sdev);
 		device_del(&sdev->sdev_gendev);
 		return error;
 	}
 	transport_add_device(&sdev->sdev_gendev);
 	sdev->is_visible = 1;
 
-	error = bsg_scsi_register_queue(rq, &sdev->sdev_gendev);
+	error = bsg_register_queue(rq, &sdev->sdev_gendev, NULL, NULL);
+
 	if (error)
 		/* we're treating error on bsg register as non-fatal,
 		 * so pretend nothing went wrong */
@@ -1342,13 +1327,6 @@ int scsi_sysfs_add_sdev(struct scsi_device *sdev)
 			if (error)
 				return error;
 		}
-	}
-
-	if (sdev->host->hostt->sdev_groups) {
-		error = sysfs_create_groups(&sdev->sdev_gendev.kobj,
-				sdev->host->hostt->sdev_groups);
-		if (error)
-			return error;
 	}
 
 	scsi_autopm_put_device(sdev);
@@ -1390,13 +1368,10 @@ void __scsi_remove_device(struct scsi_device *sdev)
 		if (res != 0)
 			return;
 
-		if (sdev->host->hostt->sdev_groups)
-			sysfs_remove_groups(&sdev->sdev_gendev.kobj,
-					sdev->host->hostt->sdev_groups);
-
 		bsg_unregister_queue(sdev->request_queue);
 		device_unregister(&sdev->sdev_dev);
 		transport_remove_device(dev);
+		scsi_dh_remove_device(sdev);
 		device_del(dev);
 	} else
 		put_device(&sdev->sdev_dev);

@@ -353,7 +353,6 @@ static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type,
 		break;
 	case PR_TYPE_WRITE_EXCLUSIVE_REGONLY:
 		we = 1;
-		/* fall through */
 	case PR_TYPE_EXCLUSIVE_ACCESS_REGONLY:
 		/*
 		 * Some commands are only allowed for registered I_T Nexuses.
@@ -362,7 +361,6 @@ static int core_scsi3_pr_seq_non_holder(struct se_cmd *cmd, u32 pr_reg_type,
 		break;
 	case PR_TYPE_WRITE_EXCLUSIVE_ALLREG:
 		we = 1;
-		/* fall through */
 	case PR_TYPE_EXCLUSIVE_ACCESS_ALLREG:
 		/*
 		 * Each registered I_T Nexus is a reservation holder.
@@ -1525,7 +1523,7 @@ core_scsi3_decode_spec_i_port(
 	tidh_new = kzalloc(sizeof(struct pr_transport_id_holder), GFP_KERNEL);
 	if (!tidh_new) {
 		pr_err("Unable to allocate tidh_new\n");
-		return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 	}
 	INIT_LIST_HEAD(&tidh_new->dest_list);
 	tidh_new->dest_tpg = tpg;
@@ -1537,7 +1535,7 @@ core_scsi3_decode_spec_i_port(
 				sa_res_key, all_tg_pt, aptpl);
 	if (!local_pr_reg) {
 		kfree(tidh_new);
-		return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 	}
 	tidh_new->dest_pr_reg = local_pr_reg;
 	/*
@@ -1557,7 +1555,7 @@ core_scsi3_decode_spec_i_port(
 
 	buf = transport_kmap_data_sg(cmd);
 	if (!buf) {
-		ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 		goto out;
 	}
 
@@ -1601,7 +1599,7 @@ core_scsi3_decode_spec_i_port(
 			dest_rtpi = tmp_lun->lun_rtpi;
 
 			i_str = target_parse_pr_out_transport_id(tmp_tpg,
-					ptr, &tid_len, &iport_ptr);
+					(const char *)ptr, &tid_len, &iport_ptr);
 			if (!i_str)
 				continue;
 
@@ -1771,7 +1769,7 @@ core_scsi3_decode_spec_i_port(
 			core_scsi3_nodeacl_undepend_item(dest_node_acl);
 			core_scsi3_tpg_undepend_item(dest_tpg);
 			kfree(tidh_new);
-			ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+			ret = TCM_INVALID_PARAMETER_LIST;
 			goto out_unmap;
 		}
 		tidh_new->dest_pr_reg = dest_pr_reg;
@@ -1975,21 +1973,24 @@ static int __core_scsi3_write_aptpl_to_file(
 	struct t10_wwn *wwn = &dev->t10_wwn;
 	struct file *file;
 	int flags = O_RDWR | O_CREAT | O_TRUNC;
-	char *path;
+	char path[512];
 	u32 pr_aptpl_buf_len;
 	int ret;
 	loff_t pos = 0;
 
-	path = kasprintf(GFP_KERNEL, "%s/pr/aptpl_%s", db_root,
-			&wwn->unit_serial[0]);
-	if (!path)
-		return -ENOMEM;
+	memset(path, 0, 512);
 
+	if (strlen(&wwn->unit_serial[0]) >= 512) {
+		pr_err("WWN value for struct se_device does not fit"
+			" into path buffer\n");
+		return -EMSGSIZE;
+	}
+
+	snprintf(path, 512, "%s/pr/aptpl_%s", db_root, &wwn->unit_serial[0]);
 	file = filp_open(path, flags, 0600);
 	if (IS_ERR(file)) {
 		pr_err("filp_open(%s) for APTPL metadata"
 			" failed\n", path);
-		kfree(path);
 		return PTR_ERR(file);
 	}
 
@@ -2000,7 +2001,6 @@ static int __core_scsi3_write_aptpl_to_file(
 	if (ret < 0)
 		pr_debug("Error writing APTPL metadata file: %s\n", path);
 	fput(file);
-	kfree(path);
 
 	return (ret < 0) ? -EIO : 0;
 }
@@ -2105,7 +2105,7 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
 					register_type, 0)) {
 				pr_err("Unable to allocate"
 					" struct t10_pr_registration\n");
-				return TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+				return TCM_INVALID_PARAMETER_LIST;
 			}
 		} else {
 			/*
@@ -3217,7 +3217,7 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 	 */
 	buf = transport_kmap_data_sg(cmd);
 	if (!buf) {
-		ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 		goto out_put_pr_reg;
 	}
 
@@ -3269,7 +3269,7 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 
 	buf = transport_kmap_data_sg(cmd);
 	if (!buf) {
-		ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 		goto out_put_pr_reg;
 	}
 	proto_ident = (buf[24] & 0x0f);
@@ -3287,7 +3287,7 @@ core_scsi3_emulate_pro_register_and_move(struct se_cmd *cmd, u64 res_key,
 		goto out;
 	}
 	initiator_str = target_parse_pr_out_transport_id(dest_se_tpg,
-			&buf[24], &tmp_tid_len, &iport_ptr);
+			(const char *)&buf[24], &tmp_tid_len, &iport_ptr);
 	if (!initiator_str) {
 		pr_err("SPC-3 PR REGISTER_AND_MOVE: Unable to locate"
 			" initiator_str from Transport ID\n");
@@ -3468,7 +3468,7 @@ after_iport_check:
 		if (core_scsi3_alloc_registration(cmd->se_dev, dest_node_acl,
 					dest_lun, dest_se_deve, dest_se_deve->mapped_lun,
 					iport_ptr, sa_res_key, 0, aptpl, 2, 1)) {
-			ret = TCM_INSUFFICIENT_REGISTRATION_RESOURCES;
+			ret = TCM_INVALID_PARAMETER_LIST;
 			goto out;
 		}
 		spin_lock(&dev->dev_reservation_lock);
@@ -3529,6 +3529,8 @@ after_iport_check:
 		core_scsi3_put_pr_reg(pr_reg);
 
 	core_scsi3_update_and_write_aptpl(cmd->se_dev, aptpl);
+
+	transport_kunmap_data_sg(cmd);
 
 	core_scsi3_put_pr_reg(dest_pr_reg);
 	return 0;
@@ -3742,7 +3744,6 @@ core_scsi3_pri_read_keys(struct se_cmd *cmd)
 	spin_unlock(&dev->t10_pr.registration_lock);
 
 	put_unaligned_be32(add_len, &buf[4]);
-	target_set_cmd_data_length(cmd, 8 + add_len);
 
 	transport_kunmap_data_sg(cmd);
 
@@ -3761,7 +3762,7 @@ core_scsi3_pri_read_reservation(struct se_cmd *cmd)
 	struct t10_pr_registration *pr_reg;
 	unsigned char *buf;
 	u64 pr_res_key;
-	u32 add_len = 0;
+	u32 add_len = 16; /* Hardcoded to 16 when a reservation is held. */
 
 	if (cmd->data_length < 8) {
 		pr_err("PRIN SA READ_RESERVATIONS SCSI Data Length: %u"
@@ -3779,9 +3780,8 @@ core_scsi3_pri_read_reservation(struct se_cmd *cmd)
 	pr_reg = dev->dev_pr_res_holder;
 	if (pr_reg) {
 		/*
-		 * Set the Additional Length to 16 when a reservation is held
+		 * Set the hardcoded Additional Length
 		 */
-		add_len = 16;
 		put_unaligned_be32(add_len, &buf[4]);
 
 		if (cmd->data_length < 22)
@@ -3817,8 +3817,6 @@ core_scsi3_pri_read_reservation(struct se_cmd *cmd)
 			  (pr_reg->pr_res_type & 0x0f);
 	}
 
-	target_set_cmd_data_length(cmd, 8 + add_len);
-
 err:
 	spin_unlock(&dev->dev_reservation_lock);
 	transport_kunmap_data_sg(cmd);
@@ -3837,7 +3835,7 @@ core_scsi3_pri_report_capabilities(struct se_cmd *cmd)
 	struct se_device *dev = cmd->se_dev;
 	struct t10_reservation *pr_tmpl = &dev->t10_pr;
 	unsigned char *buf;
-	u16 len = 8; /* Hardcoded to 8. */
+	u16 add_len = 8; /* Hardcoded to 8. */
 
 	if (cmd->data_length < 6) {
 		pr_err("PRIN SA REPORT_CAPABILITIES SCSI Data Length:"
@@ -3849,7 +3847,7 @@ core_scsi3_pri_report_capabilities(struct se_cmd *cmd)
 	if (!buf)
 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 
-	put_unaligned_be16(len, &buf[0]);
+	put_unaligned_be16(add_len, &buf[0]);
 	buf[2] |= 0x10; /* CRH: Compatible Reservation Hanlding bit. */
 	buf[2] |= 0x08; /* SIP_C: Specify Initiator Ports Capable bit */
 	buf[2] |= 0x04; /* ATP_C: All Target Ports Capable bit */
@@ -3877,8 +3875,6 @@ core_scsi3_pri_report_capabilities(struct se_cmd *cmd)
 	buf[4] |= 0x08; /* PR_TYPE_EXCLUSIVE_ACCESS */
 	buf[4] |= 0x02; /* PR_TYPE_WRITE_EXCLUSIVE */
 	buf[5] |= 0x01; /* PR_TYPE_EXCLUSIVE_ACCESS_ALLREG */
-
-	target_set_cmd_data_length(cmd, len);
 
 	transport_kunmap_data_sg(cmd);
 
@@ -4040,7 +4036,6 @@ core_scsi3_pri_read_full_status(struct se_cmd *cmd)
 	 * Set ADDITIONAL_LENGTH
 	 */
 	put_unaligned_be32(add_len, &buf[4]);
-	target_set_cmd_data_length(cmd, 8 + add_len);
 
 	transport_kunmap_data_sg(cmd);
 

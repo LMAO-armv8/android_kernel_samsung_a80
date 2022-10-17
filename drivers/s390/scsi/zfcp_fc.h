@@ -170,8 +170,7 @@ enum zfcp_fc_wka_status {
 /**
  * struct zfcp_fc_wka_port - representation of well-known-address (WKA) FC port
  * @adapter: Pointer to adapter structure this WKA port belongs to
- * @opened: Wait for completion of open command
- * @closed: Wait for completion of close command
+ * @completion_wq: Wait for completion of open/close command
  * @status: Current status of WKA port
  * @refcount: Reference count to keep port open as long as it is in use
  * @d_id: FC destination id or well-known-address
@@ -181,8 +180,7 @@ enum zfcp_fc_wka_status {
  */
 struct zfcp_fc_wka_port {
 	struct zfcp_adapter	*adapter;
-	wait_queue_head_t	opened;
-	wait_queue_head_t	closed;
+	wait_queue_head_t	completion_wq;
 	enum zfcp_fc_wka_status	status;
 	atomic_t		refcount;
 	u32			d_id;
@@ -209,13 +207,20 @@ struct zfcp_fc_wka_ports {
  * zfcp_fc_scsi_to_fcp - setup FCP command with data from scsi_cmnd
  * @fcp: fcp_cmnd to setup
  * @scsi: scsi_cmnd where to get LUN, task attributes/flags and CDB
+ * @tm: task management flags to setup task management command
  */
 static inline
-void zfcp_fc_scsi_to_fcp(struct fcp_cmnd *fcp, struct scsi_cmnd *scsi)
+void zfcp_fc_scsi_to_fcp(struct fcp_cmnd *fcp, struct scsi_cmnd *scsi,
+			 u8 tm_flags)
 {
 	u32 datalen;
 
 	int_to_scsilun(scsi->device->lun, (struct scsi_lun *) &fcp->fc_lun);
+
+	if (unlikely(tm_flags)) {
+		fcp->fc_tm_flags = tm_flags;
+		return;
+	}
 
 	fcp->fc_pri_ta = FCP_PTA_SIMPLE;
 
@@ -233,19 +238,6 @@ void zfcp_fc_scsi_to_fcp(struct fcp_cmnd *fcp, struct scsi_cmnd *scsi)
 		datalen += datalen / scsi->device->sector_size * 8;
 		fcp->fc_dl = cpu_to_be32(datalen);
 	}
-}
-
-/**
- * zfcp_fc_fcp_tm() - Setup FCP command as task management command.
- * @fcp: Pointer to FCP_CMND IU to set up.
- * @dev: Pointer to SCSI_device where to send the task management command.
- * @tm_flags: Task management flags to setup tm command.
- */
-static inline
-void zfcp_fc_fcp_tm(struct fcp_cmnd *fcp, struct scsi_device *dev, u8 tm_flags)
-{
-	int_to_scsilun(dev->lun, (struct scsi_lun *) &fcp->fc_lun);
-	fcp->fc_tm_flags = tm_flags;
 }
 
 /**

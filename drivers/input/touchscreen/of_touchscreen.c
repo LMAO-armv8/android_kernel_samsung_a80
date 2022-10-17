@@ -13,7 +13,6 @@
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
-#include <linux/module.h>
 
 static bool touchscreen_get_prop_u32(struct device *dev,
 				     const char *property,
@@ -80,8 +79,8 @@ void touchscreen_parse_properties(struct input_dev *input, bool multitouch,
 	data_present = touchscreen_get_prop_u32(dev, "touchscreen-size-x",
 						input_abs_get_max(input,
 								  axis) + 1,
-						&maximum);
-	data_present |= touchscreen_get_prop_u32(dev, "touchscreen-fuzz-x",
+						&maximum) |
+		       touchscreen_get_prop_u32(dev, "touchscreen-fuzz-x",
 						input_abs_get_fuzz(input, axis),
 						&fuzz);
 	if (data_present)
@@ -91,8 +90,8 @@ void touchscreen_parse_properties(struct input_dev *input, bool multitouch,
 	data_present = touchscreen_get_prop_u32(dev, "touchscreen-size-y",
 						input_abs_get_max(input,
 								  axis) + 1,
-						&maximum);
-	data_present |= touchscreen_get_prop_u32(dev, "touchscreen-fuzz-y",
+						&maximum) |
+		       touchscreen_get_prop_u32(dev, "touchscreen-fuzz-y",
 						input_abs_get_fuzz(input, axis),
 						&fuzz);
 	if (data_present)
@@ -102,11 +101,11 @@ void touchscreen_parse_properties(struct input_dev *input, bool multitouch,
 	data_present = touchscreen_get_prop_u32(dev,
 						"touchscreen-max-pressure",
 						input_abs_get_max(input, axis),
-						&maximum);
-	data_present |= touchscreen_get_prop_u32(dev,
-						 "touchscreen-fuzz-pressure",
-						 input_abs_get_fuzz(input, axis),
-						 &fuzz);
+						&maximum) |
+		       touchscreen_get_prop_u32(dev,
+						"touchscreen-fuzz-pressure",
+						input_abs_get_fuzz(input, axis),
+						&fuzz);
 	if (data_present)
 		touchscreen_set_params(input, axis, maximum, fuzz);
 
@@ -186,6 +185,3 @@ void touchscreen_report_pos(struct input_dev *input,
 	input_report_abs(input, multitouch ? ABS_MT_POSITION_Y : ABS_Y, y);
 }
 EXPORT_SYMBOL(touchscreen_report_pos);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("Device-tree helpers functions for touchscreen devices");

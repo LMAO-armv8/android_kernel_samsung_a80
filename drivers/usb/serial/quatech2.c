@@ -1,8 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * usb-serial driver for Quatech USB 2 devices
  *
  * Copyright (C) 2012 Bill Pemberton (wfp5p@virginia.edu)
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License version 2
+ * as published by the Free Software Foundation.
+ *
  *
  *  These devices all have only 1 bulk in and 1 bulk out that is shared
  *  for all serial ports.
@@ -194,7 +198,7 @@ static inline int qt2_getregister(struct usb_device *dev,
 	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
 			      QT_SET_GET_REGISTER, 0xc0, reg,
 			      uart, data, sizeof(*data), QT2_USB_TIMEOUT);
-	if (ret < (int)sizeof(*data)) {
+	if (ret < sizeof(*data)) {
 		if (ret >= 0)
 			ret = -EIO;
 	}
@@ -416,7 +420,7 @@ static void qt2_close(struct usb_serial_port *port)
 
 	/* flush the port transmit buffer */
 	i = usb_control_msg(serial->dev,
-			    usb_sndctrlpipe(serial->dev, 0),
+			    usb_rcvctrlpipe(serial->dev, 0),
 			    QT2_FLUSH_DEVICE, 0x40, 1,
 			    port_priv->device_port, NULL, 0, QT2_USB_TIMEOUT);
 
@@ -426,7 +430,7 @@ static void qt2_close(struct usb_serial_port *port)
 
 	/* flush the port receive buffer */
 	i = usb_control_msg(serial->dev,
-			    usb_sndctrlpipe(serial->dev, 0),
+			    usb_rcvctrlpipe(serial->dev, 0),
 			    QT2_FLUSH_DEVICE, 0x40, 0,
 			    port_priv->device_port, NULL, 0, QT2_USB_TIMEOUT);
 
@@ -621,17 +625,16 @@ static void qt2_write_bulk_callback(struct urb *urb)
 {
 	struct usb_serial_port *port;
 	struct qt2_port_private *port_priv;
-	unsigned long flags;
 
 	port = urb->context;
 	port_priv = usb_get_serial_port_data(port);
 
-	spin_lock_irqsave(&port_priv->urb_lock, flags);
+	spin_lock(&port_priv->urb_lock);
 
 	port_priv->urb_in_use = false;
 	usb_serial_port_softint(port);
 
-	spin_unlock_irqrestore(&port_priv->urb_lock, flags);
+	spin_unlock(&port_priv->urb_lock);
 
 }
 
@@ -693,7 +696,7 @@ static int qt2_attach(struct usb_serial *serial)
 	int status;
 
 	/* power on unit */
-	status = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
+	status = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
 				 0xc2, 0x40, 0x8000, 0, NULL, 0,
 				 QT2_USB_TIMEOUT);
 	if (status < 0) {
@@ -1030,4 +1033,4 @@ static struct usb_serial_driver *const serial_drivers[] = {
 module_usb_serial_driver(serial_drivers, id_table);
 
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");

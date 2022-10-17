@@ -130,6 +130,7 @@ static const struct adc128_configuration adc128_config[] = {
 
 static const struct iio_info adc128_info = {
 	.read_raw = adc128_read_raw,
+	.driver_module = THIS_MODULE,
 };
 
 static int adc128_probe(struct spi_device *spi)
@@ -168,13 +169,7 @@ static int adc128_probe(struct spi_device *spi)
 	mutex_init(&adc->lock);
 
 	ret = iio_device_register(indio_dev);
-	if (ret)
-		goto err_disable_regulator;
 
-	return 0;
-
-err_disable_regulator:
-	regulator_disable(adc->reg);
 	return ret;
 }
 

@@ -48,7 +48,7 @@ static int qed_sriov_eqe_event(struct qed_hwfn *p_hwfn,
 			       u8 opcode,
 			       __le16 echo,
 			       union event_ring_data *data, u8 fw_return_code);
-static int qed_iov_bulletin_set_mac(struct qed_hwfn *p_hwfn, u8 *mac, int vfid);
+
 
 static u8 qed_vf_calculate_legacy(struct qed_vf_info *p_vf)
 {
@@ -96,13 +96,11 @@ static int qed_sp_vf_start(struct qed_hwfn *p_hwfn, struct qed_vf_info *p_vf)
 		p_ramrod->personality = PERSONALITY_ETH;
 		break;
 	case QED_PCI_ETH_ROCE:
-	case QED_PCI_ETH_IWARP:
 		p_ramrod->personality = PERSONALITY_RDMA_AND_ETH;
 		break;
 	default:
 		DP_NOTICE(p_hwfn, "Unknown VF personality %d\n",
 			  p_hwfn->hw_info.personality);
-		qed_sp_destroy_request(p_hwfn, p_ent);
 		return -EINVAL;
 	}
 
@@ -155,9 +153,9 @@ static int qed_sp_vf_stop(struct qed_hwfn *p_hwfn,
 	return qed_spq_post(p_hwfn, p_ent, NULL);
 }
 
-bool qed_iov_is_valid_vfid(struct qed_hwfn *p_hwfn,
-			   int rel_vf_id,
-			   bool b_enabled_only, bool b_non_malicious)
+static bool qed_iov_is_valid_vfid(struct qed_hwfn *p_hwfn,
+				  int rel_vf_id,
+				  bool b_enabled_only, bool b_non_malicious)
 {
 	if (!p_hwfn->pf_iov_info) {
 		DP_NOTICE(p_hwfn->cdev, "No iov info\n");
@@ -674,8 +672,8 @@ int qed_iov_hw_info(struct qed_hwfn *p_hwfn)
 	return 0;
 }
 
-static bool _qed_iov_pf_sanity_check(struct qed_hwfn *p_hwfn,
-				     int vfid, bool b_fail_malicious)
+bool _qed_iov_pf_sanity_check(struct qed_hwfn *p_hwfn,
+			      int vfid, bool b_fail_malicious)
 {
 	/* Check PF supports sriov */
 	if (IS_VF(p_hwfn->cdev) || !IS_QED_SRIOV(p_hwfn->cdev) ||
@@ -689,7 +687,7 @@ static bool _qed_iov_pf_sanity_check(struct qed_hwfn *p_hwfn,
 	return true;
 }
 
-static bool qed_iov_pf_sanity_check(struct qed_hwfn *p_hwfn, int vfid)
+bool qed_iov_pf_sanity_check(struct qed_hwfn *p_hwfn, int vfid)
 {
 	return _qed_iov_pf_sanity_check(p_hwfn, vfid, true);
 }
@@ -1623,7 +1621,7 @@ static void qed_iov_vf_mbx_acquire(struct qed_hwfn *p_hwfn,
 	/* fill in pfdev info */
 	pfdev_info->chip_num = p_hwfn->cdev->chip_num;
 	pfdev_info->db_size = 0;
-	pfdev_info->indices_per_sb = PIS_PER_SB_E4;
+	pfdev_info->indices_per_sb = PIS_PER_SB;
 
 	pfdev_info->capabilities = PFVF_ACQUIRE_CAP_DEFAULT_UNTAGGED |
 				   PFVF_ACQUIRE_CAP_POST_FW_OVERRIDE;
@@ -1792,8 +1790,7 @@ static int qed_iov_configure_vport_forced(struct qed_hwfn *p_hwfn,
 	if (!p_vf->vport_instance)
 		return -EINVAL;
 
-	if ((events & BIT(MAC_ADDR_FORCED)) ||
-	    p_vf->p_vf_info.is_trusted_configured) {
+	if (events & BIT(MAC_ADDR_FORCED)) {
 		/* Since there's no way [currently] of removing the MAC,
 		 * we can always assume this means we need to force it.
 		 */
@@ -1812,12 +1809,8 @@ static int qed_iov_configure_vport_forced(struct qed_hwfn *p_hwfn,
 				  "PF failed to configure MAC for VF\n");
 			return rc;
 		}
-		if (p_vf->p_vf_info.is_trusted_configured)
-			p_vf->configured_features |=
-				BIT(VFPF_BULLETIN_MAC_ADDR);
-		else
-			p_vf->configured_features |=
-				BIT(MAC_ADDR_FORCED);
+
+		p_vf->configured_features |= 1 << MAC_ADDR_FORCED;
 	}
 
 	if (events & BIT(VLAN_ADDR_FORCED)) {
@@ -3002,16 +2995,12 @@ static int qed_iov_pre_update_vport(struct qed_hwfn *hwfn,
 	u8 mask = QED_ACCEPT_UCAST_UNMATCHED | QED_ACCEPT_MCAST_UNMATCHED;
 	struct qed_filter_accept_flags *flags = &params->accept_flags;
 	struct qed_public_vf_info *vf_info;
-	u16 tlv_mask;
-
-	tlv_mask = BIT(QED_IOV_VP_UPDATE_ACCEPT_PARAM) |
-		   BIT(QED_IOV_VP_UPDATE_ACCEPT_ANY_VLAN);
 
 	/* Untrusted VFs can't even be trusted to know that fact.
 	 * Simply indicate everything is configured fine, and trace
 	 * configuration 'behind their back'.
 	 */
-	if (!(*tlvs & tlv_mask))
+	if (!(*tlvs & BIT(QED_IOV_VP_UPDATE_ACCEPT_PARAM)))
 		return 0;
 
 	vf_info = qed_iov_get_public_vf_info(hwfn, vfid, true);
@@ -3026,13 +3015,6 @@ static int qed_iov_pre_update_vport(struct qed_hwfn *hwfn,
 		vf_info->tx_accept_mode = flags->tx_accept_filter;
 		if (!vf_info->is_trusted_configured)
 			flags->tx_accept_filter &= ~mask;
-	}
-
-	if (params->update_accept_any_vlan_flg) {
-		vf_info->accept_any_vlan = params->accept_any_vlan;
-
-		if (vf_info->forced_vlan && !vf_info->is_trusted_configured)
-			params->accept_any_vlan = false;
 	}
 
 	return 0;
@@ -3190,10 +3172,6 @@ static int qed_iov_vf_update_mac_shadow(struct qed_hwfn *p_hwfn,
 	if (p_vf->bulletin.p_virt->valid_bitmap & BIT(MAC_ADDR_FORCED))
 		return 0;
 
-	/* Don't keep track of shadow copy since we don't intend to restore. */
-	if (p_vf->p_vf_info.is_trusted_configured)
-		return 0;
-
 	/* First remove entries and then add new ones */
 	if (p_params->opcode == QED_FILTER_REMOVE) {
 		for (i = 0; i < QED_ETH_VF_NUM_MAC_FILTERS; i++) {
@@ -3268,16 +3246,8 @@ static int qed_iov_chk_ucast(struct qed_hwfn *hwfn,
 
 	/* No real decision to make; Store the configured MAC */
 	if (params->type == QED_FILTER_MAC ||
-	    params->type == QED_FILTER_MAC_VLAN) {
+	    params->type == QED_FILTER_MAC_VLAN)
 		ether_addr_copy(vf->mac, params->mac);
-
-		if (vf->is_trusted_configured) {
-			qed_iov_bulletin_set_mac(hwfn, vf->mac, vfid);
-
-			/* Update and post bulleitin again */
-			qed_schedule_iov(hwfn, QED_IOV_WQ_BULLETIN_UPDATE_FLAG);
-		}
-	}
 
 	return 0;
 }
@@ -3614,11 +3584,11 @@ static int
 qed_iov_vf_flr_poll_pbf(struct qed_hwfn *p_hwfn,
 			struct qed_vf_info *p_vf, struct qed_ptt *p_ptt)
 {
-	u32 cons[MAX_NUM_VOQS_E4], distance[MAX_NUM_VOQS_E4];
+	u32 cons[MAX_NUM_VOQS], distance[MAX_NUM_VOQS];
 	int i, cnt;
 
 	/* Read initial consumers & producers */
-	for (i = 0; i < MAX_NUM_VOQS_E4; i++) {
+	for (i = 0; i < MAX_NUM_VOQS; i++) {
 		u32 prod;
 
 		cons[i] = qed_rd(p_hwfn, p_ptt,
@@ -3633,7 +3603,7 @@ qed_iov_vf_flr_poll_pbf(struct qed_hwfn *p_hwfn,
 	/* Wait for consumers to pass the producers */
 	i = 0;
 	for (cnt = 0; cnt < 50; cnt++) {
-		for (; i < MAX_NUM_VOQS_E4; i++) {
+		for (; i < MAX_NUM_VOQS; i++) {
 			u32 tmp;
 
 			tmp = qed_rd(p_hwfn, p_ptt,
@@ -3643,7 +3613,7 @@ qed_iov_vf_flr_poll_pbf(struct qed_hwfn *p_hwfn,
 				break;
 		}
 
-		if (i == MAX_NUM_VOQS_E4)
+		if (i == MAX_NUM_VOQS)
 			break;
 
 		msleep(20);
@@ -3811,11 +3781,11 @@ bool qed_iov_mark_vf_flr(struct qed_hwfn *p_hwfn, u32 *p_disabled_vfs)
 	return found;
 }
 
-static int qed_iov_get_link(struct qed_hwfn *p_hwfn,
-			    u16 vfid,
-			    struct qed_mcp_link_params *p_params,
-			    struct qed_mcp_link_state *p_link,
-			    struct qed_mcp_link_capabilities *p_caps)
+static void qed_iov_get_link(struct qed_hwfn *p_hwfn,
+			     u16 vfid,
+			     struct qed_mcp_link_params *p_params,
+			     struct qed_mcp_link_state *p_link,
+			     struct qed_mcp_link_capabilities *p_caps)
 {
 	struct qed_vf_info *p_vf = qed_iov_get_vf_info(p_hwfn,
 						       vfid,
@@ -3823,7 +3793,7 @@ static int qed_iov_get_link(struct qed_hwfn *p_hwfn,
 	struct qed_bulletin_content *p_bulletin;
 
 	if (!p_vf)
-		return -EINVAL;
+		return;
 
 	p_bulletin = p_vf->bulletin.p_virt;
 
@@ -3833,41 +3803,6 @@ static int qed_iov_get_link(struct qed_hwfn *p_hwfn,
 		__qed_vf_get_link_state(p_hwfn, p_link, p_bulletin);
 	if (p_caps)
 		__qed_vf_get_link_caps(p_hwfn, p_caps, p_bulletin);
-	return 0;
-}
-
-static int
-qed_iov_vf_pf_bulletin_update_mac(struct qed_hwfn *p_hwfn,
-				  struct qed_ptt *p_ptt,
-				  struct qed_vf_info *p_vf)
-{
-	struct qed_bulletin_content *p_bulletin = p_vf->bulletin.p_virt;
-	struct qed_iov_vf_mbx *mbx = &p_vf->vf_mbx;
-	struct vfpf_bulletin_update_mac_tlv *p_req;
-	u8 status = PFVF_STATUS_SUCCESS;
-	int rc = 0;
-
-	if (!p_vf->p_vf_info.is_trusted_configured) {
-		DP_VERBOSE(p_hwfn,
-			   QED_MSG_IOV,
-			   "Blocking bulletin update request from untrusted VF[%d]\n",
-			   p_vf->abs_vf_id);
-		status = PFVF_STATUS_NOT_SUPPORTED;
-		rc = -EINVAL;
-		goto send_status;
-	}
-
-	p_req = &mbx->req_virt->bulletin_update_mac;
-	ether_addr_copy(p_bulletin->mac, p_req->mac);
-	DP_VERBOSE(p_hwfn, QED_MSG_IOV,
-		   "Updated bulletin of VF[%d] with requested MAC[%pM]\n",
-		   p_vf->abs_vf_id, p_req->mac);
-
-send_status:
-	qed_iov_prepare_resp(p_hwfn, p_ptt, p_vf,
-			     CHANNEL_TLV_BULLETIN_UPDATE_MAC,
-			     sizeof(struct pfvf_def_resp_tlv), status);
-	return rc;
 }
 
 static void qed_iov_process_mbx_req(struct qed_hwfn *p_hwfn,
@@ -3949,9 +3884,6 @@ static void qed_iov_process_mbx_req(struct qed_hwfn *p_hwfn,
 		case CHANNEL_TLV_COALESCE_READ:
 			qed_iov_vf_pf_get_coalesce(p_hwfn, p_ptt, p_vf);
 			break;
-		case CHANNEL_TLV_BULLETIN_UPDATE_MAC:
-			qed_iov_vf_pf_bulletin_update_mac(p_hwfn, p_ptt, p_vf);
-			break;
 		}
 	} else if (qed_iov_tlv_supported(mbx->first_tlv.tl.type)) {
 		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
@@ -3995,7 +3927,7 @@ static void qed_iov_process_mbx_req(struct qed_hwfn *p_hwfn,
 	}
 }
 
-static void qed_iov_pf_get_pending_events(struct qed_hwfn *p_hwfn, u64 *events)
+void qed_iov_pf_get_pending_events(struct qed_hwfn *p_hwfn, u64 *events)
 {
 	int i;
 
@@ -4151,58 +4083,14 @@ static void qed_iov_bulletin_set_forced_mac(struct qed_hwfn *p_hwfn,
 		return;
 	}
 
-	if (vf_info->p_vf_info.is_trusted_configured) {
-		feature = BIT(VFPF_BULLETIN_MAC_ADDR);
-		/* Trust mode will disable Forced MAC */
-		vf_info->bulletin.p_virt->valid_bitmap &=
-			~BIT(MAC_ADDR_FORCED);
-	} else {
-		feature = BIT(MAC_ADDR_FORCED);
-		/* Forced MAC will disable MAC_ADDR */
-		vf_info->bulletin.p_virt->valid_bitmap &=
-			~BIT(VFPF_BULLETIN_MAC_ADDR);
-	}
-
+	feature = 1 << MAC_ADDR_FORCED;
 	memcpy(vf_info->bulletin.p_virt->mac, mac, ETH_ALEN);
 
 	vf_info->bulletin.p_virt->valid_bitmap |= feature;
+	/* Forced MAC will disable MAC_ADDR */
+	vf_info->bulletin.p_virt->valid_bitmap &= ~BIT(VFPF_BULLETIN_MAC_ADDR);
 
 	qed_iov_configure_vport_forced(p_hwfn, vf_info, feature);
-}
-
-static int qed_iov_bulletin_set_mac(struct qed_hwfn *p_hwfn, u8 *mac, int vfid)
-{
-	struct qed_vf_info *vf_info;
-	u64 feature;
-
-	vf_info = qed_iov_get_vf_info(p_hwfn, (u16)vfid, true);
-	if (!vf_info) {
-		DP_NOTICE(p_hwfn->cdev, "Can not set MAC, invalid vfid [%d]\n",
-			  vfid);
-		return -EINVAL;
-	}
-
-	if (vf_info->b_malicious) {
-		DP_NOTICE(p_hwfn->cdev, "Can't set MAC to malicious VF [%d]\n",
-			  vfid);
-		return -EINVAL;
-	}
-
-	if (vf_info->bulletin.p_virt->valid_bitmap & BIT(MAC_ADDR_FORCED)) {
-		DP_VERBOSE(p_hwfn, QED_MSG_IOV,
-			   "Can not set MAC, Forced MAC is configured\n");
-		return -EINVAL;
-	}
-
-	feature = BIT(VFPF_BULLETIN_MAC_ADDR);
-	ether_addr_copy(vf_info->bulletin.p_virt->mac, mac);
-
-	vf_info->bulletin.p_virt->valid_bitmap |= feature;
-
-	if (vf_info->p_vf_info.is_trusted_configured)
-		qed_iov_configure_vport_forced(p_hwfn, vf_info, feature);
-
-	return 0;
 }
 
 static void qed_iov_bulletin_set_forced_vlan(struct qed_hwfn *p_hwfn,
@@ -4318,21 +4206,6 @@ out:
 	return rc;
 }
 
-static u8 *qed_iov_bulletin_get_mac(struct qed_hwfn *p_hwfn, u16 rel_vf_id)
-{
-	struct qed_vf_info *p_vf;
-
-	p_vf = qed_iov_get_vf_info(p_hwfn, rel_vf_id, true);
-	if (!p_vf || !p_vf->bulletin.p_virt)
-		return NULL;
-
-	if (!(p_vf->bulletin.p_virt->valid_bitmap &
-	      BIT(VFPF_BULLETIN_MAC_ADDR)))
-		return NULL;
-
-	return p_vf->bulletin.p_virt->mac;
-}
-
 static u8 *qed_iov_bulletin_get_forced_mac(struct qed_hwfn *p_hwfn,
 					   u16 rel_vf_id)
 {
@@ -4366,7 +4239,6 @@ qed_iov_bulletin_get_forced_vlan(struct qed_hwfn *p_hwfn, u16 rel_vf_id)
 static int qed_iov_configure_tx_rate(struct qed_hwfn *p_hwfn,
 				     struct qed_ptt *p_ptt, int vfid, int val)
 {
-	struct qed_mcp_link_state *p_link;
 	struct qed_vf_info *vf;
 	u8 abs_vp_id = 0;
 	int rc;
@@ -4379,10 +4251,7 @@ static int qed_iov_configure_tx_rate(struct qed_hwfn *p_hwfn,
 	if (rc)
 		return rc;
 
-	p_link = &QED_LEADING_HWFN(p_hwfn->cdev)->mcp_info->link_output;
-
-	return qed_init_vport_rl(p_hwfn, p_ptt, abs_vp_id, (u32)val,
-				 p_link->speed);
+	return qed_init_vport_rl(p_hwfn, p_ptt, abs_vp_id, (u32)val);
 }
 
 static int
@@ -4637,12 +4506,8 @@ static int qed_sriov_pf_set_mac(struct qed_dev *cdev, u8 *mac, int vfid)
 		if (!vf_info)
 			continue;
 
-		/* Set the MAC, and schedule the IOV task */
-		if (vf_info->is_trusted_configured)
-			ether_addr_copy(vf_info->mac, mac);
-		else
-			ether_addr_copy(vf_info->forced_mac, mac);
-
+		/* Set the forced MAC, and schedule the IOV task */
+		ether_addr_copy(vf_info->forced_mac, mac);
 		qed_schedule_iov(hwfn, QED_IOV_WQ_SET_UNICAST_FILTER_FLAG);
 	}
 
@@ -4688,7 +4553,6 @@ static int qed_get_vf_config(struct qed_dev *cdev,
 	struct qed_public_vf_info *vf_info;
 	struct qed_mcp_link_state link;
 	u32 tx_rate;
-	int ret;
 
 	/* Sanitize request */
 	if (IS_VF(cdev))
@@ -4702,9 +4566,7 @@ static int qed_get_vf_config(struct qed_dev *cdev,
 
 	vf_info = qed_iov_get_public_vf_info(hwfn, vf_id, true);
 
-	ret = qed_iov_get_link(hwfn, vf_id, NULL, &link, NULL);
-	if (ret)
-		return ret;
+	qed_iov_get_link(hwfn, vf_id, NULL, &link, NULL);
 
 	/* Fill information about VF */
 	ivi->vf = vf_id;
@@ -4720,7 +4582,6 @@ static int qed_get_vf_config(struct qed_dev *cdev,
 	tx_rate = vf_info->tx_rate;
 	ivi->max_tx_rate = tx_rate ? tx_rate : link.speed;
 	ivi->min_tx_rate = qed_iov_get_vf_min_rate(hwfn, vf_id);
-	ivi->trusted = vf_info->is_trusted_request;
 
 	return 0;
 }
@@ -4954,33 +4815,6 @@ static void qed_handle_vf_msg(struct qed_hwfn *hwfn)
 	qed_ptt_release(hwfn, ptt);
 }
 
-static bool qed_pf_validate_req_vf_mac(struct qed_hwfn *hwfn,
-				       u8 *mac,
-				       struct qed_public_vf_info *info)
-{
-	if (info->is_trusted_configured) {
-		if (is_valid_ether_addr(info->mac) &&
-		    (!mac || !ether_addr_equal(mac, info->mac)))
-			return true;
-	} else {
-		if (is_valid_ether_addr(info->forced_mac) &&
-		    (!mac || !ether_addr_equal(mac, info->forced_mac)))
-			return true;
-	}
-
-	return false;
-}
-
-static void qed_set_bulletin_mac(struct qed_hwfn *hwfn,
-				 struct qed_public_vf_info *info,
-				 int vfid)
-{
-	if (info->is_trusted_configured)
-		qed_iov_bulletin_set_mac(hwfn, info->mac, vfid);
-	else
-		qed_iov_bulletin_set_forced_mac(hwfn, info->forced_mac, vfid);
-}
-
 static void qed_handle_pf_set_vf_unicast(struct qed_hwfn *hwfn)
 {
 	int i;
@@ -4995,20 +4829,18 @@ static void qed_handle_pf_set_vf_unicast(struct qed_hwfn *hwfn)
 			continue;
 
 		/* Update data on bulletin board */
-		if (info->is_trusted_configured)
-			mac = qed_iov_bulletin_get_mac(hwfn, i);
-		else
-			mac = qed_iov_bulletin_get_forced_mac(hwfn, i);
-
-		if (qed_pf_validate_req_vf_mac(hwfn, mac, info)) {
+		mac = qed_iov_bulletin_get_forced_mac(hwfn, i);
+		if (is_valid_ether_addr(info->forced_mac) &&
+		    (!mac || !ether_addr_equal(mac, info->forced_mac))) {
 			DP_VERBOSE(hwfn,
 				   QED_MSG_IOV,
 				   "Handling PF setting of VF MAC to VF 0x%02x [Abs 0x%02x]\n",
 				   i,
 				   hwfn->cdev->p_iov_info->first_vf_in_pf + i);
 
-			/* Update bulletin board with MAC */
-			qed_set_bulletin_mac(hwfn, info, i);
+			/* Update bulletin board with forced MAC */
+			qed_iov_bulletin_set_forced_mac(hwfn,
+							info->forced_mac, i);
 			update = true;
 		}
 
@@ -5048,72 +4880,6 @@ static void qed_handle_bulletin_post(struct qed_hwfn *hwfn)
 	qed_ptt_release(hwfn, ptt);
 }
 
-static void qed_update_mac_for_vf_trust_change(struct qed_hwfn *hwfn, int vf_id)
-{
-	struct qed_public_vf_info *vf_info;
-	struct qed_vf_info *vf;
-	u8 *force_mac;
-	int i;
-
-	vf_info = qed_iov_get_public_vf_info(hwfn, vf_id, true);
-	vf = qed_iov_get_vf_info(hwfn, vf_id, true);
-
-	if (!vf_info || !vf)
-		return;
-
-	/* Force MAC converted to generic MAC in case of VF trust on */
-	if (vf_info->is_trusted_configured &&
-	    (vf->bulletin.p_virt->valid_bitmap & BIT(MAC_ADDR_FORCED))) {
-		force_mac = qed_iov_bulletin_get_forced_mac(hwfn, vf_id);
-
-		if (force_mac) {
-			/* Clear existing shadow copy of MAC to have a clean
-			 * slate.
-			 */
-			for (i = 0; i < QED_ETH_VF_NUM_MAC_FILTERS; i++) {
-				if (ether_addr_equal(vf->shadow_config.macs[i],
-						     vf_info->mac)) {
-					memset(vf->shadow_config.macs[i], 0,
-					       ETH_ALEN);
-					DP_VERBOSE(hwfn, QED_MSG_IOV,
-						   "Shadow MAC %pM removed for VF 0x%02x, VF trust mode is ON\n",
-						    vf_info->mac, vf_id);
-					break;
-				}
-			}
-
-			ether_addr_copy(vf_info->mac, force_mac);
-			memset(vf_info->forced_mac, 0, ETH_ALEN);
-			vf->bulletin.p_virt->valid_bitmap &=
-					~BIT(MAC_ADDR_FORCED);
-			qed_schedule_iov(hwfn, QED_IOV_WQ_BULLETIN_UPDATE_FLAG);
-		}
-	}
-
-	/* Update shadow copy with VF MAC when trust mode is turned off */
-	if (!vf_info->is_trusted_configured) {
-		u8 empty_mac[ETH_ALEN];
-
-		memset(empty_mac, 0, ETH_ALEN);
-		for (i = 0; i < QED_ETH_VF_NUM_MAC_FILTERS; i++) {
-			if (ether_addr_equal(vf->shadow_config.macs[i],
-					     empty_mac)) {
-				ether_addr_copy(vf->shadow_config.macs[i],
-						vf_info->mac);
-				DP_VERBOSE(hwfn, QED_MSG_IOV,
-					   "Shadow is updated with %pM for VF 0x%02x, VF trust mode is OFF\n",
-					    vf_info->mac, vf_id);
-				break;
-			}
-		}
-		/* Clear bulletin when trust mode is turned off,
-		 * to have a clean slate for next (normal) operations.
-		 */
-		qed_iov_bulletin_set_mac(hwfn, empty_mac, vf_id);
-		qed_schedule_iov(hwfn, QED_IOV_WQ_BULLETIN_UPDATE_FLAG);
-	}
-}
-
 static void qed_iov_handle_trust_change(struct qed_hwfn *hwfn)
 {
 	struct qed_sp_vport_update_params params;
@@ -5137,9 +4903,6 @@ static void qed_iov_handle_trust_change(struct qed_hwfn *hwfn)
 			continue;
 		vf_info->is_trusted_configured = vf_info->is_trusted_request;
 
-		/* Handle forced MAC mode */
-		qed_update_mac_for_vf_trust_change(hwfn, i);
-
 		/* Validate that the VF has a configured vport */
 		vf = qed_iov_get_vf_info(hwfn, i, true);
 		if (!vf->vport_instance)
@@ -5151,12 +4914,6 @@ static void qed_iov_handle_trust_change(struct qed_hwfn *hwfn)
 
 		params.update_ctl_frame_check = 1;
 		params.mac_chk_en = !vf_info->is_trusted_configured;
-		params.update_accept_any_vlan_flg = 0;
-
-		if (vf_info->accept_any_vlan && vf_info->forced_vlan) {
-			params.update_accept_any_vlan_flg = 1;
-			params.accept_any_vlan = vf_info->accept_any_vlan;
-		}
 
 		if (vf_info->rx_accept_mode & mask) {
 			flags->update_rx_mode_config = 1;
@@ -5172,20 +4929,13 @@ static void qed_iov_handle_trust_change(struct qed_hwfn *hwfn)
 		if (!vf_info->is_trusted_configured) {
 			flags->rx_accept_filter &= ~mask;
 			flags->tx_accept_filter &= ~mask;
-			params.accept_any_vlan = false;
 		}
 
 		if (flags->update_rx_mode_config ||
 		    flags->update_tx_mode_config ||
-		    params.update_ctl_frame_check ||
-		    params.update_accept_any_vlan_flg) {
-			DP_VERBOSE(hwfn, QED_MSG_IOV,
-				   "vport update config for %s VF[abs 0x%x rel 0x%x]\n",
-				   vf_info->is_trusted_configured ? "trusted" : "untrusted",
-				   vf->abs_vf_id, vf->relative_vf_id);
+		    params.update_ctl_frame_check)
 			qed_sp_vport_update(hwfn, &params,
 					    QED_SPQ_MODE_EBLOCK, NULL);
-		}
 	}
 }
 

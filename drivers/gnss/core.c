@@ -184,17 +184,17 @@ out_unlock:
 	return ret;
 }
 
-static __poll_t gnss_poll(struct file *file, poll_table *wait)
+static unsigned int gnss_poll(struct file *file, poll_table *wait)
 {
 	struct gnss_device *gdev = file->private_data;
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 
 	poll_wait(file, &gdev->read_queue, wait);
 
 	if (!kfifo_is_empty(&gdev->read_fifo))
-		mask |= EPOLLIN | EPOLLRDNORM;
+		mask |= POLLIN | POLLRDNORM;
 	if (gdev->disconnected)
-		mask |= EPOLLHUP;
+		mask |= POLLHUP;
 
 	return mask;
 }

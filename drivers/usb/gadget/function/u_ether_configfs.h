@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * u_ether_configfs.h
  *
@@ -8,6 +7,10 @@
  *		http://www.samsung.com
  *
  * Author: Andrzej Pietrasiewicz <andrzej.p@samsung.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
 #ifndef __U_ETHER_CONFIGFS_H
@@ -32,6 +35,11 @@
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		int result;						\
 									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
+									\
 		mutex_lock(&opts->lock);				\
 		result = gether_get_dev_addr(opts->net, page, PAGE_SIZE); \
 		mutex_unlock(&opts->lock);				\
@@ -44,6 +52,11 @@
 	{								\
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		int ret;						\
+									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
 									\
 		mutex_lock(&opts->lock);				\
 		if (opts->refcnt) {					\
@@ -67,6 +80,11 @@
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		int result;						\
 									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
+									\
 		mutex_lock(&opts->lock);				\
 		result = gether_get_host_addr(opts->net, page, PAGE_SIZE); \
 		mutex_unlock(&opts->lock);				\
@@ -79,6 +97,11 @@
 	{								\
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		int ret;						\
+									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
 									\
 		mutex_lock(&opts->lock);				\
 		if (opts->refcnt) {					\
@@ -102,6 +125,11 @@
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		unsigned qmult;						\
 									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
+									\
 		mutex_lock(&opts->lock);				\
 		qmult = gether_get_qmult(opts->net);			\
 		mutex_unlock(&opts->lock);				\
@@ -114,6 +142,11 @@
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		u8 val;							\
 		int ret;						\
+									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
 									\
 		mutex_lock(&opts->lock);				\
 		if (opts->refcnt) {					\
@@ -140,6 +173,11 @@ out:									\
 	{								\
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
 		int ret;						\
+									\
+		if (opts->bound == false) {		\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;			\
+		}							\
 									\
 		mutex_lock(&opts->lock);				\
 		ret = gether_get_ifname(opts->net, page, PAGE_SIZE);	\
@@ -169,11 +207,12 @@ out:									\
 						size_t len)		\
 	{								\
 		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
-		int ret = -EINVAL;					\
+		int ret;						\
 		u8 val;							\
 									\
 		mutex_lock(&opts->lock);				\
-		if (sscanf(page, "%02hhx", &val) > 0) {			\
+		ret = sscanf(page, "%02hhx", &val);			\
+		if (ret > 0) {						\
 			opts->_n_ = val;				\
 			ret = len;					\
 		}							\
@@ -183,5 +222,51 @@ out:									\
 	}								\
 									\
 	CONFIGFS_ATTR(_f_##_opts_, _n_)
+
+#define USB_ETHERNET_CONFIGFS_ITEM_ATTR_WCEIS(_f_)			\
+	static ssize_t _f_##_opts_wceis_show(struct config_item *item,	\
+					     char *page)		\
+	{								\
+		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
+		bool wceis;						\
+									\
+		if (opts->bound == false) {				\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;					\
+		}							\
+									\
+		mutex_lock(&opts->lock);				\
+		wceis = opts->wceis;					\
+		mutex_unlock(&opts->lock);				\
+		return snprintf(page, PAGE_SIZE, "%d", wceis);		\
+	}								\
+									\
+	static ssize_t _f_##_opts_wceis_store(struct config_item *item, \
+					      const char *page, size_t len)\
+	{								\
+		struct f_##_f_##_opts *opts = to_f_##_f_##_opts(item);	\
+		bool wceis;						\
+		int ret;						\
+									\
+		if (opts->bound == false) {				\
+			pr_err("Gadget function do not bind yet.\n");	\
+			return -ENODEV;					\
+		}							\
+									\
+		mutex_lock(&opts->lock);				\
+									\
+		ret = kstrtobool(page, &wceis);				\
+		if (ret)						\
+			goto out;					\
+									\
+		opts->wceis = wceis;					\
+		ret = len;						\
+out:									\
+		mutex_unlock(&opts->lock);				\
+									\
+		return ret;						\
+	}								\
+									\
+	CONFIGFS_ATTR(_f_##_opts_, wceis)
 
 #endif /* __U_ETHER_CONFIGFS_H */

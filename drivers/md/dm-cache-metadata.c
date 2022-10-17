@@ -13,7 +13,6 @@
 #include "persistent-data/dm-transaction-manager.h"
 
 #include <linux/device-mapper.h>
-#include <linux/refcount.h>
 
 /*----------------------------------------------------------------*/
 
@@ -101,7 +100,7 @@ struct cache_disk_superblock {
 } __packed;
 
 struct dm_cache_metadata {
-	refcount_t ref_count;
+	atomic_t ref_count;
 	struct list_head list;
 
 	unsigned version;
@@ -537,16 +536,12 @@ static int __create_persistent_data_objects(struct dm_cache_metadata *cmd,
 					  CACHE_MAX_CONCURRENT_LOCKS);
 	if (IS_ERR(cmd->bm)) {
 		DMERR("could not create block manager");
-		r = PTR_ERR(cmd->bm);
-		cmd->bm = NULL;
-		return r;
+		return PTR_ERR(cmd->bm);
 	}
 
 	r = __open_or_format_metadata(cmd, may_format_device);
-	if (r) {
+	if (r)
 		dm_block_manager_destroy(cmd->bm);
-		cmd->bm = NULL;
-	}
 
 	return r;
 }
@@ -759,7 +754,7 @@ static struct dm_cache_metadata *metadata_open(struct block_device *bdev,
 	}
 
 	cmd->version = metadata_version;
-	refcount_set(&cmd->ref_count, 1);
+	atomic_set(&cmd->ref_count, 1);
 	init_rwsem(&cmd->root_lock);
 	cmd->bdev = bdev;
 	cmd->data_block_size = data_block_size;
@@ -797,7 +792,7 @@ static struct dm_cache_metadata *lookup(struct block_device *bdev)
 
 	list_for_each_entry(cmd, &table, list)
 		if (cmd->bdev == bdev) {
-			refcount_inc(&cmd->ref_count);
+			atomic_inc(&cmd->ref_count);
 			return cmd;
 		}
 
@@ -868,7 +863,7 @@ struct dm_cache_metadata *dm_cache_metadata_open(struct block_device *bdev,
 
 void dm_cache_metadata_close(struct dm_cache_metadata *cmd)
 {
-	if (refcount_dec_and_test(&cmd->ref_count)) {
+	if (atomic_dec_and_test(&cmd->ref_count)) {
 		mutex_lock(&table_lock);
 		list_del(&cmd->list);
 		mutex_unlock(&table_lock);
