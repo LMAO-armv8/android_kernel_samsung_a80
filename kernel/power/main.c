@@ -15,41 +15,17 @@
 #include <linux/workqueue.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
-#include <linux/suspend.h>
+
+#ifdef CONFIG_CPU_FREQ_LIMIT_USERSPACE
+#include <linux/cpufreq.h>
+#include <linux/cpufreq_limit.h>
+#endif
 
 #include "power.h"
 
+DEFINE_MUTEX(pm_mutex);
+
 #ifdef CONFIG_PM_SLEEP
-
-void lock_system_sleep(void)
-{
-	current->flags |= PF_FREEZER_SKIP;
-	mutex_lock(&system_transition_mutex);
-}
-EXPORT_SYMBOL_GPL(lock_system_sleep);
-
-void unlock_system_sleep(void)
-{
-	/*
-	 * Don't use freezer_count() because we don't want the call to
-	 * try_to_freeze() here.
-	 *
-	 * Reason:
-	 * Fundamentally, we just don't need it, because freezing condition
-	 * doesn't come into effect until we release the
-	 * system_transition_mutex lock, since the freezer always works with
-	 * system_transition_mutex held.
-	 *
-	 * More importantly, in the case of hibernation,
-	 * unlock_system_sleep() gets called in snapshot_read() and
-	 * snapshot_write() when the freezing condition is still in effect.
-	 * Which means, if we use try_to_freeze() here, it would make them
-	 * enter the refrigerator, thus causing hibernation to lockup.
-	 */
-	current->flags &= ~PF_FREEZER_SKIP;
-	mutex_unlock(&system_transition_mutex);
-}
-EXPORT_SYMBOL_GPL(unlock_system_sleep);
 
 /* Routines for PM-transition notifications */
 
@@ -535,15 +511,13 @@ static inline void pm_print_times_init(void) {}
 #endif /* CONFIG_PM_SLEEP_DEBUG */
 
 struct kobject *power_kobj;
-EXPORT_SYMBOL_GPL(power_kobj);
 
 /**
  * state - control system sleep states.
  *
  * show() returns available sleep state labels, which may be "mem", "standby",
- * "freeze" and "disk" (hibernation).
- * See Documentation/admin-guide/pm/sleep-states.rst for a description of
- * what they mean.
+ * "freeze" and "disk" (hibernation).  See Documentation/power/states.txt for a
+ * description of what they mean.
  *
  * store() accepts one of those strings, translates it into the proper
  * enumerated value, and initiates a suspend transition.
@@ -780,6 +754,184 @@ power_attr(wake_unlock);
 #endif /* CONFIG_PM_WAKELOCKS */
 #endif /* CONFIG_PM_SLEEP */
 
+#ifdef CONFIG_CPU_FREQ_LIMIT_USERSPACE
+static int cpufreq_max_limit_val = -1;
+static int cpufreq_min_limit_val = -1;
+struct cpufreq_limit_handle *cpufreq_max_hd;
+struct cpufreq_limit_handle *cpufreq_min_hd;
+DEFINE_MUTEX(cpufreq_limit_mutex);
+
+static ssize_t cpufreq_table_show(struct kobject *kobj,
+			struct kobj_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	len = cpufreq_limit_get_table(buf);
+
+	return len;
+}
+
+static ssize_t cpufreq_table_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t n)
+{
+	pr_err("%s: cpufreq_table is read-only\n", __func__);
+	return -EINVAL;
+}
+
+static ssize_t cpufreq_max_limit_show(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					char *buf)
+{
+	return sprintf(buf, "%d\n", cpufreq_max_limit_val);
+}
+
+static ssize_t cpufreq_max_limit_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t n)
+{
+	int val;
+	ssize_t ret = -EINVAL;
+
+	ret = kstrtoint(buf, 10, &val);
+	if (ret < 0) {
+		pr_err("%s: Invalid cpufreq format\n", __func__);
+		goto out;
+	}
+
+	mutex_lock(&cpufreq_limit_mutex);
+	if (cpufreq_max_hd) {
+		cpufreq_limit_put(cpufreq_max_hd);
+		cpufreq_max_hd = NULL;
+	}
+
+	/* big core hotplut in/out regarding max limit clock */
+	cpufreq_limit_corectl(val);
+
+	if (val != -1) {
+		cpufreq_max_hd = cpufreq_limit_max_freq(val, "user lock(max)");
+		if (IS_ERR(cpufreq_max_hd)) {
+			pr_err("%s: fail to get the handle\n", __func__);
+			cpufreq_max_hd = NULL;
+		}
+	}
+
+	cpufreq_max_hd ?
+		(cpufreq_max_limit_val = val) : (cpufreq_max_limit_val = -1);
+
+	mutex_unlock(&cpufreq_limit_mutex);
+	ret = n;
+out:
+	return ret;
+}
+
+static ssize_t cpufreq_min_limit_show(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					char *buf)
+{
+	return sprintf(buf, "%d\n", cpufreq_min_limit_val);
+}
+
+static ssize_t cpufreq_min_limit_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t n)
+{
+	int val;
+	ssize_t ret = -EINVAL;
+
+	if (sscanf(buf, "%d", &val) != 1) {
+		pr_err("%s: Invalid cpufreq format\n", __func__);
+		goto out;
+	}
+
+	mutex_lock(&cpufreq_limit_mutex);
+	if (cpufreq_min_hd) {
+		cpufreq_limit_put(cpufreq_min_hd);
+		cpufreq_min_hd = NULL;
+	}
+
+	if (val != -1) {
+		cpufreq_min_hd = cpufreq_limit_min_freq(val, "user lock(min)");
+		if (IS_ERR(cpufreq_min_hd)) {
+			pr_err("%s: fail to get the handle\n", __func__);
+			cpufreq_min_hd = NULL;
+		}
+	}
+
+	cpufreq_min_hd ?
+		(cpufreq_min_limit_val = val) : (cpufreq_min_limit_val = -1);
+
+	mutex_unlock(&cpufreq_limit_mutex);
+	ret = n;
+out:
+	return ret;
+}
+
+power_attr(cpufreq_table);
+power_attr(cpufreq_max_limit);
+power_attr(cpufreq_min_limit);
+
+struct cpufreq_limit_handle *cpufreq_min_touch;
+struct cpufreq_limit_handle *cpufreq_min_finger;
+struct cpufreq_limit_handle *cpufreq_min_argos;
+int set_freq_limit(unsigned long id, unsigned int freq)
+{
+	ssize_t ret = 0;
+
+	mutex_lock(&cpufreq_limit_mutex);
+
+	pr_debug("%s: id=%d freq=%d\n", __func__, (int)id, freq);
+
+	/* min lock */
+	if (id & DVFS_TOUCH_ID) {
+		if (cpufreq_min_touch) {
+			cpufreq_limit_put(cpufreq_min_touch);
+			cpufreq_min_touch = NULL;
+		}
+		if (freq != -1) {
+			cpufreq_min_touch = cpufreq_limit_min_freq(freq, "touch min");
+			if (IS_ERR(cpufreq_min_touch)) {
+				pr_err("%s: fail to get the handle\n", __func__);
+				cpufreq_min_touch = NULL;
+				ret = -EINVAL;
+			}
+		}
+	}
+
+	if (id & DVFS_FINGER_ID) {
+		if (cpufreq_min_finger) {
+			cpufreq_limit_put(cpufreq_min_finger);
+			cpufreq_min_finger = NULL;
+		}
+		if (freq != -1) {
+			cpufreq_min_finger = cpufreq_limit_min_freq(freq, "finger min");
+			if (IS_ERR(cpufreq_min_finger)) {
+				pr_err("%s: fail to get the handle\n", __func__);
+				cpufreq_min_finger = NULL;
+				ret = -EINVAL;
+			}
+		}
+	}
+
+	if (id & DVFS_ARGOS_ID) {
+		if (cpufreq_min_argos) {
+			cpufreq_limit_put(cpufreq_min_argos);
+			cpufreq_min_argos = NULL;
+		}
+		if (freq != -1) {
+			cpufreq_min_argos = cpufreq_limit_min_freq(freq, "argos min");
+			if (IS_ERR(cpufreq_min_argos)) {
+				pr_err("%s: fail to get the handle\n", __func__);
+				cpufreq_min_argos = NULL;
+				ret = -EINVAL;
+			}
+		}
+	}
+
+	mutex_unlock(&cpufreq_limit_mutex);
+	return ret;
+}
+#endif
+
 #ifdef CONFIG_PM_TRACE
 int pm_trace_enabled;
 
@@ -843,6 +995,36 @@ power_attr(pm_freeze_timeout);
 
 #endif	/* CONFIG_FREEZER*/
 
+#ifdef CONFIG_SEC_PM
+extern int qpnp_set_resin_wk_int(int en);
+static int volkey_wakeup = 1;
+static ssize_t volkey_wakeup_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", volkey_wakeup);
+}
+
+static ssize_t volkey_wakeup_store(struct kobject *kobj,
+				   struct kobj_attribute *attr,
+				   const char *buf, size_t n)
+{
+	int val;
+
+	if (kstrtoint(buf, 10, &val) < 0)
+		return -EINVAL;
+
+	if (volkey_wakeup == val)
+		return n;
+
+	volkey_wakeup = val;
+	qpnp_set_resin_wk_int(volkey_wakeup);
+
+	return n;
+
+}
+power_attr(volkey_wakeup);
+#endif /* CONFIG_SEC_PM */
+
 static struct attribute * g[] = {
 	&state_attr.attr,
 #ifdef CONFIG_PM_TRACE
@@ -869,8 +1051,16 @@ static struct attribute * g[] = {
 	&pm_debug_messages_attr.attr,
 #endif
 #endif
+#ifdef CONFIG_CPU_FREQ_LIMIT_USERSPACE
+	&cpufreq_table_attr.attr,
+	&cpufreq_max_limit_attr.attr,
+	&cpufreq_min_limit_attr.attr,
+#endif
 #ifdef CONFIG_FREEZER
 	&pm_freeze_timeout_attr.attr,
+#endif
+#ifdef CONFIG_SEC_PM
+	&volkey_wakeup_attr.attr,
 #endif
 	NULL,
 };

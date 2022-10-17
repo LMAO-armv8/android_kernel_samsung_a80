@@ -140,6 +140,8 @@ static const struct bin_table bin_kern_table[] = {
 	{ CTL_INT,	KERN_MAX_LOCK_DEPTH,		"max_lock_depth" },
 	{ CTL_INT,	KERN_PANIC_ON_NMI,		"panic_on_unrecovered_nmi" },
 	{ CTL_INT,	KERN_PANIC_ON_WARN,		"panic_on_warn" },
+	{ CTL_INT,	KERN_BOOT_REASON,		"boot_reason" },
+	{ CTL_INT,	KERN_COLD_BOOT,			"cold_boot" },
 	{}
 };
 
@@ -255,6 +257,7 @@ static const struct bin_table bin_net_ipv4_conf_vars_table[] = {
 	{ CTL_INT,	NET_IPV4_CONF_NOPOLICY,			"disable_policy" },
 	{ CTL_INT,	NET_IPV4_CONF_FORCE_IGMP_VERSION,	"force_igmp_version" },
 	{ CTL_INT,	NET_IPV4_CONF_PROMOTE_SECONDARIES,	"promote_secondaries" },
+	{ CTL_INT, NET_IPV4_CONF_NF_IPV4_DEFRAG_SKIP, "nf_ipv4_defrag_skip" },
 	{}
 };
 
@@ -525,6 +528,7 @@ static const struct bin_table bin_net_ipv6_conf_var_table[] = {
 	{ CTL_INT,	NET_IPV6_PROXY_NDP,			"proxy_ndp" },
 	{ CTL_INT,	NET_IPV6_ACCEPT_SOURCE_ROUTE,		"accept_source_route" },
 	{ CTL_INT,	NET_IPV6_ACCEPT_RA_FROM_LOCAL,		"accept_ra_from_local" },
+	{ CTL_INT, NET_IPV6_ACCEPT_RA_PREFIX_ROUTE, "accept_ra_prefix_route" },
 	{}
 };
 
@@ -704,6 +708,24 @@ static const struct bin_table bin_net_netfilter_table[] = {
 	{}
 };
 
+static const struct bin_table bin_net_irda_table[] = {
+	{ CTL_INT,	NET_IRDA_DISCOVERY,		"discovery" },
+	{ CTL_STR,	NET_IRDA_DEVNAME,		"devname" },
+	{ CTL_INT,	NET_IRDA_DEBUG,			"debug" },
+	{ CTL_INT,	NET_IRDA_FAST_POLL,		"fast_poll_increase" },
+	{ CTL_INT,	NET_IRDA_DISCOVERY_SLOTS,	"discovery_slots" },
+	{ CTL_INT,	NET_IRDA_DISCOVERY_TIMEOUT,	"discovery_timeout" },
+	{ CTL_INT,	NET_IRDA_SLOT_TIMEOUT,		"slot_timeout" },
+	{ CTL_INT,	NET_IRDA_MAX_BAUD_RATE,		"max_baud_rate" },
+	{ CTL_INT,	NET_IRDA_MIN_TX_TURN_TIME,	"min_tx_turn_time" },
+	{ CTL_INT,	NET_IRDA_MAX_TX_DATA_SIZE,	"max_tx_data_size" },
+	{ CTL_INT,	NET_IRDA_MAX_TX_WINDOW,		"max_tx_window" },
+	{ CTL_INT,	NET_IRDA_MAX_NOREPLY_TIME,	"max_noreply_time" },
+	{ CTL_INT,	NET_IRDA_WARN_NOREPLY_TIME,	"warn_noreply_time" },
+	{ CTL_INT,	NET_IRDA_LAP_KEEPALIVE_TIME,	"lap_keepalive_time" },
+	{}
+};
+
 static const struct bin_table bin_net_table[] = {
 	{ CTL_DIR,	NET_CORE,		"core",		bin_net_core_table },
 	/* NET_ETHER not used */
@@ -725,7 +747,7 @@ static const struct bin_table bin_net_table[] = {
 	{ CTL_DIR,	NET_LLC,		"llc",		bin_net_llc_table },
 	{ CTL_DIR,	NET_NETFILTER,		"netfilter",	bin_net_netfilter_table },
 	/* NET_DCCP "dccp" no longer used */
-	/* NET_IRDA "irda" no longer used */
+	{ CTL_DIR,	NET_IRDA,		"irda",		bin_net_irda_table },
 	{ CTL_INT,	2089,			"nf_conntrack_max" },
 	{}
 };

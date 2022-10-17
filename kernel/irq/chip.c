@@ -1,11 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ * linux/kernel/irq/chip.c
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the core interrupt handling code, for irq-chip based
- * architectures. Detailed information is available in
- * Documentation/core-api/genericirq.rst
+ * This file contains the core interrupt handling code, for irq-chip
+ * based architectures.
+ *
+ * Detailed information is available in Documentation/core-api/genericirq.rst
  */
 
 #include <linux/irq.h>
@@ -15,6 +17,8 @@
 #include <linux/kernel_stat.h>
 #include <linux/irqdomain.h>
 #include <linux/wakeup_reason.h>
+
+#include <linux/sec_debug.h>
 
 #include <trace/events/irq.h>
 
@@ -206,24 +210,20 @@ __irq_startup_managed(struct irq_desc *desc, struct cpumask *aff, bool force)
 		 * Catch code which fiddles with enable_irq() on a managed
 		 * and potentially shutdown IRQ. Chained interrupt
 		 * installment or irq auto probing should not happen on
-		 * managed irqs either.
+		 * managed irqs either. Emit a warning, break the affinity
+		 * and start it up as a normal interrupt.
 		 */
 		if (WARN_ON_ONCE(force))
-			return IRQ_STARTUP_ABORT;
+			return IRQ_STARTUP_NORMAL;
 		/*
 		 * The interrupt was requested, but there is no online CPU
 		 * in it's affinity mask. Put it into managed shutdown
 		 * state and let the cpu hotplug mechanism start it up once
 		 * a CPU in the mask becomes available.
 		 */
+		irqd_set_managed_shutdown(d);
 		return IRQ_STARTUP_ABORT;
 	}
-	/*
-	 * Managed interrupts have reserved resources, so this should not
-	 * happen.
-	 */
-	if (WARN_ON(irq_domain_activate_irq(d, false)))
-		return IRQ_STARTUP_ABORT;
 	return IRQ_STARTUP_MANAGED;
 }
 #else
@@ -239,9 +239,7 @@ static int __irq_startup(struct irq_desc *desc)
 	struct irq_data *d = irq_desc_get_irq_data(desc);
 	int ret = 0;
 
-	/* Warn if this interrupt is not activated but try nevertheless */
-	WARN_ON_ONCE(!irqd_is_activated(d));
-
+	irq_domain_activate_irq(d);
 	if (d->chip->irq_startup) {
 		ret = d->chip->irq_startup(d);
 		irq_state_clr_disabled(desc);
@@ -266,18 +264,14 @@ int irq_startup(struct irq_desc *desc, bool resend, bool force)
 	} else {
 		switch (__irq_startup_managed(desc, aff, force)) {
 		case IRQ_STARTUP_NORMAL:
-			if (d->chip->flags & IRQCHIP_AFFINITY_PRE_STARTUP)
-				irq_setup_affinity(desc);
 			ret = __irq_startup(desc);
-			if (!(d->chip->flags & IRQCHIP_AFFINITY_PRE_STARTUP))
-				irq_setup_affinity(desc);
+			irq_setup_affinity(desc);
 			break;
 		case IRQ_STARTUP_MANAGED:
 			irq_do_set_affinity(d, aff, false);
 			ret = __irq_startup(desc);
 			break;
 		case IRQ_STARTUP_ABORT:
-			irqd_set_managed_shutdown(d);
 			return 0;
 		}
 	}
@@ -285,22 +279,6 @@ int irq_startup(struct irq_desc *desc, bool resend, bool force)
 		check_irq_resend(desc);
 
 	return ret;
-}
-
-int irq_activate(struct irq_desc *desc)
-{
-	struct irq_data *d = irq_desc_get_irq_data(desc);
-
-	if (!irqd_affinity_is_managed(d))
-		return irq_domain_activate_irq(d, false);
-	return 0;
-}
-
-int irq_activate_and_startup(struct irq_desc *desc, bool resend)
-{
-	if (WARN_ON(irq_activate(desc)))
-		return 0;
-	return irq_startup(desc, resend, IRQ_START_FORCE);
 }
 
 static void __irq_disable(struct irq_desc *desc, bool mask);
@@ -318,12 +296,6 @@ void irq_shutdown(struct irq_desc *desc)
 		}
 		irq_state_clr_started(desc);
 	}
-}
-
-
-void irq_shutdown_and_deactivate(struct irq_desc *desc)
-{
-	irq_shutdown(desc);
 	/*
 	 * This must be called even if the interrupt was never started up,
 	 * because the activation can happen before the interrupt is
@@ -922,9 +894,13 @@ void handle_percpu_devid_irq(struct irq_desc *desc)
 		chip->irq_ack(&desc->irq_data);
 
 	if (likely(action)) {
+		sec_debug_irq_sched_log(irq, action->handler,
+					(char *)action->name, IRQ_ENTRY);
 		trace_irq_handler_entry(irq, action);
 		res = action->handler(irq, raw_cpu_ptr(action->percpu_dev_id));
 		trace_irq_handler_exit(irq, action, res);
+		sec_debug_irq_sched_log(irq, action->handler,
+					(char *)action->name, IRQ_EXIT);
 	} else {
 		unsigned int cpu = smp_processor_id();
 		bool enabled = cpumask_test_cpu(cpu, desc->percpu_enabled);
@@ -1006,7 +982,7 @@ __irq_do_set_handler(struct irq_desc *desc, irq_flow_handler_t handle,
 		irq_settings_set_norequest(desc);
 		irq_settings_set_nothread(desc);
 		desc->action = &chained_action;
-		irq_activate_and_startup(desc, IRQ_RESEND);
+		irq_startup(desc, IRQ_RESEND, IRQ_START_FORCE);
 	}
 }
 
@@ -1258,50 +1234,6 @@ EXPORT_SYMBOL_GPL(handle_fasteoi_mask_irq);
 #endif /* CONFIG_IRQ_FASTEOI_HIERARCHY_HANDLERS */
 
 /**
- *	irq_chip_set_parent_state - set the state of a parent interrupt.
- *	@data: Pointer to interrupt specific data
- *	@which: State to be restored (one of IRQCHIP_STATE_*)
- *	@val: Value corresponding to @which
- *
- */
-int irq_chip_set_parent_state(struct irq_data *data,
-			      enum irqchip_irq_state which,
-			      bool val)
-{
-	data = data->parent_data;
-	if (!data)
-		return 0;
-
-	if (data->chip->irq_set_irqchip_state)
-		return data->chip->irq_set_irqchip_state(data, which, val);
-
-	return 0;
-}
-EXPORT_SYMBOL(irq_chip_set_parent_state);
-
-/**
- *	irq_chip_get_parent_state - get the state of a parent interrupt.
- *	@data: Pointer to interrupt specific data
- *	@which: one of IRQCHIP_STATE_* the caller wants to know
- *	@state: a pointer to a boolean where the state is to be stored
- *
- */
-int irq_chip_get_parent_state(struct irq_data *data,
-			      enum irqchip_irq_state which,
-			      bool *state)
-{
-	data = data->parent_data;
-	if (!data)
-		return 0;
-
-	if (data->chip->irq_get_irqchip_state)
-		return data->chip->irq_get_irqchip_state(data, which, state);
-
-	return 0;
-}
-EXPORT_SYMBOL(irq_chip_get_parent_state);
-
-/**
  * irq_chip_enable_parent - Enable the parent interrupt (defaults to unmask if
  * NULL)
  * @data:	Pointer to interrupt specific data
@@ -1427,7 +1359,6 @@ int irq_chip_retrigger_hierarchy(struct irq_data *data)
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(irq_chip_retrigger_hierarchy);
 
 /**
  * irq_chip_set_vcpu_affinity_parent - Set vcpu affinity on the parent interrupt
@@ -1442,7 +1373,6 @@ int irq_chip_set_vcpu_affinity_parent(struct irq_data *data, void *vcpu_info)
 
 	return -ENOSYS;
 }
-EXPORT_SYMBOL_GPL(irq_chip_set_vcpu_affinity_parent);
 
 /**
  * irq_chip_set_wake_parent - Set/reset wake-up on the parent interrupt
@@ -1463,7 +1393,6 @@ int irq_chip_set_wake_parent(struct irq_data *data, unsigned int on)
 
 	return -ENOSYS;
 }
-EXPORT_SYMBOL_GPL(irq_chip_set_wake_parent);
 #endif
 
 /**

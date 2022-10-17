@@ -29,7 +29,6 @@
 
 #include "power.h"
 
-static bool need_wait;
 
 #define SNAPSHOT_MINOR	231
 
@@ -83,7 +82,7 @@ static int snapshot_open(struct inode *inode, struct file *filp)
 		 * Resuming.  We may need to wait for the image device to
 		 * appear.
 		 */
-		need_wait = true;
+		wait_for_device_probe();
 
 		data->swap = -1;
 		data->mode = O_WRONLY;
@@ -175,11 +174,6 @@ static ssize_t snapshot_write(struct file *filp, const char __user *buf,
 	ssize_t res;
 	loff_t pg_offp = *offp & ~PAGE_MASK;
 
-	if (need_wait) {
-		wait_for_device_probe();
-		need_wait = false;
-	}
-
 	lock_system_sleep();
 
 	data = filp->private_data;
@@ -215,11 +209,6 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 	loff_t size;
 	sector_t offset;
 
-	if (need_wait) {
-		wait_for_device_probe();
-		need_wait = false;
-	}
-
 	if (_IOC_TYPE(cmd) != SNAPSHOT_IOC_MAGIC)
 		return -ENOTTY;
 	if (_IOC_NR(cmd) > SNAPSHOT_IOC_MAXNR)
@@ -227,7 +216,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	if (!mutex_trylock(&system_transition_mutex))
+	if (!mutex_trylock(&pm_mutex))
 		return -EBUSY;
 
 	lock_device_hotplug();
@@ -240,7 +229,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 			break;
 
 		printk("Syncing filesystems ... ");
-		ksys_sync();
+		sys_sync();
 		printk("done.\n");
 
 		error = freeze_processes();
@@ -405,7 +394,7 @@ static long snapshot_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	unlock_device_hotplug();
-	mutex_unlock(&system_transition_mutex);
+	mutex_unlock(&pm_mutex);
 
 	return error;
 }

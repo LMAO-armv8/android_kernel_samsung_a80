@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 */
 
 #ifndef _LINUX_KERNEL_TRACE_H
 #define _LINUX_KERNEL_TRACE_H
@@ -259,7 +259,6 @@ struct trace_array {
 	struct trace_options	*topts;
 	struct list_head	systems;
 	struct list_head	events;
-	struct trace_event_file *trace_marker_file;
 	cpumask_var_t		tracing_cpumask; /* only trace on set CPUs */
 	int			ref;
 #ifdef CONFIG_FUNCTION_TRACER
@@ -274,8 +273,6 @@ struct trace_array {
 	/* function tracing enabled */
 	int			function_enabled;
 #endif
-	int			time_stamp_abs_ref;
-	struct list_head	hist_vars;
 };
 
 enum {
@@ -288,11 +285,6 @@ extern struct mutex trace_types_lock;
 
 extern int trace_array_get(struct trace_array *tr);
 extern void trace_array_put(struct trace_array *tr);
-
-extern int tracing_set_time_stamp_abs(struct trace_array *tr, bool abs);
-extern int tracing_set_clock(struct trace_array *tr, const char *clockstr);
-
-extern bool trace_clock_in_ns(struct trace_array *tr);
 
 /*
  * The global tracer (top) should be the first trace array added,
@@ -467,8 +459,23 @@ struct tracer {
  *  When function tracing occurs, the following steps are made:
  *   If arch does not support a ftrace feature:
  *    call internal function (uses INTERNAL bits) which calls...
+ *   If callback is registered to the "global" list, the list
+ *    function is called and recursion checks the GLOBAL bits.
+ *    then this function calls...
  *   The function callback, which can use the FTRACE bits to
  *    check for recursion.
+ *
+ * Now if the arch does not suppport a feature, and it calls
+ * the global list function which calls the ftrace callback
+ * all three of these steps will do a recursion protection.
+ * There's no reason to do one if the previous caller already
+ * did. The recursion that we are protecting against will
+ * go through the same steps again.
+ *
+ * To prevent the multiple recursion checks, if a recursion
+ * bit is set that is higher than the MAX bit of the current
+ * check, then we know that the check was made by the previous
+ * caller, and we can skip the current check.
  */
 enum {
 	TRACE_BUFFER_BIT,
@@ -481,14 +488,12 @@ enum {
 	TRACE_FTRACE_NMI_BIT,
 	TRACE_FTRACE_IRQ_BIT,
 	TRACE_FTRACE_SIRQ_BIT,
-	TRACE_FTRACE_TRANSITION_BIT,
 
-	/* Internal use recursion bits */
+	/* INTERNAL_BITs must be greater than FTRACE_BITs */
 	TRACE_INTERNAL_BIT,
 	TRACE_INTERNAL_NMI_BIT,
 	TRACE_INTERNAL_IRQ_BIT,
 	TRACE_INTERNAL_SIRQ_BIT,
-	TRACE_INTERNAL_TRANSITION_BIT,
 
 	TRACE_BRANCH_BIT,
 /*
@@ -540,18 +545,12 @@ enum {
 #define TRACE_CONTEXT_BITS	4
 
 #define TRACE_FTRACE_START	TRACE_FTRACE_BIT
+#define TRACE_FTRACE_MAX	((1 << (TRACE_FTRACE_START + TRACE_CONTEXT_BITS)) - 1)
 
 #define TRACE_LIST_START	TRACE_INTERNAL_BIT
+#define TRACE_LIST_MAX		((1 << (TRACE_LIST_START + TRACE_CONTEXT_BITS)) - 1)
 
-#define TRACE_CONTEXT_MASK	((1 << (TRACE_LIST_START + TRACE_CONTEXT_BITS)) - 1)
-
-enum {
-	TRACE_CTX_NMI,
-	TRACE_CTX_IRQ,
-	TRACE_CTX_SOFTIRQ,
-	TRACE_CTX_NORMAL,
-	TRACE_CTX_TRANSITION,
-};
+#define TRACE_CONTEXT_MASK	TRACE_LIST_MAX
 
 static __always_inline int trace_get_context_bit(void)
 {
@@ -559,36 +558,30 @@ static __always_inline int trace_get_context_bit(void)
 
 	if (in_interrupt()) {
 		if (in_nmi())
-			bit = TRACE_CTX_NMI;
+			bit = 0;
 
 		else if (in_irq())
-			bit = TRACE_CTX_IRQ;
+			bit = 1;
 		else
-			bit = TRACE_CTX_SOFTIRQ;
+			bit = 2;
 	} else
-		bit = TRACE_CTX_NORMAL;
+		bit = 3;
 
 	return bit;
 }
 
-static __always_inline int trace_test_and_set_recursion(int start)
+static __always_inline int trace_test_and_set_recursion(int start, int max)
 {
 	unsigned int val = current->trace_recursion;
 	int bit;
 
+	/* A previous recursion check was made */
+	if ((val & TRACE_CONTEXT_MASK) > max)
+		return 0;
+
 	bit = trace_get_context_bit() + start;
-	if (unlikely(val & (1 << bit))) {
-		/*
-		 * It could be that preempt_count has not been updated during
-		 * a switch between contexts. Allow for a single recursion.
-		 */
-		bit = start + TRACE_CTX_TRANSITION;
-		if (trace_recursion_test(bit))
-			return -1;
-		trace_recursion_set(bit);
-		barrier();
-		return bit;
-	}
+	if (unlikely(val & (1 << bit)))
+		return -1;
 
 	val |= 1 << bit;
 	current->trace_recursion = val;
@@ -601,6 +594,9 @@ static __always_inline void trace_clear_recursion(int bit)
 {
 	unsigned int val = current->trace_recursion;
 
+	if (!bit)
+		return;
+
 	bit = 1 << bit;
 	val &= ~bit;
 
@@ -611,7 +607,9 @@ static __always_inline void trace_clear_recursion(int bit)
 static inline struct ring_buffer_iter *
 trace_buffer_iter(struct trace_iterator *iter, int cpu)
 {
-	return iter->buffer_iter ? iter->buffer_iter[cpu] : NULL;
+	if (iter->buffer_iter && iter->buffer_iter[cpu])
+		return iter->buffer_iter[cpu];
+	return NULL;
 }
 
 int tracer_init(struct tracer *t, struct trace_array *tr);
@@ -622,7 +620,7 @@ void tracing_reset_current(int cpu);
 void tracing_reset_all_online_cpus(void);
 int tracing_open_generic(struct inode *inode, struct file *filp);
 bool tracing_is_disabled(void);
-bool tracer_tracing_is_on(struct trace_array *tr);
+int tracer_tracing_is_on(struct trace_array *tr);
 void tracer_tracing_on(struct trace_array *tr);
 void tracer_tracing_off(struct trace_array *tr);
 struct dentry *trace_create_file(const char *name,
@@ -721,15 +719,13 @@ void update_max_tr_single(struct trace_array *tr,
 #endif /* CONFIG_TRACER_MAX_TRACE */
 
 #ifdef CONFIG_STACKTRACE
-void ftrace_trace_userstack(struct trace_array *tr,
-			    struct ring_buffer *buffer, unsigned long flags,
+void ftrace_trace_userstack(struct ring_buffer *buffer, unsigned long flags,
 			    int pc);
 
 void __trace_stack(struct trace_array *tr, unsigned long flags, int skip,
 		   int pc);
 #else
-static inline void ftrace_trace_userstack(struct trace_array *tr,
-					  struct ring_buffer *buffer,
+static inline void ftrace_trace_userstack(struct ring_buffer *buffer,
 					  unsigned long flags, int pc)
 {
 }
@@ -775,6 +771,8 @@ extern int trace_selftest_startup_wakeup(struct tracer *trace,
 					 struct trace_array *tr);
 extern int trace_selftest_startup_nop(struct tracer *trace,
 					 struct trace_array *tr);
+extern int trace_selftest_startup_sched_switch(struct tracer *trace,
+					       struct trace_array *tr);
 extern int trace_selftest_startup_branch(struct tracer *trace,
 					 struct trace_array *tr);
 /*
@@ -1005,6 +1003,7 @@ void ftrace_destroy_function_files(struct trace_array *tr);
 void ftrace_init_global_array_ops(struct trace_array *tr);
 void ftrace_init_array_ops(struct trace_array *tr, ftrace_func_t func);
 void ftrace_reset_array_ops(struct trace_array *tr);
+int using_ftrace_ops_list_func(void);
 void ftrace_init_tracefs(struct trace_array *tr, struct dentry *d_tracer);
 void ftrace_init_tracefs_toplevel(struct trace_array *tr,
 				  struct dentry *d_tracer);
@@ -1282,11 +1281,12 @@ struct ftrace_event_field {
 	int			is_signed;
 };
 
-struct prog_entry;
-
 struct event_filter {
-	struct prog_entry __rcu	*prog;
-	char			*filter_string;
+	int			n_preds;	/* Number assigned */
+	int			a_preds;	/* allocated */
+	struct filter_pred __rcu	*preds;
+	struct filter_pred __rcu	*root;
+	char				*filter_string;
 };
 
 struct event_subsystem {
@@ -1363,28 +1363,16 @@ __event_trigger_test_discard(struct trace_event_file *file,
 	unsigned long eflags = file->flags;
 
 	if (eflags & EVENT_FILE_FL_TRIGGER_COND)
-		*tt = event_triggers_call(file, entry, event);
+		*tt = event_triggers_call(file, entry);
 
-	if (likely(!(file->flags & (EVENT_FILE_FL_SOFT_DISABLED |
-				    EVENT_FILE_FL_FILTERED |
-				    EVENT_FILE_FL_PID_FILTER))))
-		return false;
-
-	if (file->flags & EVENT_FILE_FL_SOFT_DISABLED)
-		goto discard;
-
-	if (file->flags & EVENT_FILE_FL_FILTERED &&
-	    !filter_match_preds(file->filter, entry))
-		goto discard;
-
-	if ((file->flags & EVENT_FILE_FL_PID_FILTER) &&
-	    trace_event_ignore_this_pid(file))
-		goto discard;
+	if (test_bit(EVENT_FILE_FL_SOFT_DISABLED_BIT, &file->flags) ||
+	    (unlikely(file->flags & EVENT_FILE_FL_FILTERED) &&
+	     !filter_match_preds(file->filter, entry))) {
+		__trace_event_discard_commit(buffer, event);
+		return true;
+	}
 
 	return false;
- discard:
-	__trace_event_discard_commit(buffer, event);
-	return true;
 }
 
 /**
@@ -1395,6 +1383,7 @@ __event_trigger_test_discard(struct trace_event_file *file,
  * @entry: The event itself
  * @irq_flags: The state of the interrupts at the start of the event
  * @pc: The state of the preempt count at the start of the event.
+ * @len: The length of the payload data required for stm logging.
  *
  * This is a helper function to handle triggers that require data
  * from the event itself. It also tests the event against filters and
@@ -1404,15 +1393,20 @@ static inline void
 event_trigger_unlock_commit(struct trace_event_file *file,
 			    struct ring_buffer *buffer,
 			    struct ring_buffer_event *event,
-			    void *entry, unsigned long irq_flags, int pc)
+			    void *entry, unsigned long irq_flags, int pc,
+			    unsigned long len)
 {
 	enum event_trigger_type tt = ETT_NONE;
 
-	if (!__event_trigger_test_discard(file, buffer, event, entry, &tt))
+	if (!__event_trigger_test_discard(file, buffer, event, entry, &tt)) {
+		if (len)
+			stm_log(OST_ENTITY_FTRACE_EVENTS, entry, len);
+
 		trace_buffer_unlock_commit(file->tr, buffer, event, irq_flags, pc);
+	}
 
 	if (tt)
-		event_triggers_post_call(file, tt);
+		event_triggers_post_call(file, tt, entry);
 }
 
 /**
@@ -1445,7 +1439,7 @@ event_trigger_unlock_commit_regs(struct trace_event_file *file,
 						irq_flags, pc, regs);
 
 	if (tt)
-		event_triggers_post_call(file, tt);
+		event_triggers_post_call(file, tt, entry);
 }
 
 #define FILTER_PRED_INVALID	((unsigned short)-1)
@@ -1490,8 +1484,12 @@ struct filter_pred {
 	unsigned short		*ops;
 	struct ftrace_event_field *field;
 	int 			offset;
-	int			not;
+	int 			not;
 	int 			op;
+	unsigned short		index;
+	unsigned short		parent;
+	unsigned short		left;
+	unsigned short		right;
 };
 
 static inline bool is_string_field(struct ftrace_event_field *field)
@@ -1529,20 +1527,16 @@ trace_find_event_field(struct trace_event_call *call, char *name);
 extern void trace_event_enable_cmd_record(bool enable);
 extern void trace_event_enable_tgid_record(bool enable);
 
-extern int event_trace_init(void);
 extern int event_trace_add_tracer(struct dentry *parent, struct trace_array *tr);
 extern int event_trace_del_tracer(struct trace_array *tr);
 
-extern struct trace_event_file *__find_event_file(struct trace_array *tr,
-						  const char *system,
-						  const char *event);
 extern struct trace_event_file *find_event_file(struct trace_array *tr,
 						const char *system,
 						const char *event);
 
 static inline void *event_file_data(struct file *filp)
 {
-	return READ_ONCE(file_inode(filp)->i_private);
+	return ACCESS_ONCE(file_inode(filp)->i_private);
 }
 
 extern struct mutex event_mutex;
@@ -1612,6 +1606,9 @@ extern int event_trigger_init(struct event_trigger_ops *ops,
 extern int trace_event_trigger_enable_disable(struct trace_event_file *file,
 					      int trigger_enable);
 extern void update_cond_flag(struct trace_event_file *file);
+extern void unregister_trigger(char *glob, struct event_trigger_ops *ops,
+			       struct event_trigger_data *test,
+			       struct trace_event_file *file);
 extern int set_trigger_filter(char *filter_str,
 			      struct event_trigger_data *trigger_data,
 			      struct trace_event_file *file);
@@ -1624,8 +1621,6 @@ extern void pause_named_trigger(struct event_trigger_data *data);
 extern void unpause_named_trigger(struct event_trigger_data *data);
 extern void set_named_trigger_data(struct event_trigger_data *data,
 				   struct event_trigger_data *named_data);
-extern struct event_trigger_data *
-get_named_trigger_data(struct event_trigger_data *data);
 extern int register_event_command(struct event_command *cmd);
 extern int unregister_event_command(struct event_command *cmd);
 extern int register_trigger_hist_enable_disable_cmds(void);
@@ -1669,8 +1664,7 @@ extern int register_trigger_hist_enable_disable_cmds(void);
  */
 struct event_trigger_ops {
 	void			(*func)(struct event_trigger_data *data,
-					void *rec,
-					struct ring_buffer_event *rbe);
+					void *rec);
 	int			(*init)(struct event_trigger_ops *ops,
 					struct event_trigger_data *data);
 	void			(*free)(struct event_trigger_ops *ops,
@@ -1837,13 +1831,6 @@ void trace_printk_start_comm(void);
 int trace_keep_overwrite(struct tracer *tracer, u32 mask, int set);
 int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled);
 
-#define MAX_EVENT_NAME_LEN	64
-
-extern int trace_run_command(const char *buf, int (*createfn)(int, char**));
-extern ssize_t trace_parse_run_command(struct file *file,
-		const char __user *buffer, size_t count, loff_t *ppos,
-		int (*createfn)(int, char**));
-
 /*
  * Normal trace_printk() and friends allocates special buffers
  * to do the manipulation, as well as saves the print formats
@@ -1905,21 +1892,6 @@ static inline int tracing_alloc_snapshot_instance(struct trace_array *tr)
 {
 	return 0;
 }
-#endif
-
-#ifdef CONFIG_PREEMPT_TRACER
-void tracer_preempt_on(unsigned long a0, unsigned long a1);
-void tracer_preempt_off(unsigned long a0, unsigned long a1);
-#else
-static inline void tracer_preempt_on(unsigned long a0, unsigned long a1) { }
-static inline void tracer_preempt_off(unsigned long a0, unsigned long a1) { }
-#endif
-#ifdef CONFIG_IRQSOFF_TRACER
-void tracer_hardirqs_on(unsigned long a0, unsigned long a1);
-void tracer_hardirqs_off(unsigned long a0, unsigned long a1);
-#else
-static inline void tracer_hardirqs_on(unsigned long a0, unsigned long a1) { }
-static inline void tracer_hardirqs_off(unsigned long a0, unsigned long a1) { }
 #endif
 
 extern struct trace_iterator *tracepoint_print_iter;

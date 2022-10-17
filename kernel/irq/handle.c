@@ -1,10 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ * linux/kernel/irq/handle.c
+ *
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the core interrupt handling code. Detailed
- * information is available in Documentation/core-api/genericirq.rst
+ * This file contains the core interrupt handling code.
+ *
+ * Detailed information is available in Documentation/core-api/genericirq.rst
  *
  */
 
@@ -13,14 +15,11 @@
 #include <linux/sched.h>
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
+#include <linux/sec_debug.h>
 
 #include <trace/events/irq.h>
 
 #include "internals.h"
-
-#ifdef CONFIG_GENERIC_IRQ_MULTI_HANDLER
-void (*handle_arch_irq)(struct pt_regs *) __ro_after_init;
-#endif
 
 /**
  * handle_bad_irq - handle spurious and unhandled irqs
@@ -145,9 +144,11 @@ irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc, unsigned int *flags
 	for_each_action_of_desc(desc, action) {
 		irqreturn_t res;
 
+		sec_debug_irq_sched_log(irq, action->handler, (char *)action->name, IRQ_ENTRY);
 		trace_irq_handler_entry(irq, action);
 		res = action->handler(irq, action->dev_id);
 		trace_irq_handler_exit(irq, action, res);
+		sec_debug_irq_sched_log(irq, action->handler, (char *)action->name, IRQ_EXIT);
 
 		if (WARN_ONCE(!irqs_disabled(),"irq %u handler %pF enabled interrupts\n",
 			      irq, action->handler))
@@ -188,7 +189,7 @@ irqreturn_t handle_irq_event_percpu(struct irq_desc *desc)
 
 	retval = __handle_irq_event_percpu(desc, &flags);
 
-	add_interrupt_randomness(desc->irq_data.irq);
+	add_interrupt_randomness(desc->irq_data.irq, flags);
 
 	if (!noirqdebug)
 		note_interrupt(desc, retval);
@@ -209,14 +210,3 @@ irqreturn_t handle_irq_event(struct irq_desc *desc)
 	irqd_clear(&desc->irq_data, IRQD_IRQ_INPROGRESS);
 	return ret;
 }
-
-#ifdef CONFIG_GENERIC_IRQ_MULTI_HANDLER
-int __init set_handle_irq(void (*handle_irq)(struct pt_regs *))
-{
-	if (handle_arch_irq)
-		return -EBUSY;
-
-	handle_arch_irq = handle_irq;
-	return 0;
-}
-#endif
