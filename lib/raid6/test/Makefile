@@ -4,8 +4,6 @@
 # from userspace.
 #
 
-pound := \#
-
 CC	 = gcc
 OPTFLAGS = -O2			# Adjust as desired
 CFLAGS	 = -I.. -I ../../../include -g $(OPTFLAGS)
@@ -46,14 +44,15 @@ else ifeq ($(HAS_NEON),yes)
         OBJS   += neon.o neon1.o neon2.o neon4.o neon8.o recov_neon.o recov_neon_inner.o
         CFLAGS += -DCONFIG_KERNEL_MODE_NEON=1
 else
-        HAS_ALTIVEC := $(shell printf '$(pound)include <altivec.h>\nvector int a;\n' |\
-                         gcc -c -x c - >/dev/null && rm ./-.o && echo yes)
+        HAS_ALTIVEC := $(shell printf '\#include <altivec.h>\nvector int a;\n' |\
+                         gcc -c -x c - >&/dev/null && \
+                         rm ./-.o && echo yes)
         ifeq ($(HAS_ALTIVEC),yes)
-                CFLAGS += -I../../../arch/powerpc/include
-                CFLAGS += -DCONFIG_ALTIVEC
-                OBJS += altivec1.o altivec2.o altivec4.o altivec8.o \
-                        vpermxor1.o vpermxor2.o vpermxor4.o vpermxor8.o
+                OBJS += altivec1.o altivec2.o altivec4.o altivec8.o
         endif
+endif
+ifeq ($(ARCH),tilegx)
+OBJS += tilegx8.o
 endif
 
 .c.o:
@@ -99,18 +98,6 @@ altivec4.c: altivec.uc ../unroll.awk
 altivec8.c: altivec.uc ../unroll.awk
 	$(AWK) ../unroll.awk -vN=8 < altivec.uc > $@
 
-vpermxor1.c: vpermxor.uc ../unroll.awk
-	$(AWK) ../unroll.awk -vN=1 < vpermxor.uc > $@
-
-vpermxor2.c: vpermxor.uc ../unroll.awk
-	$(AWK) ../unroll.awk -vN=2 < vpermxor.uc > $@
-
-vpermxor4.c: vpermxor.uc ../unroll.awk
-	$(AWK) ../unroll.awk -vN=4 < vpermxor.uc > $@
-
-vpermxor8.c: vpermxor.uc ../unroll.awk
-	$(AWK) ../unroll.awk -vN=8 < vpermxor.uc > $@
-
 int1.c: int.uc ../unroll.awk
 	$(AWK) ../unroll.awk -vN=1 < int.uc > $@
 
@@ -129,11 +116,15 @@ int16.c: int.uc ../unroll.awk
 int32.c: int.uc ../unroll.awk
 	$(AWK) ../unroll.awk -vN=32 < int.uc > $@
 
+tilegx8.c: tilegx.uc ../unroll.awk
+	$(AWK) ../unroll.awk -vN=8 < tilegx.uc > $@
+
 tables.c: mktables
 	./mktables > tables.c
 
 clean:
-	rm -f *.o *.a mktables mktables.c *.uc int*.c altivec*.c vpermxor*.c neon*.c tables.c raid6test
+	rm -f *.o *.a mktables mktables.c *.uc int*.c altivec*.c neon*.c tables.c raid6test
+	rm -f tilegx*.c
 
 spotless: clean
 	rm -f *~

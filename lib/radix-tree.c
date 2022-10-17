@@ -24,7 +24,6 @@
 
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
-#include <linux/bug.h>
 #include <linux/cpu.h>
 #include <linux/errno.h>
 #include <linux/export.h>
@@ -88,6 +87,11 @@ struct radix_tree_preload {
 };
 static DEFINE_PER_CPU(struct radix_tree_preload, radix_tree_preloads) = { 0, };
 
+static inline void *indirect_to_ptr(void *ptr)
+{
+	return (void *)((unsigned long)ptr & ~RADIX_TREE_INDIRECT_PTR);
+}
+
 static inline struct radix_tree_node *entry_to_node(void *ptr)
 {
 	return (void *)((unsigned long)ptr & ~RADIX_TREE_INTERNAL_NODE);
@@ -120,7 +124,7 @@ bool is_sibling_entry(const struct radix_tree_node *parent, void *node)
 static inline unsigned long
 get_slot_offset(const struct radix_tree_node *parent, void __rcu **slot)
 {
-	return parent ? slot - parent->slots : 0;
+	return slot - parent->slots;
 }
 
 static unsigned int radix_tree_descend(const struct radix_tree_node *parent,
@@ -146,7 +150,7 @@ static unsigned int radix_tree_descend(const struct radix_tree_node *parent,
 
 static inline gfp_t root_gfp_mask(const struct radix_tree_root *root)
 {
-	return root->gfp_mask & (__GFP_BITS_MASK & ~GFP_ZONEMASK);
+	return root->gfp_mask & __GFP_BITS_MASK;
 }
 
 static inline void tag_set(struct radix_tree_node *node, unsigned int tag,
@@ -678,7 +682,8 @@ out:
  *	@root		radix tree root
  */
 static inline bool radix_tree_shrink(struct radix_tree_root *root,
-				     radix_tree_update_node_t update_node)
+				     radix_tree_update_node_t update_node,
+				     void *private)
 {
 	bool shrunk = false;
 
@@ -739,7 +744,7 @@ static inline bool radix_tree_shrink(struct radix_tree_root *root,
 		if (!radix_tree_is_internal_node(child)) {
 			node->slots[0] = (void __rcu *)RADIX_TREE_RETRY;
 			if (update_node)
-				update_node(node);
+				update_node(node, private);
 		}
 
 		WARN_ON_ONCE(!list_empty(&node->private_list));
@@ -752,7 +757,7 @@ static inline bool radix_tree_shrink(struct radix_tree_root *root,
 
 static bool delete_node(struct radix_tree_root *root,
 			struct radix_tree_node *node,
-			radix_tree_update_node_t update_node)
+			radix_tree_update_node_t update_node, void *private)
 {
 	bool deleted = false;
 
@@ -762,8 +767,8 @@ static bool delete_node(struct radix_tree_root *root,
 		if (node->count) {
 			if (node_to_entry(node) ==
 					rcu_dereference_raw(root->rnode))
-				deleted |= radix_tree_shrink(root,
-								update_node);
+				deleted |= radix_tree_shrink(root, update_node,
+								private);
 			return deleted;
 		}
 
@@ -1173,6 +1178,7 @@ static int calculate_count(struct radix_tree_root *root,
  * @slot:		pointer to slot in @node
  * @item:		new item to store in the slot.
  * @update_node:	callback for changing leaf nodes
+ * @private:		private data to pass to @update_node
  *
  * For use with __radix_tree_lookup().  Caller must hold tree write locked
  * across slot lookup and replacement.
@@ -1180,7 +1186,7 @@ static int calculate_count(struct radix_tree_root *root,
 void __radix_tree_replace(struct radix_tree_root *root,
 			  struct radix_tree_node *node,
 			  void __rcu **slot, void *item,
-			  radix_tree_update_node_t update_node)
+			  radix_tree_update_node_t update_node, void *private)
 {
 	void *old = rcu_dereference_raw(*slot);
 	int exceptional = !!radix_tree_exceptional_entry(item) -
@@ -1200,9 +1206,9 @@ void __radix_tree_replace(struct radix_tree_root *root,
 		return;
 
 	if (update_node)
-		update_node(node);
+		update_node(node, private);
 
-	delete_node(root, node, update_node);
+	delete_node(root, node, update_node, private);
 }
 
 /**
@@ -1224,7 +1230,7 @@ void __radix_tree_replace(struct radix_tree_root *root,
 void radix_tree_replace_slot(struct radix_tree_root *root,
 			     void __rcu **slot, void *item)
 {
-	__radix_tree_replace(root, NULL, slot, item, NULL);
+	__radix_tree_replace(root, NULL, slot, item, NULL, NULL);
 }
 EXPORT_SYMBOL(radix_tree_replace_slot);
 
@@ -1241,7 +1247,7 @@ void radix_tree_iter_replace(struct radix_tree_root *root,
 				const struct radix_tree_iter *iter,
 				void __rcu **slot, void *item)
 {
-	__radix_tree_replace(root, iter->node, slot, item, NULL);
+	__radix_tree_replace(root, iter->node, slot, item, NULL, NULL);
 }
 
 #ifdef CONFIG_RADIX_TREE_MULTIORDER
@@ -1847,6 +1853,49 @@ radix_tree_gang_lookup(const struct radix_tree_root *root, void **results,
 EXPORT_SYMBOL(radix_tree_gang_lookup);
 
 /**
+ *	radix_tree_gang_lookup_index - perform multiple lookup on a radix tree
+ *	@root:		radix tree root
+ *	@results:	where the results of the lookup are placed
+ *	@indices:	where their indices should be placed
+ *	@first_index:	start the lookup from this key
+ *	@max_items:	place up to this many items at *results
+ *
+ *	Performs an index-ascending scan of the tree for present items.  Places
+ *	them at *@results and returns the number of items which were placed at
+ *	*@results. The indices are placed in @indices.
+ *
+ *	The implementation is naive.
+ *
+ *	Just one difference from radix_tree_gang_lookup, the indices are also
+ *	collected along with the results of lookup.
+ */
+unsigned int
+radix_tree_gang_lookup_index(struct radix_tree_root *root, void **results,
+			unsigned long *indices, unsigned long first_index,
+			unsigned int max_items)
+{
+	struct radix_tree_iter iter;
+	void **slot;
+	unsigned int ret = 0;
+
+	if (unlikely(!max_items))
+		return 0;
+
+	radix_tree_for_each_slot(slot, root, &iter, first_index) {
+		results[ret] = indirect_to_ptr(rcu_dereference_raw(*slot));
+		if (!results[ret])
+			continue;
+		if (indices)
+			indices[ret] = iter.index;
+		if (++ret == max_items)
+			break;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL(radix_tree_gang_lookup_index);
+
+/**
  *	radix_tree_gang_lookup_slot - perform multiple slot lookup on radix tree
  *	@root:		radix tree root
  *	@results:	where the results of the lookup are placed
@@ -1969,6 +2018,7 @@ EXPORT_SYMBOL(radix_tree_gang_lookup_tag_slot);
  *	@root:		radix tree root
  *	@node:		node containing @index
  *	@update_node:	callback for changing leaf nodes
+ *	@private:	private data to pass to @update_node
  *
  *	After clearing the slot at @index in @node from radix tree
  *	rooted at @root, call this function to attempt freeing the
@@ -1976,9 +2026,10 @@ EXPORT_SYMBOL(radix_tree_gang_lookup_tag_slot);
  */
 void __radix_tree_delete_node(struct radix_tree_root *root,
 			      struct radix_tree_node *node,
-			      radix_tree_update_node_t update_node)
+			      radix_tree_update_node_t update_node,
+			      void *private)
 {
-	delete_node(root, node, update_node);
+	delete_node(root, node, update_node, private);
 }
 
 static bool __radix_tree_delete(struct radix_tree_root *root,
@@ -1996,7 +2047,7 @@ static bool __radix_tree_delete(struct radix_tree_root *root,
 			node_tag_clear(root, node, tag, offset);
 
 	replace_slot(slot, NULL, node, -1, exceptional);
-	return node && delete_node(root, node, NULL);
+	return node && delete_node(root, node, NULL, NULL);
 }
 
 /**
@@ -2106,6 +2157,14 @@ void idr_preload(gfp_t gfp_mask)
 }
 EXPORT_SYMBOL(idr_preload);
 
+/**
+ * ida_pre_get - reserve resources for ida allocation
+ * @ida: ida handle
+ * @gfp: memory allocation flags
+ *
+ * This function should be called before calling ida_get_new_above().  If it
+ * is unable to allocate memory, it will return %0.  On success, it returns %1.
+ */
 int ida_pre_get(struct ida *ida, gfp_t gfp)
 {
 	/*
@@ -2117,7 +2176,7 @@ int ida_pre_get(struct ida *ida, gfp_t gfp)
 		preempt_enable();
 
 	if (!this_cpu_read(ida_bitmap)) {
-		struct ida_bitmap *bitmap = kzalloc(sizeof(*bitmap), gfp);
+		struct ida_bitmap *bitmap = kmalloc(sizeof(*bitmap), gfp);
 		if (!bitmap)
 			return 0;
 		if (this_cpu_cmpxchg(ida_bitmap, NULL, bitmap))
@@ -2126,8 +2185,9 @@ int ida_pre_get(struct ida *ida, gfp_t gfp)
 
 	return 1;
 }
+EXPORT_SYMBOL(ida_pre_get);
 
-void __rcu **idr_get_free(struct radix_tree_root *root,
+void __rcu **idr_get_free_cmn(struct radix_tree_root *root,
 			      struct radix_tree_iter *iter, gfp_t gfp,
 			      unsigned long max)
 {
@@ -2276,7 +2336,6 @@ void __init radix_tree_init(void)
 	int ret;
 
 	BUILD_BUG_ON(RADIX_TREE_MAX_TAGS + __GFP_BITS_SHIFT > 32);
-	BUILD_BUG_ON(ROOT_IS_IDR & ~GFP_ZONEMASK);
 	radix_tree_node_cachep = kmem_cache_create("radix_tree_node",
 			sizeof(struct radix_tree_node), 0,
 			SLAB_PANIC | SLAB_RECLAIM_ACCOUNT,
