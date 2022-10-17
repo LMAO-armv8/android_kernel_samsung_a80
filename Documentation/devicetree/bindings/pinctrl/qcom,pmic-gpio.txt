@@ -7,7 +7,6 @@ PMIC's from Qualcomm.
 	Usage: required
 	Value type: <string>
 	Definition: must be one of:
-		    "qcom,pm8005-gpio"
 		    "qcom,pm8018-gpio"
 		    "qcom,pm8038-gpio"
 		    "qcom,pm8058-gpio"
@@ -16,7 +15,6 @@ PMIC's from Qualcomm.
 		    "qcom,pm8921-gpio"
 		    "qcom,pm8941-gpio"
 		    "qcom,pm8994-gpio"
-		    "qcom,pm8998-gpio"
 		    "qcom,pma8084-gpio"
 		    "qcom,pmi8994-gpio"
 
@@ -45,6 +43,17 @@ PMIC's from Qualcomm.
 	Definition: Must be 2;
 		    the first cell will be used to define gpio number and the
 		    second denotes the flags for this gpio
+
+- qcom,gpios-disallowed:
+	Usage: optional
+	Value type: <prop-encoded-array>
+	Definition: Array of the GPIO hardware numbers corresponding to GPIOs
+		    which the APSS processor is not allowed to configure.
+		    The hardware numbers are indexed from 1.
+		    The interrupt resources for these GPIOs must not be defined
+		    in "interrupts" and "interrupt-names" properties.
+		    GPIOs defined in this array won't be registered as pins
+		    in the pinctrl device or gpios in the gpio chip.
 
 Please refer to ../gpio/gpio.txt and ../interrupt-controller/interrupts.txt for
 a general description of GPIO and interrupt bindings.
@@ -79,7 +88,6 @@ to specify in a pin configuration subnode:
 	Value type: <string-array>
 	Definition: List of gpio pins affected by the properties specified in
 		    this subnode.  Valid pins are:
-		    gpio1-gpio4 for pm8005
 		    gpio1-gpio6 for pm8018
 		    gpio1-gpio12 for pm8038
 		    gpio1-gpio40 for pm8058
@@ -88,7 +96,6 @@ to specify in a pin configuration subnode:
 		    gpio1-gpio44 for pm8921
 		    gpio1-gpio36 for pm8941
 		    gpio1-gpio22 for pm8994
-		    gpio1-gpio26 for pm8998
 		    gpio1-gpio22 for pma8084
 		    gpio1-gpio10 for pmi8994
 
@@ -234,6 +241,7 @@ Example:
 
 		gpio-controller;
 		#gpio-cells = <2>;
+		qcom,gpios-disallowed = <1 20>;
 
 		pm8921_gpio_keys: gpio-keys {
 			volume-keys {
