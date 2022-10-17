@@ -75,9 +75,6 @@ static inline depot_stack_handle_t save_stack(gfp_t flags)
 
 	save_stack_trace(&trace);
 	filter_irq_stacks(&trace);
-	if (trace.nr_entries != 0 &&
-	    trace.entries[trace.nr_entries-1] == ULONG_MAX)
-		trace.nr_entries--;
 
 	return depot_save_stack(&trace, flags);
 }
@@ -264,7 +261,7 @@ static inline unsigned int optimal_redzone(unsigned int object_size)
 }
 
 void kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
-			slab_flags_t *flags)
+			unsigned long *flags)
 {
 	unsigned int orig_size = *size;
 	unsigned int redzone_size;
@@ -629,6 +626,7 @@ void kasan_report(unsigned long addr, size_t size, bool is_write, unsigned long 
 	__kasan_report(addr, size, is_write, ip);
 	user_access_restore(flags);
 }
+
 
 #ifdef CONFIG_MEMORY_HOTPLUG
 static bool shadow_mapped(unsigned long addr)

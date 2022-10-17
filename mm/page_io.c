@@ -39,6 +39,7 @@ static struct bio *get_swap_bio(gfp_t gfp_flags,
 
 		bio->bi_iter.bi_sector = map_swap_page(page, &bdev);
 		bio_set_dev(bio, bdev);
+		bio->bi_iter.bi_sector <<= PAGE_SHIFT - 9;
 		bio->bi_end_io = end_io;
 
 		for (i = 0; i < nr; i++)
@@ -50,7 +51,7 @@ static struct bio *get_swap_bio(gfp_t gfp_flags,
 
 void end_swap_bio_write(struct bio *bio)
 {
-	struct page *page = bio_first_page_all(bio);
+	struct page *page = bio->bi_io_vec[0].bv_page;
 
 	if (bio->bi_status) {
 		SetPageError(page);
@@ -63,18 +64,70 @@ void end_swap_bio_write(struct bio *bio)
 		 * Also clear PG_reclaim to avoid rotate_reclaimable_page()
 		 */
 		set_page_dirty(page);
-		pr_alert("Write-error on swap-device (%u:%u:%llu)\n",
-			 MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+#ifndef CONFIG_ZRAM
+		pr_alert_ratelimited("Write-error on swap-device (%u:%u:%llu)\n",
+			 MAJOR(bio_dev(bio)),
+			 MINOR(bio_dev(bio)),
 			 (unsigned long long)bio->bi_iter.bi_sector);
+#endif
 		ClearPageReclaim(page);
 	}
 	end_page_writeback(page);
 	bio_put(bio);
 }
 
+static void swap_slot_free_notify(struct page *page)
+{
+	struct swap_info_struct *sis;
+	struct gendisk *disk;
+	swp_entry_t entry;
+
+	/*
+	 * There is no guarantee that the page is in swap cache - the software
+	 * suspend code (at least) uses end_swap_bio_read() against a non-
+	 * swapcache page.  So we must check PG_swapcache before proceeding with
+	 * this optimization.
+	 */
+	if (unlikely(!PageSwapCache(page)))
+		return;
+
+	sis = page_swap_info(page);
+	if (!(sis->flags & SWP_BLKDEV))
+		return;
+
+	/*
+	 * The swap subsystem performs lazy swap slot freeing,
+	 * expecting that the page will be swapped out again.
+	 * So we can avoid an unnecessary write if the page
+	 * isn't redirtied.
+	 * This is good for real swap storage because we can
+	 * reduce unnecessary I/O and enhance wear-leveling
+	 * if an SSD is used as the as swap device.
+	 * But if in-memory swap device (eg zram) is used,
+	 * this causes a duplicated copy between uncompressed
+	 * data in VM-owned memory and compressed data in
+	 * zram-owned memory.  So let's free zram-owned memory
+	 * and make the VM-owned decompressed page *dirty*,
+	 * so the page should be swapped out somewhere again if
+	 * we again wish to reclaim it.
+	 */
+	disk = sis->bdev->bd_disk;
+	entry.val = page_private(page);
+	if (disk->fops->swap_slot_free_notify &&
+			__swap_count(sis, entry) == 1) {
+		unsigned long offset;
+
+		offset = swp_offset(entry);
+
+		SetPageDirty(page);
+		disk->fops->swap_slot_free_notify(sis->bdev,
+				offset);
+	}
+}
+
 static void end_swap_bio_read(struct bio *bio)
 {
-	struct page *page = bio_first_page_all(bio);
+	struct page *page = bio->bi_io_vec[0].bv_page;
 	struct task_struct *waiter = bio->bi_private;
 
 	if (bio->bi_status) {
@@ -87,6 +140,7 @@ static void end_swap_bio_read(struct bio *bio)
 	}
 
 	SetPageUptodate(page);
+	swap_slot_free_notify(page);
 out:
 	unlock_page(page);
 	WRITE_ONCE(bio->bi_private, NULL);
@@ -212,6 +266,11 @@ out:
 	return ret;
 }
 
+static sector_t swap_page_sector(struct page *page)
+{
+	return (sector_t)__page_file_index(page) << (PAGE_SHIFT - 9);
+}
+
 static inline void count_swpout_vm_event(struct page *page)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -270,8 +329,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 		return ret;
 	}
 
-	ret = bdev_write_page(sis->bdev, map_swap_page(page, &sis->bdev),
-			      page, wbc);
+	ret = bdev_write_page(sis->bdev, swap_page_sector(page), page, wbc);
 	if (!ret) {
 		count_swpout_vm_event(page);
 		return 0;
@@ -285,8 +343,7 @@ int __swap_writepage(struct page *page, struct writeback_control *wbc,
 		ret = -ENOMEM;
 		goto out;
 	}
-	bio->bi_opf = REQ_OP_WRITE | REQ_SWAP | wbc_to_write_flags(wbc);
-	bio_associate_blkcg_from_page(bio, page);
+	bio->bi_opf = REQ_OP_WRITE | wbc_to_write_flags(wbc);
 	count_swpout_vm_event(page);
 	set_page_writeback(page);
 	unlock_page(page);
@@ -331,8 +388,13 @@ int swap_readpage(struct page *page, bool synchronous)
 		goto out;
 	}
 
-	ret = bdev_read_page(sis->bdev, map_swap_page(page, &sis->bdev), page);
+	ret = bdev_read_page(sis->bdev, swap_page_sector(page), page);
 	if (!ret) {
+		if (trylock_page(page)) {
+			swap_slot_free_notify(page);
+			unlock_page(page);
+		}
+
 		count_vm_event(PSWPIN);
 		goto out;
 	}
@@ -360,7 +422,7 @@ int swap_readpage(struct page *page, bool synchronous)
 		if (!READ_ONCE(bio->bi_private))
 			break;
 
-		if (!blk_poll(disk->queue, qc))
+		if (!blk_mq_poll(disk->queue, qc))
 			break;
 	}
 	__set_current_state(TASK_RUNNING);

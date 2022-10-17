@@ -31,6 +31,16 @@ config DEBUG_PAGEALLOC
 	  enabled by DEBUG_PAGEALLOC_ENABLE_DEFAULT or the debug_pagealloc
 	  command line parameter.
 
+config SLUB_DEBUG_PANIC_ON
+	bool "Enable to Panic on SLUB corruption detection"
+	depends on SLUB_DEBUG
+	help
+	  SLUB has a resiliency feature enabled which restores bytes in
+	  order for production environments to continue to operate. IN
+	  debug options this may not be desirable as it prevents from
+	  investigating the root cause which may be rooted within cache
+	  or memory.
+
 config DEBUG_PAGEALLOC_ENABLE_DEFAULT
 	bool "Enable debug page memory allocations by default?"
 	default n
@@ -46,13 +56,22 @@ config PAGE_POISONING
 	  Fill the pages with poison patterns after free_pages() and verify
 	  the patterns before alloc_pages. The filling of the memory helps
 	  reduce the risk of information leaks from freed data. This does
-	  have a potential performance impact if enabled with the
-	  "page_poison=1" kernel boot option.
+	  have a potential performance impact.
 
 	  Note that "poison" here is not the same thing as the "HWPoison"
 	  for CONFIG_MEMORY_FAILURE. This is software poisoning only.
 
 	  If unsure, say N
+
+config PAGE_POISONING_ENABLE_DEFAULT
+	bool "Enable page poisoning by default?"
+	default n
+	depends on PAGE_POISONING
+	---help---
+	  Enable page poisoning of free pages by default? This value
+	  can be overridden by page_poison=off|on. This can be used
+	  to avoid passing the kernel parameter and let page poisoning
+	  feature enabled by default.
 
 config PAGE_POISONING_NO_SANITY
 	depends on PAGE_POISONING
@@ -66,7 +85,7 @@ config PAGE_POISONING_NO_SANITY
 	   say N.
 
 config PAGE_POISONING_ZERO
-	bool "Use zero for poisoning instead of debugging value"
+	bool "Use zero for poisoning instead of random data"
 	depends on PAGE_POISONING
 	---help---
 	   Instead of using the existing poison value, fill the pages with
@@ -76,6 +95,7 @@ config PAGE_POISONING_ZERO
 	   allocation.
 
 	   If unsure, say N
+	bool
 
 config DEBUG_PAGE_REF
 	bool "Enable tracepoint to track down page reference manipulation"

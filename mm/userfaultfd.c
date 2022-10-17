@@ -16,6 +16,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mmu_notifier.h>
 #include <linux/hugetlb.h>
+#include <linux/pagemap.h>
 #include <linux/shmem_fs.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -55,8 +56,6 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 			/* don't free the page */
 			goto out;
 		}
-
-		flush_dcache_page(page);
 	} else {
 		page = *pagep;
 		*pagep = NULL;
@@ -273,7 +272,7 @@ retry:
 		 */
 		idx = linear_page_index(dst_vma, dst_addr);
 		mapping = dst_vma->vm_file->f_mapping;
-		hash = hugetlb_fault_mutex_hash(h, mapping, idx);
+		hash = hugetlb_fault_mutex_hash(h, mapping, idx, dst_addr);
 		mutex_lock(&hugetlb_fault_mutex_table[hash]);
 
 		err = -ENOMEM;
@@ -438,8 +437,7 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 					      unsigned long dst_start,
 					      unsigned long src_start,
 					      unsigned long len,
-					      bool zeropage,
-					      bool *mmap_changing)
+					      bool zeropage)
 {
 	struct vm_area_struct *dst_vma;
 	ssize_t err;
@@ -464,15 +462,6 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 	page = NULL;
 retry:
 	down_read(&dst_mm->mmap_sem);
-
-	/*
-	 * If memory mappings are changing because of non-cooperative
-	 * operation (e.g. mremap) running in parallel, bail out and
-	 * request the user to retry later
-	 */
-	err = -EAGAIN;
-	if (mmap_changing && READ_ONCE(*mmap_changing))
-		goto out_unlock;
 
 	/*
 	 * Make sure the vma is not shared, that the dst range is
@@ -576,7 +565,6 @@ retry:
 				err = -EFAULT;
 				goto out;
 			}
-			flush_dcache_page(page);
 			goto retry;
 		} else
 			BUG_ON(page);
@@ -605,15 +593,13 @@ out:
 }
 
 ssize_t mcopy_atomic(struct mm_struct *dst_mm, unsigned long dst_start,
-		     unsigned long src_start, unsigned long len,
-		     bool *mmap_changing)
+		     unsigned long src_start, unsigned long len)
 {
-	return __mcopy_atomic(dst_mm, dst_start, src_start, len, false,
-			      mmap_changing);
+	return __mcopy_atomic(dst_mm, dst_start, src_start, len, false);
 }
 
 ssize_t mfill_zeropage(struct mm_struct *dst_mm, unsigned long start,
-		       unsigned long len, bool *mmap_changing)
+		       unsigned long len)
 {
-	return __mcopy_atomic(dst_mm, start, 0, len, true, mmap_changing);
+	return __mcopy_atomic(dst_mm, start, 0, len, true);
 }
