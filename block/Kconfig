@@ -114,7 +114,7 @@ config BLK_DEV_THROTTLING
 	one needs to mount and use blkio cgroup controller for creating
 	cgroups and specifying per device IO rate policies.
 
-	See Documentation/cgroup-v1/blkio-controller.txt for more information.
+	See Documentation/cgroups/blkio-controller.txt for more information.
 
 config BLK_DEV_THROTTLING_LOW
 	bool "Block throttling .low limit interface support (EXPERIMENTAL)"
@@ -127,6 +127,20 @@ config BLK_DEV_THROTTLING_LOW
 	utilize disk resource.
 
 	Note, this is an experimental interface and could be changed someday.
+
+config BLK_IO_VOLUME
+	bool "Support for updating block IO volume"
+	default n
+	help
+	  Say Y here if you want to be able to update the block IO volume.
+
+config BLK_TURBO_WRITE
+	bool "Support turbo write"
+	depends on BLK_IO_VOLUME
+	default n
+	---help---
+	  This feature support for turbo write.
+	  Select this option if this feature is needed on working.
 
 config BLK_CMDLINE_PARSER
 	bool "Block device command line partition parser"
@@ -148,18 +162,6 @@ config BLK_WBT
 	less impact on foreground operations. The throttling is done
 	dynamically on an algorithm loosely based on CoDel, factoring in
 	the realtime performance of the disk.
-
-config BLK_CGROUP_IOLATENCY
-	bool "Enable support for latency based cgroup IO protection"
-	depends on BLK_CGROUP=y
-	default n
-	---help---
-	Enabling this option enables the .latency interface for IO throttling.
-	The IO controller will attempt to maintain average IO latencies below
-	the configured latency target, throttling anybody with a higher latency
-	target than the victimized group.
-
-	Note, this is an experimental interface and could be changed someday.
 
 config BLK_WBT_SQ
 	bool "Single queue writeback throttling"
@@ -188,10 +190,6 @@ config BLK_DEBUG_FS
 
 	Unless you are building a kernel for a tiny system, you should
 	say Y here.
-
-config BLK_DEBUG_FS_ZONED
-       bool
-       default BLK_DEBUG_FS && BLK_DEV_ZONED
 
 config BLK_SED_OPAL
 	bool "Logic for interfacing with Opal enabled SEDs"
@@ -236,13 +234,18 @@ config BLK_MQ_PCI
 	default y
 
 config BLK_MQ_VIRTIO
-	tristate
+	bool
 	depends on BLOCK && VIRTIO
 	default y
 
 config BLK_MQ_RDMA
 	bool
 	depends on BLOCK && INFINIBAND
+	default y
+
+config BLOCK_SUPPORT_STLOG
+	bool "Enable storage log"
+	depends on BLOCK && PROC_STLOG
 	default y
 
 source block/Kconfig.iosched
