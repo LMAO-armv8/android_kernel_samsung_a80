@@ -16,7 +16,6 @@
 #include <linux/spinlock.h>
 #include <linux/seqlock.h>
 #include <linux/atomic.h>
-#include <linux/android_kabi.h>
 
 struct super_block;
 struct vfsmount;
@@ -68,11 +67,10 @@ struct mnt_namespace;
 struct vfsmount {
 	struct dentry *mnt_root;	/* root of the mounted tree */
 	struct super_block *mnt_sb;	/* pointer to superblock */
+#ifdef CONFIG_RKP_NS_PROT
+	struct mount *bp_mount;	/* pointer to mount*/
+#endif
 	int mnt_flags;
-	ANDROID_KABI_RESERVE(1);
-	ANDROID_KABI_RESERVE(2);
-	ANDROID_KABI_RESERVE(3);
-	ANDROID_KABI_RESERVE(4);
 	void *data;
 } __randomize_layout;
 
@@ -92,8 +90,6 @@ extern bool mnt_may_suid(struct vfsmount *mnt);
 
 struct path;
 extern struct vfsmount *clone_private_mount(const struct path *path);
-extern int __mnt_want_write(struct vfsmount *);
-extern void __mnt_drop_write(struct vfsmount *);
 
 struct file_system_type;
 extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,

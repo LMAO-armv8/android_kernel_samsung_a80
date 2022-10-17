@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0+
 /*
  * composite.h -- framework for usb gadgets which are composite devices
  *
@@ -41,6 +40,13 @@
 #include <linux/usb/gadget.h>
 #include <linux/log2.h>
 #include <linux/configfs.h>
+
+/* FUNCTION_SUSPEND: suspend options from usb 3.0 spec Table 9-7 */
+#define FUNC_SUSPEND_OPT_SUSP_MASK BIT(0)
+#define FUNC_SUSPEND_OPT_RW_EN_MASK BIT(1)
+
+#define FUNC_WAKEUP_CAPABLE_SHIFT  0
+#define FUNC_WAKEUP_ENABLE_SHIFT   1
 
 /*
  * USB function drivers should return USB_GADGET_DELAYED_STATUS if they
@@ -163,7 +169,7 @@ struct usb_os_desc_table {
  * @get_status: Returns function status as a reply to
  *	GetStatus() request when the recipient is Interface.
  * @func_suspend: callback to be called when
- *	SetFeature(FUNCTION_SUSPEND) is reseived
+ *	SetFeature(FUNCTION_SUSPEND) is received
  * @func_is_suspended: Tells whether the function is currently in
  *	Function Suspend state (used in Super Speed mode only).
  * @func_wakeup_allowed: Tells whether Function Remote Wakeup has been allowed
@@ -207,6 +213,12 @@ struct usb_function {
 
 	struct usb_configuration	*config;
 
+#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
+	int (*set_intf_num)(struct usb_function *f,
+			int intf_num, int index_num);
+	int (*set_config_desc)(int conf_num);
+#endif
+
 	struct usb_os_desc_table	*os_desc_table;
 	unsigned			os_desc_n;
 
@@ -223,6 +235,12 @@ struct usb_function {
 					struct usb_function *);
 	void			(*free_func)(struct usb_function *f);
 	struct module		*mod;
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+/* Optional function for vendor specific processing */
+	int			(*ctrlrequest)(struct usb_function *,
+					const struct usb_ctrlrequest *);
+#endif
 
 	/* runtime state management */
 	int			(*set_alt)(struct usb_function *,
@@ -523,6 +541,13 @@ struct usb_composite_dev {
 	 */
 	int				delayed_status;
 
+#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
+		/* used by enable_store function of android.c
+		 * to avoid signalling switch changes
+		 */
+	bool				mute_switch;
+	bool				force_disconnect;
+#endif
 	/* protects deactivations and delayed_status counts*/
 	spinlock_t			lock;
 
@@ -583,6 +608,9 @@ struct usb_composite_overwrite {
 
 void usb_composite_overwrite_options(struct usb_composite_dev *cdev,
 		struct usb_composite_overwrite *covr);
+
+int composite_dev_prepare(struct usb_composite_driver *composite,
+		struct usb_composite_dev *dev);
 
 static inline u16 get_default_bcdDevice(void)
 {

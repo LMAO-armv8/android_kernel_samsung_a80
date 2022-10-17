@@ -80,15 +80,13 @@ enum {
 	NETIF_F_HW_ESP_BIT,		/* Hardware ESP transformation offload */
 	NETIF_F_HW_ESP_TX_CSUM_BIT,	/* ESP with TX checksum offload */
 	NETIF_F_RX_UDP_TUNNEL_PORT_BIT, /* Offload of RX port for UDP tunnels */
-	NETIF_F_HW_TLS_TX_BIT,		/* Hardware TLS TX offload */
-	NETIF_F_HW_TLS_RX_BIT,		/* Hardware TLS RX offload */
+	NETIF_F_HW_MACSEC_BIT,          /* Offload MACsec operations */
 
 	NETIF_F_GRO_HW_BIT,		/* Hardware Generic receive offload */
-	NETIF_F_HW_TLS_RECORD_BIT,	/* Offload TLS record */
 
 	/*
 	 * Add your fresh new feature above and remember to update
-	 * netdev_features_strings[] in net/ethtool/common.c and maybe
+	 * netdev_features_strings[] in net/core/ethtool.c and maybe
 	 * some feature mask #defines below. Please also describe it
 	 * in Documentation/networking/netdev-features.txt.
 	 */
@@ -151,12 +149,10 @@ enum {
 #define NETIF_F_HW_ESP		__NETIF_F(HW_ESP)
 #define NETIF_F_HW_ESP_TX_CSUM	__NETIF_F(HW_ESP_TX_CSUM)
 #define	NETIF_F_RX_UDP_TUNNEL_PORT  __NETIF_F(RX_UDP_TUNNEL_PORT)
-#define NETIF_F_HW_TLS_RECORD	__NETIF_F(HW_TLS_RECORD)
 #define NETIF_F_GSO_UDP_L4	__NETIF_F(GSO_UDP_L4)
-#define NETIF_F_HW_TLS_TX	__NETIF_F(HW_TLS_TX)
-#define NETIF_F_HW_TLS_RX	__NETIF_F(HW_TLS_RX)
+#define NETIF_F_HW_MACSEC      __NETIF_F(HW_MACSEC)
 
-/* Finds the next feature with the highest number of the range of start-1 till 0.
+/* Finds the next feature with the highest number of the range of start till 0.
  */
 static inline int find_next_netdev_feature(u64 feature, unsigned long start)
 {
@@ -175,7 +171,7 @@ static inline int find_next_netdev_feature(u64 feature, unsigned long start)
 	for ((bit) = find_next_netdev_feature((mask_addr),		\
 					      NETDEV_FEATURE_COUNT);	\
 	     (bit) >= 0;						\
-	     (bit) = find_next_netdev_feature((mask_addr), (bit)))
+	     (bit) = find_next_netdev_feature((mask_addr), (bit) - 1))
 
 /* Features valid for ethtool to change */
 /* = all defined minus driver/device-class-related */
@@ -242,6 +238,7 @@ static inline int find_next_netdev_feature(u64 feature, unsigned long start)
 				 NETIF_F_GSO_GRE_CSUM |			\
 				 NETIF_F_GSO_IPXIP4 |			\
 				 NETIF_F_GSO_IPXIP6 |			\
+				 NETIF_F_GSO_UDP_L4 |			\
 				 NETIF_F_GSO_UDP_TUNNEL |		\
 				 NETIF_F_GSO_UDP_TUNNEL_CSUM)
 

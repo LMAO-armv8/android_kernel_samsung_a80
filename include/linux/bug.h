@@ -43,8 +43,6 @@ enum bug_trap_type report_bug(unsigned long bug_addr, struct pt_regs *regs);
 /* These are defined by the architecture */
 int is_valid_bugaddr(unsigned long addr);
 
-void generic_bug_clear_once(void);
-
 #else	/* !CONFIG_GENERIC_BUG */
 
 static inline void *find_bug(unsigned long bugaddr)
@@ -57,9 +55,6 @@ static inline enum bug_trap_type report_bug(unsigned long bug_addr,
 {
 	return BUG_TRAP_TYPE_BUG;
 }
-
-
-static inline void generic_bug_clear_once(void) {}
 
 #endif	/* CONFIG_GENERIC_BUG */
 
@@ -81,4 +76,9 @@ static inline __must_check bool check_data_corruption(bool v) { return v; }
 		corruption;						 \
 	}))
 
+#ifdef CONFIG_PANIC_ON_DATA_CORRUPTION
+#define PANIC_CORRUPTION 1
+#else
+#define PANIC_CORRUPTION 0
+#endif  /* CONFIG_PANIC_ON_DATA_CORRUPTION */
 #endif	/* _LINUX_BUG_H */

@@ -1,9 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  debugfs.h - a tiny little debug file system
  *
  *  Copyright (C) 2004 Greg Kroah-Hartman <greg@kroah.com>
  *  Copyright (C) 2004 IBM Inc.
+ *
+ *	This program is free software; you can redistribute it and/or
+ *	modify it under the terms of the GNU General Public License version
+ *	2 as published by the Free Software Foundation.
  *
  *  debugfs is for people to use instead of /proc or /sys.
  *  See Documentation/filesystems/ for more details.
@@ -84,8 +87,6 @@ struct dentry *debugfs_create_automount(const char *name,
 
 void debugfs_remove(struct dentry *dentry);
 void debugfs_remove_recursive(struct dentry *dentry);
-
-void debugfs_lookup_and_remove(const char *name, struct dentry *parent);
 
 const struct file_operations *debugfs_real_fops(const struct file *filp);
 
@@ -218,12 +219,6 @@ static inline void debugfs_remove(struct dentry *dentry)
 
 static inline void debugfs_remove_recursive(struct dentry *dentry)
 { }
-
-static inline void debugfs_lookup_and_remove(const char *name,
-					     struct dentry *parent)
-{ }
-
-const struct file_operations *debugfs_real_fops(const struct file *filp);
 
 static inline int debugfs_file_get(struct dentry *dentry)
 {

@@ -51,9 +51,8 @@ struct irq_affinity;
  *	Returns the first 32 feature bits (all we currently need).
  * @finalize_features: confirm what device features we'll be using.
  *	vdev: the virtio_device
- *	This sends the driver feature bits to the device: it can change
+ *	This gives the final feature bits for the device: it can change
  *	the dev->feature bits if it wants.
- * Note: despite the name this can be called any number of times.
  *	Returns 0 on success or error status
  * @bus_name: return the bus name associated with the device
  *	vdev: the virtio_device
@@ -80,8 +79,7 @@ struct virtio_config_ops {
 	u64 (*get_features)(struct virtio_device *vdev);
 	int (*finalize_features)(struct virtio_device *vdev);
 	const char *(*bus_name)(struct virtio_device *vdev);
-	int (*set_vq_affinity)(struct virtqueue *vq,
-			       const struct cpumask *cpu_mask);
+	int (*set_vq_affinity)(struct virtqueue *vq, int cpu);
 	const struct cpumask *(*get_vq_affinity)(struct virtio_device *vdev,
 			int index);
 };
@@ -238,11 +236,11 @@ const char *virtio_bus_name(struct virtio_device *vdev)
  *
  */
 static inline
-int virtqueue_set_affinity(struct virtqueue *vq, const struct cpumask *cpu_mask)
+int virtqueue_set_affinity(struct virtqueue *vq, int cpu)
 {
 	struct virtio_device *vdev = vq->vdev;
 	if (vdev->config->set_vq_affinity)
-		return vdev->config->set_vq_affinity(vq, cpu_mask);
+		return vdev->config->set_vq_affinity(vq, cpu);
 	return 0;
 }
 

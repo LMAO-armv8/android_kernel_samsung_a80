@@ -66,6 +66,7 @@ struct uart_ops {
 	void		(*set_ldisc)(struct uart_port *, struct ktermios *);
 	void		(*pm)(struct uart_port *, unsigned int state,
 			      unsigned int oldstate);
+	void		(*wake_peer)(struct uart_port *);
 
 	/*
 	 * Return a string describing the type of the port
@@ -127,13 +128,6 @@ struct uart_port {
 					     struct ktermios *);
 	unsigned int		(*get_mctrl)(struct uart_port *);
 	void			(*set_mctrl)(struct uart_port *, unsigned int);
-	unsigned int		(*get_divisor)(struct uart_port *,
-					       unsigned int baud,
-					       unsigned int *frac);
-	void			(*set_divisor)(struct uart_port *,
-					       unsigned int baud,
-					       unsigned int quot,
-					       unsigned int quot_frac);
 	int			(*startup)(struct uart_port *port);
 	void			(*shutdown)(struct uart_port *port);
 	void			(*throttle)(struct uart_port *port);
@@ -241,7 +235,6 @@ struct uart_port {
 #define UPSTAT_AUTORTS		((__force upstat_t) (1 << 2))
 #define UPSTAT_AUTOCTS		((__force upstat_t) (1 << 3))
 #define UPSTAT_AUTOXOFF		((__force upstat_t) (1 << 4))
-#define UPSTAT_SYNC_FIFO	((__force upstat_t) (1 << 5))
 
 	int			hw_stopped;		/* sw-assisted CTS flow state */
 	unsigned int		mctrl;			/* current modem ctrl settings */
@@ -305,23 +298,6 @@ struct uart_state {
 
 /* number of characters left in xmit buffer before we ask for more */
 #define WAKEUP_CHARS		256
-
-/**
- * uart_xmit_advance - Advance xmit buffer and account Tx'ed chars
- * @up: uart_port structure describing the port
- * @chars: number of characters sent
- *
- * This function advances the tail of circular xmit buffer by the number of
- * @chars transmitted and handles accounting of transmitted bytes (into
- * @up's icount.tx).
- */
-static inline void uart_xmit_advance(struct uart_port *up, unsigned int chars)
-{
-	struct circ_buf *xmit = &up->state->xmit;
-
-	xmit->tail = (xmit->tail + chars) & (UART_XMIT_SIZE - 1);
-	up->icount.tx += chars;
-}
 
 struct module;
 struct tty_driver;
@@ -410,10 +386,10 @@ extern int of_setup_earlycon(const struct earlycon_id *match,
 			     const char *options);
 
 #ifdef CONFIG_SERIAL_EARLYCON
-extern bool earlycon_acpi_spcr_enable __initdata;
+extern bool earlycon_init_is_deferred __initdata;
 int setup_earlycon(char *buf);
 #else
-static const bool earlycon_acpi_spcr_enable EARLYCON_USED_OR_UNUSED;
+static const bool earlycon_init_is_deferred;
 static inline int setup_earlycon(char *buf) { return 0; }
 #endif
 
@@ -421,7 +397,7 @@ struct uart_port *uart_get_console(struct uart_port *ports, int nr,
 				   struct console *c);
 int uart_parse_earlycon(char *p, unsigned char *iotype, resource_size_t *addr,
 			char **options);
-void uart_parse_options(const char *options, int *baud, int *parity, int *bits,
+void uart_parse_options(char *options, int *baud, int *parity, int *bits,
 			int *flow);
 int uart_set_options(struct uart_port *port, struct console *co, int baud,
 		     int parity, int bits, int flow);
@@ -569,5 +545,4 @@ static inline int uart_handle_break(struct uart_port *port)
 					 (cflag) & CRTSCTS || \
 					 !((cflag) & CLOCAL))
 
-void uart_get_rs485_mode(struct device *dev, struct serial_rs485 *rs485conf);
 #endif /* LINUX_SERIAL_CORE_H */

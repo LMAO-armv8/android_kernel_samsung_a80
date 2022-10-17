@@ -5,6 +5,8 @@
  * Everything to do with buffer_heads.
  */
 
+/* @fs.sec -- c853aa20d912cceb3e932a91b6bc8aa3 -- */
+
 #ifndef _LINUX_BUFFER_HEAD_H
 #define _LINUX_BUFFER_HEAD_H
 
@@ -37,6 +39,7 @@ enum bh_state_bits {
 	BH_Quiet,	/* Buffer Error Prinks to be quiet */
 	BH_Meta,	/* Buffer contains metadata */
 	BH_Prio,	/* Buffer should be submitted with REQ_PRIO */
+	BH_Sync_Flush,	/* Buffer should be submttted with REQ_SYNC_FLUSH */
 	BH_Defer_Completion, /* Defer AIO completion to workqueue */
 
 	BH_PrivateStart,/* not a state bit, but the first bit available
@@ -81,14 +84,11 @@ struct buffer_head {
 /*
  * macro tricks to expand the set_buffer_foo(), clear_buffer_foo()
  * and buffer_foo() functions.
- * To avoid reset buffer flags that are already set, because that causes
- * a costly cache line transition, check the flag first.
  */
 #define BUFFER_FNS(bit, name)						\
 static __always_inline void set_buffer_##name(struct buffer_head *bh)	\
 {									\
-	if (!test_bit(BH_##bit, &(bh)->b_state))			\
-		set_bit(BH_##bit, &(bh)->b_state);			\
+	set_bit(BH_##bit, &(bh)->b_state);				\
 }									\
 static __always_inline void clear_buffer_##name(struct buffer_head *bh)	\
 {									\
@@ -117,6 +117,7 @@ static __always_inline int test_clear_buffer_##name(struct buffer_head *bh) \
  * of the form "mark_buffer_foo()".  These are higher-level functions which
  * do something in addition to setting a b_state bit.
  */
+BUFFER_FNS(Uptodate, uptodate)
 BUFFER_FNS(Dirty, dirty)
 TAS_BUFFER_FNS(Dirty, dirty)
 BUFFER_FNS(Lock, locked)
@@ -132,42 +133,8 @@ BUFFER_FNS(Write_EIO, write_io_error)
 BUFFER_FNS(Unwritten, unwritten)
 BUFFER_FNS(Meta, meta)
 BUFFER_FNS(Prio, prio)
+BUFFER_FNS(Sync_Flush, sync_flush)
 BUFFER_FNS(Defer_Completion, defer_completion)
-
-static __always_inline void set_buffer_uptodate(struct buffer_head *bh)
-{
-	/*
-	 * If somebody else already set this uptodate, they will
-	 * have done the memory barrier, and a reader will thus
-	 * see *some* valid buffer state.
-	 *
-	 * Any other serialization (with IO errors or whatever that
-	 * might clear the bit) has to come from other state (eg BH_Lock).
-	 */
-	if (test_bit(BH_Uptodate, &bh->b_state))
-		return;
-
-	/*
-	 * make it consistent with folio_mark_uptodate
-	 * pairs with smp_load_acquire in buffer_uptodate
-	 */
-	smp_mb__before_atomic();
-	set_bit(BH_Uptodate, &bh->b_state);
-}
-
-static __always_inline void clear_buffer_uptodate(struct buffer_head *bh)
-{
-	clear_bit(BH_Uptodate, &bh->b_state);
-}
-
-static __always_inline int buffer_uptodate(const struct buffer_head *bh)
-{
-	/*
-	 * make it consistent with folio_test_uptodate
-	 * pairs with smp_mb__before_atomic in set_buffer_uptodate
-	 */
-	return (smp_load_acquire(&bh->b_state) & (1UL << BH_Uptodate)) != 0;
-}
 
 #define bh_offset(bh)		((unsigned long)(bh)->b_data & ~PAGE_MASK)
 
@@ -187,13 +154,15 @@ void buffer_check_dirty_writeback(struct page *page,
  */
 
 void mark_buffer_dirty(struct buffer_head *bh);
+void mark_buffer_dirty_sync(struct buffer_head *bh);
 void mark_buffer_write_io_error(struct buffer_head *bh);
+void init_buffer(struct buffer_head *, bh_end_io_t *, void *);
 void touch_buffer(struct buffer_head *bh);
 void set_bh_page(struct buffer_head *bh,
 		struct page *page, unsigned long offset);
 int try_to_free_buffers(struct page *);
 struct buffer_head *alloc_page_buffers(struct page *page, unsigned long size,
-		bool retry);
+		int retry);
 void create_empty_buffers(struct page *, unsigned long,
 			unsigned long b_state);
 void end_buffer_read_sync(struct buffer_head *bh, int uptodate);
@@ -202,6 +171,7 @@ void end_buffer_async_write(struct buffer_head *bh, int uptodate);
 
 /* Things to do with buffers at mapping->private_list */
 void mark_buffer_dirty_inode(struct buffer_head *bh, struct inode *inode);
+void mark_buffer_dirty_inode_sync(struct buffer_head *bh, struct inode *inode);
 int inode_has_buffers(struct inode *);
 void invalidate_inode_buffers(struct inode *);
 int remove_inode_buffers(struct inode *inode);
@@ -241,6 +211,8 @@ void write_boundary_block(struct block_device *bdev,
 			sector_t bblock, unsigned blocksize);
 int bh_uptodate_or_lock(struct buffer_head *bh);
 int bh_submit_read(struct buffer_head *bh);
+loff_t page_cache_seek_hole_data(struct inode *inode, loff_t offset,
+				 loff_t length, int whence);
 
 extern int buffer_heads_over_limit;
 

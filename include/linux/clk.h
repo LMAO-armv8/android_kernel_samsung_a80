@@ -204,11 +204,13 @@ static inline long clk_get_phase(struct clk *clk)
 	return -ENOTSUPP;
 }
 
+#ifndef CONFIG_COMMON_CLK_MSM
 static inline int clk_set_duty_cycle(struct clk *clk, unsigned int num,
 				     unsigned int den)
 {
 	return -ENOTSUPP;
 }
+#endif
 
 static inline unsigned int clk_get_scaled_duty_cycle(struct clk *clk,
 						     unsigned int scale)
@@ -242,7 +244,7 @@ static inline int clk_prepare(struct clk *clk)
 	return 0;
 }
 
-static inline int __must_check clk_bulk_prepare(int num_clks, struct clk_bulk_data *clks)
+static inline int clk_bulk_prepare(int num_clks, struct clk_bulk_data *clks)
 {
 	might_sleep();
 	return 0;
@@ -364,38 +366,6 @@ struct clk *devm_clk_get(struct device *dev, const char *id);
  */
 struct clk *devm_get_clk_from_child(struct device *dev,
 				    struct device_node *np, const char *con_id);
-/**
- * clk_rate_exclusive_get - get exclusivity over the rate control of a
- *                          producer
- * @clk: clock source
- *
- * This function allows drivers to get exclusive control over the rate of a
- * provider. It prevents any other consumer to execute, even indirectly,
- * opereation which could alter the rate of the provider or cause glitches
- *
- * If exlusivity is claimed more than once on clock, even by the same driver,
- * the rate effectively gets locked as exclusivity can't be preempted.
- *
- * Must not be called from within atomic context.
- *
- * Returns success (0) or negative errno.
- */
-int clk_rate_exclusive_get(struct clk *clk);
-
-/**
- * clk_rate_exclusive_put - release exclusivity over the rate control of a
- *                          producer
- * @clk: clock source
- *
- * This function allows drivers to release the exclusivity it previously got
- * from clk_rate_exclusive_get()
- *
- * The caller must balance the number of clk_rate_exclusive_get() and
- * clk_rate_exclusive_put() calls.
- *
- * Must not be called from within atomic context.
- */
-void clk_rate_exclusive_put(struct clk *clk);
 
 /**
  * clk_enable - inform the system when the clock source should be running.
@@ -538,23 +508,6 @@ long clk_round_rate(struct clk *clk, unsigned long rate);
 int clk_set_rate(struct clk *clk, unsigned long rate);
 
 /**
- * clk_set_rate_exclusive- set the clock rate and claim exclusivity over
- *                         clock source
- * @clk: clock source
- * @rate: desired clock rate in Hz
- *
- * This helper function allows drivers to atomically set the rate of a producer
- * and claim exclusivity over the rate control of the producer.
- *
- * It is essentially a combination of clk_set_rate() and
- * clk_rate_exclusite_get(). Caller must balance this call with a call to
- * clk_rate_exclusive_put()
- *
- * Returns success (0) or negative errno.
- */
-int clk_set_rate_exclusive(struct clk *clk, unsigned long rate);
-
-/**
  * clk_has_parent - check if a clock is a possible parent for another
  * @clk: clock source
  * @parent: parent clock source
@@ -629,6 +582,15 @@ struct clk *clk_get_parent(struct clk *clk);
  */
 struct clk *clk_get_sys(const char *dev_id, const char *con_id);
 
+/**
+ * clk_set_flags - set the custom HW specific flags for this clock
+ * @clk: clock source
+ * @flags: custom flags which would be hardware specific.
+ *
+ * Returns success 0 or negative errno.
+ */
+int clk_set_flags(struct clk *clk, unsigned long flags);
+
 #else /* !CONFIG_HAVE_CLK */
 
 static inline struct clk *clk_get(struct device *dev, const char *id)
@@ -636,8 +598,8 @@ static inline struct clk *clk_get(struct device *dev, const char *id)
 	return NULL;
 }
 
-static inline int __must_check clk_bulk_get(struct device *dev, int num_clks,
-					    struct clk_bulk_data *clks)
+static inline int clk_bulk_get(struct device *dev, int num_clks,
+			       struct clk_bulk_data *clks)
 {
 	return 0;
 }
@@ -647,8 +609,8 @@ static inline struct clk *devm_clk_get(struct device *dev, const char *id)
 	return NULL;
 }
 
-static inline int __must_check devm_clk_bulk_get(struct device *dev, int num_clks,
-						 struct clk_bulk_data *clks)
+static inline int devm_clk_bulk_get(struct device *dev, int num_clks,
+				    struct clk_bulk_data *clks)
 {
 	return 0;
 }
@@ -665,20 +627,12 @@ static inline void clk_bulk_put(int num_clks, struct clk_bulk_data *clks) {}
 
 static inline void devm_clk_put(struct device *dev, struct clk *clk) {}
 
-
-static inline int clk_rate_exclusive_get(struct clk *clk)
-{
-	return 0;
-}
-
-static inline void clk_rate_exclusive_put(struct clk *clk) {}
-
 static inline int clk_enable(struct clk *clk)
 {
 	return 0;
 }
 
-static inline int __must_check clk_bulk_enable(int num_clks, struct clk_bulk_data *clks)
+static inline int clk_bulk_enable(int num_clks, struct clk_bulk_data *clks)
 {
 	return 0;
 }
@@ -695,11 +649,6 @@ static inline unsigned long clk_get_rate(struct clk *clk)
 }
 
 static inline int clk_set_rate(struct clk *clk, unsigned long rate)
-{
-	return 0;
-}
-
-static inline int clk_set_rate_exclusive(struct clk *clk, unsigned long rate)
 {
 	return 0;
 }
@@ -752,8 +701,8 @@ static inline void clk_disable_unprepare(struct clk *clk)
 	clk_unprepare(clk);
 }
 
-static inline int __must_check clk_bulk_prepare_enable(int num_clks,
-					struct clk_bulk_data *clks)
+static inline int clk_bulk_prepare_enable(int num_clks,
+					  struct clk_bulk_data *clks)
 {
 	int ret;
 
@@ -774,7 +723,7 @@ static inline void clk_bulk_disable_unprepare(int num_clks,
 	clk_bulk_unprepare(num_clks, clks);
 }
 
-#if defined(CONFIG_OF) && defined(CONFIG_COMMON_CLK)
+#if defined(CONFIG_OF)
 struct clk *of_clk_get(struct device_node *np, int index);
 struct clk *of_clk_get_by_name(struct device_node *np, const char *name);
 struct clk *of_clk_get_from_provider(struct of_phandle_args *clkspec);

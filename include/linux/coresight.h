@@ -1,6 +1,13 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Copyright (c) 2012, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012, 2017-2019, The Linux Foundation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
  */
 
 #ifndef _LINUX_CORESIGHT_H
@@ -90,24 +97,44 @@ union coresight_dev_subtype {
 };
 
 /**
+ * struct coresight_reg_clk - regulators and clocks need by coresight
+ * @nr_reg:	number of regulators
+ * @nr_clk:	number of clocks
+ * @reg:	regulator list
+ * @clk:	clock list
+ */
+struct coresight_reg_clk {
+	int nr_reg;
+	int nr_clk;
+	struct regulator **reg;
+	struct clk **clk;
+};
+
+/**
  * struct coresight_platform_data - data harvested from the DT specification
  * @cpu:	the CPU a source belongs to. Only applicable for ETM/PTMs.
  * @name:	name of the component as shown under sysfs.
  * @nr_inport:	number of input ports for this component.
  * @outports:	list of remote endpoint port number.
+ * @source_names:name of all source components connected to this device.
  * @child_names:name of all child components connected to this device.
  * @child_ports:child component port number the current component is
 		connected  to.
  * @nr_outport:	number of output ports for this component.
+ * @clk:	The clock this component is associated to.
+ * @reg_clk:	as defined by @coresight_reg_clk.
  */
 struct coresight_platform_data {
 	int cpu;
 	const char *name;
 	int nr_inport;
 	int *outports;
+	const char **source_names;
 	const char **child_names;
 	int *child_ports;
 	int nr_outport;
+	struct clk *clk;
+	struct coresight_reg_clk *reg_clk;
 };
 
 /**
@@ -133,6 +160,7 @@ struct coresight_desc {
 /**
  * struct coresight_connection - representation of a single connection
  * @outport:	a connection's output port number.
+ * @source_name:source component's name.
  * @chid_name:	remote component's name.
  * @child_port:	remote component's port number @output is connected to.
  * @child_dev:	a @coresight_device representation of the component
@@ -140,6 +168,7 @@ struct coresight_desc {
  */
 struct coresight_connection {
 	int outport;
+	const char *source_name;
 	const char *child_name;
 	int child_port;
 	struct coresight_device *child_dev;
@@ -160,7 +189,8 @@ struct coresight_connection {
  * @enable:	'true' if component is currently part of an active path.
  * @activated:	'true' only if a _sink_ has been activated.  A sink can be
  *		activated but not yet enabled.  Enabling for a _sink_
- *		appens when a source has been selected for that it.
+ *		happens when a source has been selected for that it.
+ * @reg_clk:	as defined by @coresight_reg_clk.
  * @ea:		Device attribute for sink representation under PMU directory.
  */
 struct coresight_device {
@@ -172,10 +202,12 @@ struct coresight_device {
 	const struct coresight_ops *ops;
 	struct device dev;
 	atomic_t *refcnt;
+	struct coresight_path *node;
 	bool orphan;
 	bool enable;	/* true only if configured as part of a path */
 	/* sink specific fields */
 	bool activated;	/* true only if a sink is part of a path */
+	struct coresight_reg_clk *reg_clk;
 	struct dev_ext_attribute *ea;
 };
 
@@ -205,6 +237,7 @@ struct coresight_ops_sink {
 	unsigned long (*update_buffer)(struct coresight_device *csdev,
 			      struct perf_output_handle *handle,
 			      void *sink_config);
+	void (*abort)(struct coresight_device *csdev);
 };
 
 /**
@@ -266,6 +299,9 @@ extern int coresight_enable(struct coresight_device *csdev);
 extern void coresight_disable(struct coresight_device *csdev);
 extern int coresight_timeout(void __iomem *addr, u32 offset,
 			     int position, int value);
+extern void coresight_abort(void);
+extern void coresight_disable_reg_clk(struct coresight_device *csdev);
+extern int coresight_enable_reg_clk(struct coresight_device *csdev);
 
 extern int coresight_claim_device(void __iomem *base);
 extern int coresight_claim_device_unlocked(void __iomem *base);
@@ -283,6 +319,12 @@ coresight_enable(struct coresight_device *csdev) { return -ENOSYS; }
 static inline void coresight_disable(struct coresight_device *csdev) {}
 static inline int coresight_timeout(void __iomem *addr, u32 offset,
 				     int position, int value) { return 1; }
+static inline void coresight_abort(void) {}
+static inline void coresight_disable_reg_clk(struct coresight_device *csdev) {}
+static inline int coresight_enable_reg_clk(struct coresight_device *csdev)
+{
+	return -EINVAL;
+}
 static inline int coresight_claim_device_unlocked(void __iomem *base)
 {
 	return -EINVAL;
@@ -302,16 +344,45 @@ static inline bool coresight_loses_context_with_cpu(struct device *dev)
 }
 #endif
 
-#ifdef CONFIG_OF
+#if defined(CONFIG_OF) && defined(CONFIG_CORESIGHT)
 extern int of_coresight_get_cpu(const struct device_node *node);
 extern struct coresight_platform_data *
 of_get_coresight_platform_data(struct device *dev,
-			       const struct device_node *node);
+				const struct device_node *node);
+extern struct coresight_cti_data *of_get_coresight_cti_data(
+				struct device *dev, struct device_node *node);
+extern int of_get_coresight_csr_name(struct device_node *node,
+				const char **csr_name);
+
 #else
 static inline int of_coresight_get_cpu(const struct device_node *node)
 { return 0; }
 static inline struct coresight_platform_data *of_get_coresight_platform_data(
 	struct device *dev, const struct device_node *node) { return NULL; }
+static inline struct coresight_cti_data *of_get_coresight_cti_data(
+		struct device *dev, struct device_node *node) { return NULL; }
+static inline int of_get_coresight_csr_name(struct device_node *node,
+		const char **csr_name){ return -EINVAL; }
+#endif
+
+#ifdef CONFIG_PID_NS
+static inline unsigned long
+coresight_vpid_to_pid(unsigned long vpid)
+{
+	struct task_struct *task = NULL;
+	unsigned long pid = 0;
+
+	rcu_read_lock();
+	task = find_task_by_vpid(vpid);
+	if (task)
+		pid = task_pid_nr(task);
+	rcu_read_unlock();
+
+	return pid;
+}
+#else
+static inline unsigned long
+coresight_vpid_to_pid(unsigned long vpid) { return vpid; }
 #endif
 
 #endif

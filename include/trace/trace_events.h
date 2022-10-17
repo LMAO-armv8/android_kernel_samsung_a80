@@ -422,7 +422,6 @@ static struct trace_event_functions trace_event_type_funcs_##call = {	\
 	do {								\
 		char *type_str = #type"["__stringify(len)"]";		\
 		BUILD_BUG_ON(len > MAX_FILTER_STR_VAL);			\
-		BUILD_BUG_ON(len <= 0);					\
 		ret = trace_define_field(event_call, type_str, #item,	\
 				 offsetof(typeof(field), item),		\
 				 sizeof(field.item),			\
@@ -719,7 +718,8 @@ trace_event_raw_event_##call(void *__data, proto)			\
 									\
 	{ assign; }							\
 									\
-	trace_event_buffer_commit(&fbuffer);				\
+	trace_event_buffer_commit(&fbuffer,				\
+				  sizeof(*entry) + __data_size);	\
 }
 /*
  * The ftrace_test_probe is compiled out, it is only here as a build time check

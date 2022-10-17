@@ -1,7 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * System Trace Module (STM) infrastructure apis
  * Copyright (C) 2014 Intel Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
  */
 
 #ifndef _STM_H_
@@ -80,10 +88,14 @@ struct stm_data {
 	unsigned int		sw_nchannels;
 	unsigned int		sw_mmiosz;
 	unsigned int		hw_override;
+	bool                    (*ost_configured)(void);
 	ssize_t			(*packet)(struct stm_data *, unsigned int,
 					  unsigned int, unsigned int,
 					  unsigned int, unsigned int,
 					  const unsigned char *);
+	ssize_t			(*ost_packet)(struct stm_data *stm_data,
+					  unsigned int size,
+					  const unsigned char *buf);
 	phys_addr_t		(*mmio_addr)(struct stm_data *, unsigned int,
 					     unsigned int, unsigned int);
 	int			(*link)(struct stm_data *, unsigned int,
