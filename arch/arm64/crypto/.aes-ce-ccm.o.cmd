@@ -1,0 +1,1 @@
+cmd_arch/arm64/crypto/aes-ce-ccm.o :=  rm -f arch/arm64/crypto/aes-ce-ccm.o; /home/rog/build/a80-u6/../toolchain/bin/aarch64-linux-android-ar rcSTPD arch/arm64/crypto/aes-ce-ccm.o arch/arm64/crypto/aes-ce-ccm-glue.o arch/arm64/crypto/aes-ce-ccm-core.o 

@@ -1,0 +1,11 @@
+!<thin>
+//                                              66        `
+do_mounts.o/
+do_mounts_rd.o/
+do_mounts_initrd.o/
+do_mounts_dm.o/
+
+/0              0           0     0     644     402736    `
+/13             0           0     0     644     228072    `
+/29             0           0     0     644     211240    `
+/49             0           0     0     644     223552    `
